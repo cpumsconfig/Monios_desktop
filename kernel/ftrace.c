@@ -56,7 +56,7 @@ typedef struct {
 
 static ftrace_symbol_t g_symbols[FTRACE_MAX_FUNCTIONS];
 static uint32_t        g_symbol_count;
-static uint64_t        g_base_offset;   /* PA of kernel = 0x100000 */
+static uint64_t        g_base_offset;   /* Physical base of kernel image. */
 static volatile int    g_enabled;
 static volatile uint32_t g_lost_count;
 

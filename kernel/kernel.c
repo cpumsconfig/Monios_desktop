@@ -1,6 +1,9 @@
 #include "common.h"
 #include "acpi.h"
+#include "aac.h"
 #include "audio.h"
+#include "bluetooth.h"
+#include "browser.h"
 #include "bsod.h"
 #include "cmos.h"
 #include "cpu.h"
@@ -9,27 +12,61 @@
 #include "dma.h"
 #include "driver_manager.h"
 #include "exec.h"
+#include "extfs.h"
 #include "file.h"
+#include "futex.h"
+#include "gop.h"
+#include "heap.h"
+#include "hid.h"
+#include "iic.h"
 #include "input.h"
 #include "interrupt.h"
+#include "ipc.h"
+#include "ipv6.h"
 #include "kernel.h"
+#include "kernel_layout.h"
 #include "keyboard.h"
+#include "lazyalloc.h"
 #include "graphics.h"
+#include "bios.h"
+#include "bitmap.h"
+#include "buddy.h"
 #include "memory.h"
 #include "mmu.h"
 #include "mouse.h"
+#include "lwip.h"
 #include "net.h"
+#include "ntfs.h"
+#include "pcb.h"
 #include "pci.h"
+#include "pool.h"
+#include "prsys.h"
 #include "registry.h"
+#include "rtc.h"
+#include "scheduler.h"
 #include "session.h"
 #include "gdb_stub.h"
 #include "crash_dump.h"
 #include "ftrace.h"
+#include "frame.h"
+#include "fs_cache.h"
 #include "shell.h"
+#include "signal.h"
+#include "schedopt.h"
 #include "smp.h"
+#include "storage_ext.h"
 #include "syscall.h"
 #include "task.h"
 #include "terminal.h"
+#include "tls.h"
+#include "http.h"
+#include "usb_ext.h"
+#include "vma.h"
+#include "vmext.h"
+#include "wifi.h"
+#include "gui.h"
+#include "gpu.h"
+#include "power.h"
 
 static bool g_graphics_mode_requested;
 static bool g_graphics_mode_toggle_requested;
@@ -393,8 +430,8 @@ void kernel_main(void)
      * to locate kernel global state after a crash. */
     extern uint64_t _kconfig_start;
     volatile uint64_t *kcfg = &_kconfig_start;
-    kcfg[0] = 0x100000UL;        /* kernel physical base (identity-mapped) */
-    kcfg[1] = 0xFFFF800000100000ULL;  /* kernel virtual base  */
+    kcfg[0] = KERNEL_PHYS_BASE;  /* kernel physical base (identity-mapped) */
+    kcfg[1] = KERNEL_VIRT_BASE;  /* kernel virtual base */
     kcfg[2] = 0;                /* panic notifier (future) */
     kcfg[3] = 0;
 
@@ -436,7 +473,7 @@ void kernel_main(void)
     };
     ftrace_set_symbols(ftrace_addrs, ftrace_names,
         (uint32_t)(sizeof(ftrace_addrs) / sizeof(ftrace_addrs[0])),
-        0x100000UL);
+        KERNEL_PHYS_BASE);
 
     log_write("boot: init gdt");
     init_gdt();
@@ -451,6 +488,17 @@ void kernel_main(void)
     g_graphics_mode_toggle_requested = false;
     log_write("boot: init heap");
     memory_init();
+    bitmap_init();
+    pool_system_init();
+    heap_init();
+    frame_init();
+    buddy_init();
+    vma_init();
+    lazyalloc_init();
+    vmext_init();
+    bios_init();
+    rtc_init();
+    gop_init();
     log_write("boot: detect cpu");
     cpu_log_info();
     cpu_enable_fpu_sse();
@@ -463,18 +511,29 @@ void kernel_main(void)
     dma_log_state();
     log_write("boot: probe pci");
     pci_log_devices();
+    scheduler_init();
+    schedopt_init();
+    pcb_init();
+    futex_init();
+    ipc_init();
+    signal_init();
+    prsys_init();
     log_write("boot: init task system");
     task_init();
     log_write("boot: init interrupts");
     init_interrupts(100);
     acpi_enable_power_button();
+    power_init();
     log_write("boot: probe audio");
     audio_init();
+    aac_init();
     audio_log_state();
     log_write("boot: init syscalls");
     syscall_init();
     log_write("boot: init filesystem");
     file_init();
+    ntfs_init();
+    extfs_init();
     log_write("boot: init registry");
     registry_init();
     log_write("boot: init device namespace");
@@ -483,11 +542,24 @@ void kernel_main(void)
     terminal_init();
     log_write("boot: load drivers");
     driver_manager_init();
+    storage_ext_init();
+    iic_init();
+    usb_ext_init();
+    bluetooth_init();
+    wifi_init();
+    ipv6_init();
     net_init();
+    lwip_init();
+    tls_init();
+    http_init();
+    browser_init();
+    gpu_init();
+    gui_init();
     log_write("boot: init session");
     ensure_desktop_layout();
     log_write("boot: init input");
     init_input();
+    hid_init();
 
     log_write("boot: audio test");
     audio_play_pc_speaker_beep();
@@ -533,6 +605,9 @@ void kernel_main(void)
         }
         audio_update();
         net_update();
+        lwip_update();
+        hid_update();
+        futex_update();
         task_run_ready();
     }
 }

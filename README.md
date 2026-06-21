@@ -1,131 +1,135 @@
-# monios_desktop
+# monios_x64
 
-为轻量级 x86_64 内核。
+`monios_x64` 是一个用于学习、实验和原型验证的 x86_64 操作系统内核。项目包含启动代码、长模式内核、内存管理、文件系统、网络栈、设备驱动、图形桌面、应用运行时和示例用户程序。
 
-**项目简介**
-- 这是一个轻量级的 x86_64 内核项目，包含内核、驱动、文件系统、示例应用和构建工具。
-- 适合用于操作系统课程实验、驱动开发原型和嵌入式系统学习。
+## 当前重点
 
-**项目结构（摘要）**
-- `kernel/`：内核源码与链接脚本。
-- `drivers/`：设备驱动实现（网卡、USB、音频、键鼠等）。
-- `fs/`：文件系统实现（FAT16/32）。
-- `apps/`：示例用户程序与运行时。
-- `include/`：公共头文件。
-- `tools/`：辅助脚本（生成镜像、音频转换、字体生成等）。
-- 根目录：`Makefile`、磁盘镜像文件模板与示例资源（`hd.img`、`hd.vmdk` 等）。
+- 启动加载：`loader` 将内核运行镜像复制到 `0x00200000`，即 1 MiB 之后的 2 MiB 位置运行；早期长模式页表扩展映射到 16 MiB，避免清 BSS 和早期栈访问踩到未映射区域。
+- 内核布局：`kernel/kernel.ld` 已同步到 2 MiB 链接基址，`.kconfig` 改为 4 个 `QUAD`，避免按 `uint64_t` 写配置时覆盖后续页表区。
+- 文件系统：保留 FAT16/FAT32/ISO9660，扩展 NTFS 启动扇区、cluster、MFT record、index record、MFT0 探测元数据；新增统一文件系统读缓存 `fscache`。
+- 网络：已有 IPv4、DNS、DHCP、UDP、socket、TCP shim、lwIP shim；IPv6 增加地址解析、压缩输出、前缀匹配、链路本地、ULA、global-unicast 等工具；新增 TLS/SSL、HTTP/HTTPS、WiFi 和基础浏览器状态框架。
+- 图形：保留 framebuffer/桌面/窗口管理器，新增 GUI 应用框架状态、控件注册状态、GPU/硬件加速 shim 状态，暴露更高分辨率/色深相关信息。
+- 设备：扩展 IDE/AHCI/NVMe/storage inventory、xHCI/USB 扩展、HID、蓝牙 HCI 框架、显卡/GOP/Bochs BGA 状态。
+- 内核运行时：扩展 IPC 队列、peek/broadcast/close；增加 VM/VMA/lazyalloc 状态、SMP 调度优化状态、多用户会话、ACPI/CPU 频率/设备电源管理状态。
 
+## 主要命令
 
-**先决条件 / 依赖**
-- 一个 x86_64 交叉编译工具链：`x86_64-elf-gcc`, `x86_64-elf-ld`, `x86_64-elf-objcopy`。
-- `nasm`（编译汇编引导/入口）
-- `python3`（用于 `tools/` 下的辅助脚本）
-- `qemu-system-x86_64`（运行与调试）和 `qemu-img`（生成 vmdk）
-- 在 Windows 上：建议使用 WSL/WSL2 或 MSYS2/MinGW 提供类 Unix 工具链，或在本机安装对应工具（注意路径与权限）。
+内核 shell 中可以使用这些命令查看或操作新增模块：
 
-**快速检查清单**
-- 已创建 `out` 目录：`mkdir -p out`
-- 安装并可调用 `x86_64-elf-gcc` / `x86_64-elf-ld` / `x86_64-elf-objcopy`（请参考下方链接）
-- `nasm`、`python3`、`qemu-system-x86_64` 可用
-
-**示例：在 WSL / Ubuntu 上安装常见依赖**
-
-```bash
-sudo apt update
-sudo apt install build-essential nasm qemu-system-x86 qemu-utils python3 python3-pip make
-# 若仓库/镜像中没有预编译的 x86_64-elf 工具链，需要自行编译或使用上方链接中提供的二进制包。
+```text
+ipv6 [addr]
+tls [server]
+ssl [server]
+http get <host> [path]
+https <url>
+wifi
+bluetooth
+browser [url]
+storagex
+usbext
+fscache [clear]
+ntfs
+gui
+gpu
+power
+vmext
+schedopt
+users
+login <user>
+ipc create|send|recv|peek|broadcast|close
+dev list
+dev read \\.\fscache
+dev read \\.\tls
+dev read \\.\http
+dev read \\.\wifi
+dev read \\.\usbext
+dev read \\.\bth
+dev read \\.\storagex
+dev read \\.\gpu
+dev read \\.\gui
+dev read \\.\power
+dev read \\.\browser
 ```
 
-**示例：MSYS2（Windows）**
+默认用户包括：
 
-```bash
-# 在 MSYS2 终端下安装常用构建工具（不包含 x86_64-elf 工具链）
-pacman -Syu
-pacman -S make nasm python
+```text
+root
+guest
+dev
 ```
 
-注意：MSYS2 包管理器默认提供的是本机/本宿主的编译器（例如 `mingw-w64-x86_64-gcc`），而本项目要求使用带有 `x86_64-elf-` 前缀的交叉工具链（`x86_64-elf-gcc` / `x86_64-elf-ld` / `x86_64-elf-objcopy`）。请从上方“编译工具与下载链接”处获取或自行构建 `x86_64-elf` 工具集，或在 `Makefile` 中调整 `X86_64_CC` / `X86_64_LD` / `X86_64_OBJCOPY` 指向你所安装的工具。
+默认镜像中的密码文件是 `pwd.txt`，图形登录和 shell 登录状态共用会话用户表。
 
-示例（Ubuntu/Debian）：
+## 项目结构
 
-```bash
-sudo apt update
-sudo apt install build-essential nasm qemu-system-x86 qemu-utils python3 python3-pip
-# 安装交叉编译工具链（包名可能因发行版不同而异）
-sudo apt install gcc-x86-64-linux-gnu binutils-multiarch
+```text
+apps/              用户态示例程序
+boot/              boot sector、loader 和实模式/保护模式引导头
+drivers/           PCI、存储、网络、USB、GPU、音频、SMBus 等驱动
+fs/                FAT16/FAT32/ISO9660/NTFS/extfs 文件系统模块
+include/           公共头文件
+kernel/            内核主体、调度、内存、shell、图形、系统调用
+lib/               用户态运行时和 syscall wrapper
+tools/             镜像、字体、音频转换等辅助脚本
+Makefile           构建、打包和运行入口
 ```
 
-注意：本仓库的 Makefile 期望可用 `x86_64-elf-*` 前缀的交叉工具链；你也可以调整 Makefile 中的 `X86_64_CC` / `X86_64_LD` / `X86_64_OBJCOPY` 变量以匹配本地工具链。
+## 构建依赖
 
-**编译工具与下载链接**
-- 官方 NASM（汇编器）： http://nasm.us/
-- 交叉工具链（示例发布）： https://github.com/lordmilko/i686-elf-tools/releases
-- QEMU 二进制与下载： https://qemu.weilnetz.de/
-- Windows 下 GNU Make 二进制（无 Guile）： https://downloads.sourceforge.net/project/ezwinports/make-4.4.1-without-guile-w32-bin.zip
+需要以下工具可在 `PATH` 中调用：
 
-重要提示：请确保下载并安装的是带有 `x86_64-elf-` 前缀的交叉工具集（即 x86_64-elf-gcc / x86_64-elf-ld / x86_64-elf-objcopy）。链接中有时会出现 `i686-elf`（32 位）或其它前缀的二进制，**这些不是本项目需要的目标工具链**。若找不到现成的 `x86_64-elf` 二进制包，可考虑自行编译交叉编译器或在发行版包管理器中安装并调整 Makefile 前缀以匹配可用工具。
+```text
+x86_64-elf-gcc
+x86_64-elf-ld
+x86_64-elf-objcopy
+nasm
+python
+make
+qemu-system-x86_64
+qemu-img
+```
 
-**快速开始（构建与运行）**
-1. 在项目根目录创建输出目录（如果不存在）：
+Windows 环境可以使用 MSYS2、WSL/WSL2，或直接安装对应交叉编译工具链。`Makefile` 默认使用 `x86_64-elf-*` 前缀。
+
+## 构建与运行
 
 ```bash
 mkdir -p out
-```
-
-2. 构建磁盘镜像（构建内核、应用并打包为 `hd.img`）：
-
-```bash
+make out/kernel.elf out/kernel.bin
 make hd.img
+make run_debug
 ```
 
-3. 在 QEMU 中运行（Makefile 会自动在需要时构建镜像）：
+普通 QEMU 运行：
 
 ```bash
 make run
 ```
 
-4. 调试运行（串口输出至控制台且不自动重启）：
-
-```bash
-make run_debug
-```
-
-5. 生成 VMware 使用的 VMDK（需要 `qemu-img`）：
+生成 VMware VMDK：
 
 ```bash
 make hd.vmdk
 ```
 
-也可以单独构建某个目标，例如只编译内核并生成二进制：
+默认 `run_debug` 使用串口输出，成功启动后可以看到类似：
 
-```bash
-make out/kernel.bin
+```text
+BLJRFP
+mmu: _text_start_pa=0x00200000
+[R3] A:/ $
+graphics: desktop drawn
 ```
 
-**常见问题 / 提示**
-- 若出现找不到 `x86_64-elf-gcc` 等交叉工具，请安装或构建相应交叉工具链，或修改 Makefile 以使用本机可用的编译器前缀。
-- Windows 用户在本机 cmd 下直接运行 `make` 可能遇到工具缺失或路径问题，建议使用 WSL/WSL2 或 MSYS2 环境。
-- 若某些 tools 脚本报错，确保使用 `python3` 执行并且所需 Python 包已安装。
+## 当前边界
 
-**开发与贡献**
-- 阅读源代码并在本地运行测试镜像是最快的上手方式。
-- 若你要贡献：
-  - Fork 本仓库并在 feature 分支中实现改动。
-  - 提交清晰的 PR，说明改动目的与测试步骤。
+这是实验性内核，不是通用发行版。以下模块已经有接口、探测和状态输出，但还不是完整生产级实现：
 
-**参考文件**
-- 构建脚本和规则定义在 [Makefile](Makefile).
-- 生成/打包脚本位于 [tools/](tools/).
-
-**支持的硬件（概要）**
-- 网卡：Intel e1000（驱动位于 `drivers/net/e1000.c`）。
-- 声卡/音频：ES1371 / AC97 驱动（位于 `drivers/music/` 与 `kernel/` 的音频子系统）。
-- 输入设备：PS/2/AT 风格键盘与鼠标（`drivers/keyboard.c`, `drivers/mouse.c`），以及 USB 基本支持（`drivers/usb.c`）。
-- 总线与控制器：PCI、DMA、SMBus（对应 `drivers/pci/`, `drivers/dma/`, `drivers/smbus/`）。
-- 图形：基础帧缓冲/图形支持（`kernel/graphics.c`）。
-- 存储：通过 FAT16/32 支持文件系统（`fs/` 中实现）。
-
-以上为本项目中已有驱动/子系统支持的常见硬件类型；实际兼容性取决于宿主平台（QEMU/VMware）所模拟的设备以及所加载的驱动。
-
-**默认密码**
-- 镜像内默认密码为：`123456`（默认文件 `pwd.txt` 已包含在镜像中）。
+- NTFS/extfs 仍以元数据和只读探测为主，尚未实现完整目录遍历、日志恢复和读写。
+- TLS/SSL 已有 record/x509/handshake 状态框架，密码学后端和证书链验证仍待接入。
+- HTTP/HTTPS 目前能构造请求和记录 URL 状态，完整 TCP client、响应解析和 HTTPS 传输仍需继续实现。
+- WiFi/蓝牙以控制器/传输探测和 HCI 框架为主，尚未实现扫描、认证、配对和数据面。
+- GPU/硬件加速当前是 framebuffer/BGA 加速 shim 和状态接口，不是完整厂商显卡驱动。
+- xHCI/HID/USB 扩展已经暴露 root hub/legacy/native 状态，完整 USB 枚举和 endpoint 调度仍待实现。
+- ACPI 电源管理依赖固件表是否能在当前早期映射范围内被解析；QEMU 中可能退回 fallback 电源路径。

@@ -2774,6 +2774,34 @@ uint32_t graphics_focused_window_index(void)
     return 0xFFFFFFFFu;
 }
 
+uint32_t graphics_framebuffer_address(void)
+{
+    return g_graphics_framebuffer_addr;
+}
+
+uint32_t graphics_framebuffer_pitch_bytes(void)
+{
+    return g_framebuffer_pitch_bytes;
+}
+
+uint32_t graphics_framebuffer_width(void)
+{
+    return FB_WIDTH;
+}
+
+uint32_t graphics_framebuffer_height(void)
+{
+    return FB_HEIGHT;
+}
+
+const char *graphics_backend_name(void)
+{
+    if (!g_graphics_active) {
+        return "framebuffer-idle";
+    }
+    return g_graphics_vmware_backend ? "vmware-svga" : "bochs-bga";
+}
+
 bool graphics_driver_init(void)
 {
     log_write("graphics driver: registered");

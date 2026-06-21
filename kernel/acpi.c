@@ -15,6 +15,7 @@
 #define ACPI_PM1_PWRBTN_STS 0x0100U
 #define ACPI_PM1_PWRBTN_EN  0x0100U
 #define ACPI_PM1_WAKE_CLEAR 0x8D00U
+#define ACPI_TABLE_PHYS_LIMIT 0x40000000ULL
 
 typedef struct {
     uint64_t signature;
@@ -68,6 +69,27 @@ static uint16_t g_slp_typb;
 static bool g_acpi_ready;
 static bool g_acpi_power_button_ready;
 static bool g_acpi_power_button_hooked;
+static acpi_info_t g_acpi_info;
+static char g_acpi_status[64];
+
+static void acpi_refresh_public_info(void)
+{
+    g_acpi_info.ready = g_acpi_ready;
+    g_acpi_info.power_button_ready = g_acpi_power_button_ready;
+    g_acpi_info.power_button_hooked = g_acpi_power_button_hooked;
+    g_acpi_info.sci_irq = g_sci_irq;
+    g_acpi_info.pm1a_cnt = g_pm1a_cnt;
+    g_acpi_info.pm1b_cnt = g_pm1b_cnt;
+    g_acpi_info.pm1a_evt = g_pm1a_evt;
+    g_acpi_info.pm1b_evt = g_pm1b_evt;
+    g_acpi_info.slp_typa = g_slp_typa;
+    g_acpi_info.slp_typb = g_slp_typb;
+    if (g_acpi_ready) {
+        strcpy(g_acpi_status, g_acpi_power_button_hooked ? "acpi: s5/power button ready" : "acpi: s5 ready");
+    } else {
+        strcpy(g_acpi_status, "acpi: not ready");
+    }
+}
 
 static uint8_t acpi_checksum(const void *ptr, uint32_t length)
 {
@@ -134,7 +156,7 @@ static const acpi_sdt_header_t *acpi_find_table_rsdt(const acpi_sdt_header_t *rs
     for (uint32_t i = 0; i < count; i++) {
         kernel_log_hex_u32("acpi: rsdt_entry=", entries[i]);
     }
-    const uint64_t MAX_SAFE_PHYS = 0x00800000ULL; /* 8 MiB */
+    const uint64_t MAX_SAFE_PHYS = ACPI_TABLE_PHYS_LIMIT;
     for (uint32_t i = 0; i < count; i++) {
         uint64_t phys = (uint64_t) entries[i];
         if (phys == 0 || phys > MAX_SAFE_PHYS) {
@@ -165,7 +187,7 @@ static const acpi_sdt_header_t *acpi_find_table_xsdt(const acpi_sdt_header_t *xs
         kernel_log_hex_u32("acpi: xsdt_entry_lo=", (uint32_t)(entries[i] & 0xFFFFFFFF));
         kernel_log_hex_u32("acpi: xsdt_entry_hi=", (uint32_t)((entries[i] >> 32) & 0xFFFFFFFF));
     }
-    const uint64_t MAX_SAFE_PHYS64 = 0x00800000ULL; /* 8 MiB */
+    const uint64_t MAX_SAFE_PHYS64 = ACPI_TABLE_PHYS_LIMIT;
     for (uint32_t i = 0; i < count; i++) {
         uint64_t phys = (uint64_t) entries[i];
         if (phys == 0 || phys > MAX_SAFE_PHYS64) {
@@ -257,9 +279,11 @@ void acpi_init(void)
     g_slp_typb = 0;
     g_acpi_power_button_ready = false;
     g_acpi_power_button_hooked = false;
+    acpi_refresh_public_info();
 
     if (rsdp == NULL) {
         log_write("acpi: rsdp not found");
+        acpi_refresh_public_info();
         return;
     }
     kernel_log_hex_u32("acpi: rsdp_va_lo=", (uint32_t) ((uint64_t) rsdp & 0xFFFFFFFF));
@@ -271,7 +295,7 @@ void acpi_init(void)
     }
     if (rsdp->revision >= 2 && rsdp->xsdt_address != 0) {
         /* Avoid dereferencing XSDT pointer if it points to an unmapped/high phys address. */
-        if ((uint64_t) rsdp->xsdt_address <= 0x00800000ULL) {
+        if ((uint64_t) rsdp->xsdt_address < ACPI_TABLE_PHYS_LIMIT) {
             fadt_header = acpi_find_table_xsdt((const acpi_sdt_header_t *) (uint64_t) rsdp->xsdt_address, ACPI_SIG_FACP);
         } else {
             kernel_log_hex_u32("acpi: skipping xsdt_addr=", (uint32_t)(rsdp->xsdt_address & 0xFFFFFFFF));
@@ -279,7 +303,7 @@ void acpi_init(void)
     }
     if (fadt_header == NULL && rsdp->rsdt_address != 0) {
         /* Avoid dereferencing RSDT pointer if it points to an unmapped/high phys address. */
-        if ((uint64_t) rsdp->rsdt_address <= 0x00800000ULL) {
+        if ((uint64_t) rsdp->rsdt_address < ACPI_TABLE_PHYS_LIMIT) {
             fadt_header = acpi_find_table_rsdt((const acpi_sdt_header_t *) (uint64_t) rsdp->rsdt_address, ACPI_SIG_FACP);
         } else {
             kernel_log_hex_u32("acpi: skipping rsdt_addr=", (uint32_t)(rsdp->rsdt_address & 0xFFFFFFFF));
@@ -287,6 +311,7 @@ void acpi_init(void)
     }
     if (fadt_header == NULL || fadt_header->length < sizeof(acpi_fadt_min_t)) {
         log_write("acpi: fadt not found");
+        acpi_refresh_public_info();
         return;
     }
 
@@ -294,6 +319,7 @@ void acpi_init(void)
     dsdt = (const acpi_sdt_header_t *) (uint64_t) fadt->dsdt;
     if (!acpi_parse_s5(dsdt)) {
         log_write("acpi: s5 not found");
+        acpi_refresh_public_info();
         return;
     }
     g_pm1a_cnt = (uint16_t) fadt->pm1a_cnt_blk;
@@ -303,6 +329,7 @@ void acpi_init(void)
     g_sci_irq = fadt->sci_int;
     if (g_pm1a_cnt == 0) {
         log_write("acpi: pm1 control block missing");
+        acpi_refresh_public_info();
         return;
     }
     g_acpi_ready = true;
@@ -310,6 +337,7 @@ void acpi_init(void)
     kernel_log_hex_u32("acpi: pm1a=", g_pm1a_cnt);
     kernel_log_hex_u32("acpi: slp_typa=", g_slp_typa);
     log_write("acpi: s5 ready");
+    acpi_refresh_public_info();
 }
 
 static uint16_t acpi_read_pm1_status(void)
@@ -377,6 +405,7 @@ void acpi_enable_power_button(void)
     } else {
         log_write("acpi: power button hook failed");
     }
+    acpi_refresh_public_info();
 }
 
 bool acpi_poweroff(void)
@@ -391,4 +420,16 @@ bool acpi_poweroff(void)
         return true;
     }
     return false;
+}
+
+const acpi_info_t *acpi_info(void)
+{
+    acpi_refresh_public_info();
+    return &g_acpi_info;
+}
+
+const char *acpi_status(void)
+{
+    acpi_refresh_public_info();
+    return g_acpi_status;
 }

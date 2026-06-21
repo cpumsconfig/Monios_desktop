@@ -1,20 +1,70 @@
+#include "ahci.h"
+#include "aac.h"
 #include "base64.h"
+#include "bios.h"
+#include "bitmap.h"
+#include "bluetooth.h"
+#include "browser.h"
 #include "bsod.h"
+#include "buddy.h"
 #include "common.h"
 #include "console.h"
+#include "cpu.h"
 #include "device.h"
+#include "dns.h"
+#include "eevdf.h"
+#include "extfs.h"
 #include "exec.h"
 #include "file.h"
+#include "frame.h"
+#include "fs_cache.h"
+#include "futex.h"
+#include "gop.h"
+#include "gpu.h"
 #include "graphics.h"
+#include "gui.h"
 #include "hash.h"
+#include "hda.h"
+#include "heap.h"
+#include "hid.h"
+#include "http.h"
+#include "iic.h"
+#include "ide.h"
+#include "ipc.h"
+#include "ipv4.h"
+#include "ipv6.h"
+#include "lazyalloc.h"
 #include "kernel.h"
+#include "lwip.h"
 #include "memory.h"
+#include "muqss.h"
 #include "net.h"
+#include "ntfs.h"
+#include "nvme.h"
 #include "path.h"
+#include "pcb.h"
+#include "pcnet.h"
+#include "pool.h"
+#include "power.h"
+#include "prsys.h"
+#include "rtc.h"
+#include "scheduler.h"
+#include "schedopt.h"
+#include "session.h"
 #include "shell.h"
+#include "signal.h"
 #include "smp.h"
+#include "socket.h"
+#include "storage_ext.h"
+#include "tcb.h"
 #include "string.h"
 #include "terminal.h"
+#include "tls.h"
+#include "usb_ext.h"
+#include "vma.h"
+#include "vmext.h"
+#include "wifi.h"
+#include "xhci.h"
 
 #define SHELL_LINE_MAX 256
 #define SHELL_ARG_MAX  8
@@ -375,10 +425,18 @@ static void shell_complete_scan_dir(const char *dir, const char *prefix, bool di
 static void shell_complete_command(const char *prefix, uint32_t prefix_len)
 {
     static const char *commands[] = {
-        "help", "whoami", "pwd", "cd", "ls", "cat", "echo", "wc",
+        "help", "whoami", "users", "login", "pwd", "cd", "ls", "cat", "echo", "wc",
         "upper", "lower", "mkdir", "touch", "write", "rm", "rmdir",
         "run", "hash", "base64", "env", "set", "unset", "sudo", "su",
-        "exit", "shutdown", "net", "dhcp", "udp", "ping", "dev",
+        "exit", "shutdown", "net", "dhcp", "dns", "ipv4", "ipv6",
+        "cpu", "fpu", "cpuid", "tcb", "ide", "ahci", "nvme", "hda",
+        "aac", "pcnet", "lwip", "xhci", "usbext", "hid", "ntfs", "extfs", "fscache",
+        "tls", "ssl", "http", "https", "wifi", "bluetooth", "storagex", "gpu", "gui",
+        "browser", "power", "vmext", "schedopt",
+        "iic", "bios", "gop", "rtc", "heap", "frame", "vma",
+        "lazyalloc", "bitmap", "buddy", "eevdf", "futex", "ipc",
+        "muqss", "pcb", "pool", "prsys", "scheduler", "signal",
+        "socket", "udp", "ping", "dev",
         "wm", "term", "smp", "taskmgr", "clear", "which", "grep",
         "head", "tail", NULL
     };
@@ -827,6 +885,93 @@ static bool shell_join_args(uint32_t argc, char *argv[SHELL_ARG_MAX], uint32_t s
         }
     }
     output[pos] = '\0';
+    return true;
+}
+
+static bool shell_parse_u32_arg(const char *text, uint32_t *out)
+{
+    uint32_t value = 0;
+    uint32_t base = 10;
+    uint32_t index = 0;
+
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return false;
+    }
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        index = 2;
+    }
+    for (; text[index] != '\0'; index++) {
+        char ch = text[index];
+
+        if (base == 10) {
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            value = value * 10u + (uint32_t) (ch - '0');
+        } else {
+            value <<= 4;
+            if (ch >= '0' && ch <= '9') {
+                value |= (uint32_t) (ch - '0');
+            } else if (ch >= 'a' && ch <= 'f') {
+                value |= (uint32_t) (ch - 'a' + 10);
+            } else if (ch >= 'A' && ch <= 'F') {
+                value |= (uint32_t) (ch - 'A' + 10);
+            } else {
+                return false;
+            }
+        }
+    }
+    *out = value;
+    return true;
+}
+
+static bool shell_parse_u16_arg(const char *text, uint16_t *out)
+{
+    uint32_t value;
+
+    if (!shell_parse_u32_arg(text, &value) || value > 65535) {
+        return false;
+    }
+    *out = (uint16_t) value;
+    return true;
+}
+
+static bool shell_parse_u64_arg(const char *text, uint64_t *out)
+{
+    uint64_t value = 0;
+    uint32_t base = 10;
+    uint32_t index = 0;
+
+    if (text == NULL || text[0] == '\0' || out == NULL) {
+        return false;
+    }
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        base = 16;
+        index = 2;
+    }
+    for (; text[index] != '\0'; index++) {
+        char ch = text[index];
+
+        if (base == 10) {
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            value = value * 10u + (uint64_t) (ch - '0');
+        } else {
+            value <<= 4;
+            if (ch >= '0' && ch <= '9') {
+                value |= (uint64_t) (ch - '0');
+            } else if (ch >= 'a' && ch <= 'f') {
+                value |= (uint64_t) (ch - 'a' + 10);
+            } else if (ch >= 'A' && ch <= 'F') {
+                value |= (uint64_t) (ch - 'A' + 10);
+            } else {
+                return false;
+            }
+        }
+    }
+    *out = value;
     return true;
 }
 
@@ -1506,6 +1651,83 @@ static void shell_print_u32_prefixed(const char *prefix, uint32_t value)
     shell_print_line(buffer);
 }
 
+static void shell_print_i32_prefixed(const char *prefix, int32_t value)
+{
+    uint32_t magnitude;
+
+    if (value < 0) {
+        char buffer[64];
+
+        strcpy(buffer, prefix);
+        if (strlen(buffer) + 2 < sizeof(buffer)) {
+            strcpy(buffer + strlen(buffer), "-");
+            prefix = buffer;
+        }
+        magnitude = (uint32_t) (-(value + 1)) + 1u;
+    } else {
+        magnitude = (uint32_t) value;
+    }
+    shell_print_u32_prefixed(prefix, magnitude);
+}
+
+static void shell_print_hex_u32_prefixed(const char *prefix, uint32_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char buffer[64];
+    uint32_t index = 0;
+
+    strcpy(buffer, prefix);
+    index = (uint32_t) strlen(buffer);
+    buffer[index++] = '0';
+    buffer[index++] = 'x';
+    for (uint32_t i = 0; i < 8 && index + 1 < sizeof(buffer); i++) {
+        buffer[index++] = hex[(value >> ((7 - i) * 4)) & 0xF];
+    }
+    buffer[index] = '\0';
+    shell_print_line(buffer);
+}
+
+static void shell_print_u64_prefixed(const char *prefix, uint64_t value)
+{
+    char buffer[80];
+    char temp[20];
+    uint32_t index;
+    uint32_t count = 0;
+
+    strcpy(buffer, prefix);
+    index = (uint32_t) strlen(buffer);
+    if (value == 0) {
+        buffer[index++] = '0';
+    } else {
+        while (value > 0 && count < sizeof(temp)) {
+            temp[count++] = (char) ('0' + (value % 10));
+            value /= 10;
+        }
+        while (count > 0 && index + 1 < sizeof(buffer)) {
+            buffer[index++] = temp[--count];
+        }
+    }
+    buffer[index] = '\0';
+    shell_print_line(buffer);
+}
+
+static void shell_print_hex_u64_prefixed(const char *prefix, uint64_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char buffer[80];
+    uint32_t index = 0;
+
+    strcpy(buffer, prefix);
+    index = (uint32_t) strlen(buffer);
+    buffer[index++] = '0';
+    buffer[index++] = 'x';
+    for (uint32_t i = 0; i < 16 && index + 1 < sizeof(buffer); i++) {
+        buffer[index++] = hex[(value >> ((15 - i) * 4)) & 0xF];
+    }
+    buffer[index] = '\0';
+    shell_print_line(buffer);
+}
+
 static uint32_t shell_count_lines(const char *text)
 {
     uint32_t lines = 0;
@@ -1753,7 +1975,7 @@ static void shell_run_command(char *line, bool elevated_once)
     argc = shell_expand_globs_in_argv(argc, argv);
 
     if (strcmp(argv[0], "help") == 0) {
-        shell_print_line("help whoami pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp udp ping dev wm term smp taskmgr clear which grep head tail");
+        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme storagex hda aac pcnet lwip xhci usbext hid ntfs extfs fscache iic bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail");
         return;
     }
 
@@ -2152,7 +2374,65 @@ static void shell_run_command(char *line, bool elevated_once)
     }
 
     if (strcmp(argv[0], "whoami") == 0) {
-        shell_print_line(g_shell_privilege == SHELL_PRIV_R0 ? "R0" : "R3");
+        const session_user_t *user = session_current_user();
+
+        shell_print_line(user != NULL ? user->name : "unknown");
+        shell_print_line(g_shell_privilege == SHELL_PRIV_R0 ? "ring: R0" : "ring: R3");
+        return;
+    }
+
+    if (strcmp(argv[0], "users") == 0) {
+        const session_user_t *current = session_current_user();
+
+        for (uint32_t i = 0; i < session_user_count(); i++) {
+            const session_user_t *user = session_user_at(i);
+            char line[64];
+
+            if (user != NULL) {
+                line[0] = '\0';
+                if (current != NULL && strcmp(current->name, user->name) == 0) {
+                    strcpy(line, "* ");
+                }
+                strcat(line, user->name);
+                shell_print_line(line);
+                shell_print_line(user->home);
+            }
+        }
+        shell_print_u32_prefixed("count: ", session_user_count());
+        shell_print_line(current != NULL ? current->name : "unknown");
+        return;
+    }
+
+    if (strcmp(argv[0], "login") == 0) {
+        const session_user_t *user;
+        char pair[SHELL_ENV_LEN];
+
+        if (argc < 2) {
+            shell_print_line("usage: login <user>");
+            return;
+        }
+        if (!session_login_name(argv[1])) {
+            shell_print_line("unknown user");
+            return;
+        }
+        user = session_current_user();
+        if (user == NULL) {
+            shell_print_line("login failed");
+            return;
+        }
+        strcpy(pair, "USER=");
+        strcat(pair, user->name);
+        shell_env_set_pair(pair);
+        strcpy(pair, "HOME=");
+        strcat(pair, user->home);
+        shell_env_set_pair(pair);
+        strcpy(pair, "PWD=");
+        strcat(pair, user->home);
+        shell_env_set_pair(pair);
+        if (file_is_dir(user->home)) {
+            strcpy(g_shell_cwd, user->home);
+        }
+        shell_print_line(user->name);
         return;
     }
 
@@ -2243,6 +2523,974 @@ static void shell_run_command(char *line, bool elevated_once)
         return;
     }
 
+    if (strcmp(argv[0], "dns") == 0) {
+        uint8_t ip[4];
+        char text[16];
+
+        if (argc < 2) {
+            shell_print_line("usage: dns <name>");
+            return;
+        }
+        if (dns_resolve_ipv4(argv[1], ip)) {
+            ipv4_to_text(ip, text);
+            shell_print_line(text);
+        } else {
+            shell_print_line(dns_status());
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "ipv4") == 0) {
+        uint8_t ip[4];
+        char text[16];
+
+        if (argc < 2) {
+            const net_info_t *info = net_info();
+
+            shell_print_line(info->ip_text);
+            shell_print_line(info->gateway_text);
+            shell_print_line(info->dns_text);
+            return;
+        }
+        if (!ipv4_parse(argv[1], ip)) {
+            shell_print_line("bad ipv4");
+            return;
+        }
+        ipv4_to_text(ip, text);
+        shell_print_line(text);
+        if (ipv4_is_loopback(ip)) shell_print_line("loopback");
+        if (ipv4_is_private(ip)) shell_print_line("private");
+        if (ipv4_is_link_local(ip)) shell_print_line("link-local");
+        if (ipv4_is_multicast(ip)) shell_print_line("multicast");
+        return;
+    }
+
+    if (strcmp(argv[0], "ipv6") == 0) {
+        uint8_t ip[16];
+        char text[48];
+
+        if (argc < 2) {
+            const ipv6_info_t *info = ipv6_info();
+
+            shell_print_line(ipv6_status());
+            shell_print_line(info->link_local);
+            shell_print_u32_prefixed("parsed: ", info->parsed_count);
+            return;
+        }
+        if (!ipv6_parse(argv[1], ip)) {
+            shell_print_line("bad ipv6");
+            return;
+        }
+        ipv6_to_text(ip, text, sizeof(text));
+        shell_print_line(text);
+        if (ipv6_is_unspecified(ip)) shell_print_line("unspecified");
+        if (ipv6_is_loopback(ip)) shell_print_line("loopback");
+        if (ipv6_is_link_local(ip)) shell_print_line("link-local");
+        if (ipv6_is_multicast(ip)) shell_print_line("multicast");
+        if (ipv6_is_unique_local(ip)) shell_print_line("unique-local");
+        if (ipv6_is_global_unicast(ip)) shell_print_line("global-unicast");
+        if (argc >= 4 && strcmp(argv[2], "prefix") == 0) {
+            uint8_t other[16];
+            uint32_t prefix = 0;
+
+            if (!ipv6_parse(argv[3], other) ||
+                (argc >= 5 && !shell_parse_u32_arg(argv[4], &prefix)) ||
+                prefix > 128) {
+                shell_print_line("usage: ipv6 <addr> prefix <other> [bits]");
+                return;
+            }
+            if (argc < 5) {
+                prefix = 64;
+            }
+            shell_print_line(ipv6_prefix_match(ip, other, (uint8_t) prefix) ? "prefix: match" : "prefix: no");
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "tls") == 0 || strcmp(argv[0], "ssl") == 0) {
+        const tls_info_t *info = tls_info();
+
+        if (argc >= 2) {
+            shell_print_line(tls_probe_server_name(argv[1]) ? tls_status() : tls_status());
+            return;
+        }
+        shell_print_line(tls_status());
+        shell_print_line(info->record_layer ? "record: yes" : "record: no");
+        shell_print_line(info->x509_parser ? "x509: yes" : "x509: no");
+        shell_print_line(info->crypto_backend_ready ? "crypto: yes" : "crypto: pending");
+        shell_print_u32_prefixed("probes: ", info->probes);
+        return;
+    }
+
+    if (strcmp(argv[0], "http") == 0 || strcmp(argv[0], "https") == 0) {
+        const http_info_t *info = http_info();
+
+        if (argc >= 3 && strcmp(argv[1], "get") == 0) {
+            char request[512];
+
+            if (http_build_get_request(argv[2], argc >= 4 ? argv[3] : "/", request, sizeof(request))) {
+                shell_print_line(request);
+            } else {
+                shell_print_line(http_status());
+            }
+            return;
+        }
+        if (argc >= 2) {
+            shell_print_line(http_probe_url(argv[1]) ? http_status() : http_status());
+            return;
+        }
+        shell_print_line(http_status());
+        shell_print_u32_prefixed("requests: ", info->requests_built);
+        shell_print_u32_prefixed("https probes: ", info->https_probes);
+        return;
+    }
+
+    if (strcmp(argv[0], "browser") == 0) {
+        const browser_info_t *info = browser_info();
+
+        if (argc >= 2) {
+            shell_print_line(browser_open_url(argv[1]) ? browser_status() : browser_status());
+            return;
+        }
+        shell_print_line(browser_status());
+        shell_print_line(info->last_url);
+        shell_print_u32_prefixed("pages: ", info->pages_requested);
+        return;
+    }
+
+    if (strcmp(argv[0], "wifi") == 0) {
+        const wifi_info_t *info = wifi_info();
+
+        shell_print_line(wifi_status());
+        if (info->present) {
+            shell_print_hex_u32_prefixed("device: ", ((uint32_t) info->vendor_id << 16) | info->device_id);
+            shell_print_u32_prefixed("bus: ", info->bus);
+            shell_print_u32_prefixed("slot: ", info->slot);
+            shell_print_u32_prefixed("irq: ", info->irq);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "bluetooth") == 0) {
+        const bluetooth_info_t *info = bluetooth_info();
+
+        shell_print_line(bluetooth_status());
+        shell_print_line(info->usb_transport_ready ? "transport: usb" : "transport: none");
+        shell_print_u32_prefixed("controllers: ", info->controllers);
+        return;
+    }
+
+    if (strcmp(argv[0], "cpu") == 0 || strcmp(argv[0], "fpu") == 0) {
+        const cpu_info_t *info = cpu_current_info();
+
+        shell_print_line(info->vendor);
+        shell_print_line(info->brand[0] != '\0' ? info->brand : "unknown");
+        shell_print_line(info->has_fpu ? "fpu: present" : "fpu: absent");
+        shell_print_line(cpu_fpu_enabled() ? "fpu: enabled" : "fpu: disabled");
+        shell_print_line(info->has_sse ? "sse: yes" : "sse: no");
+        shell_print_line(info->has_sse2 ? "sse2: yes" : "sse2: no");
+        shell_print_line(info->has_avx ? "avx: yes" : "avx: no");
+        return;
+    }
+
+    if (strcmp(argv[0], "cpuid") == 0) {
+        cpuid_regs_t regs;
+        uint32_t leaf = 0;
+        uint32_t subleaf = 0;
+
+        if (argc >= 2) {
+            if (!shell_parse_u32_arg(argv[1], &leaf)) {
+                shell_print_line("usage: cpuid [leaf] [subleaf]");
+                return;
+            }
+        }
+        if (argc >= 3 && !shell_parse_u32_arg(argv[2], &subleaf)) {
+            shell_print_line("usage: cpuid [leaf] [subleaf]");
+            return;
+        }
+        cpu_cpuid_query(leaf, subleaf, &regs);
+        shell_print_hex_u32_prefixed("eax: ", regs.eax);
+        shell_print_hex_u32_prefixed("ebx: ", regs.ebx);
+        shell_print_hex_u32_prefixed("ecx: ", regs.ecx);
+        shell_print_hex_u32_prefixed("edx: ", regs.edx);
+        return;
+    }
+
+    if (strcmp(argv[0], "tcb") == 0) {
+        tcb_t tcb;
+
+        for (uint32_t i = 0; i < tcb_capacity(); i++) {
+            if (tcb_snapshot(i, &tcb) && tcb.used) {
+                shell_print_u32_prefixed("id: ", tcb.id);
+                shell_print_line(tcb.name != NULL ? tcb.name : "(unnamed)");
+                shell_print_u32_prefixed("period: ", tcb.period_ticks);
+                shell_print_u32_prefixed("runs: ", tcb.run_count);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "ide") == 0) {
+        const ide_info_t *info = ide_info();
+
+        shell_print_line(ide_status());
+        if (info->present) {
+            shell_print_line(info->model);
+            shell_print_u32_prefixed("sectors: ", info->sectors);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "ahci") == 0) {
+        const ahci_info_t *info = ahci_info();
+
+        shell_print_line(ahci_status());
+        if (info->present) {
+            shell_print_hex_u32_prefixed("abar: ", info->abar);
+            shell_print_hex_u32_prefixed("cap: ", info->cap);
+            shell_print_hex_u32_prefixed("ports: ", info->ports_implemented);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "nvme") == 0) {
+        const nvme_info_t *info = nvme_info();
+
+        shell_print_line(nvme_status());
+        if (info->present) {
+            shell_print_hex_u32_prefixed("mmio: ", info->mmio_base);
+            shell_print_hex_u32_prefixed("version: ", info->version);
+            shell_print_hex_u32_prefixed("csts: ", info->csts);
+            shell_print_u32_prefixed("queue entries: ", info->max_queue_entries);
+            shell_print_u32_prefixed("doorbell stride: ", info->doorbell_stride);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "storagex") == 0) {
+        const storage_ext_info_t *info = storage_ext_info();
+
+        shell_print_line(storage_ext_status());
+        shell_print_u32_prefixed("ide: ", info->ide_controllers);
+        shell_print_u32_prefixed("sata: ", info->sata_controllers);
+        shell_print_u32_prefixed("nvme: ", info->nvme_controllers);
+        shell_print_u32_prefixed("scsi: ", info->scsi_controllers);
+        shell_print_u32_prefixed("raid: ", info->raid_controllers);
+        shell_print_u32_prefixed("other: ", info->other_storage);
+        return;
+    }
+
+    if (strcmp(argv[0], "hda") == 0) {
+        const hda_info_t *info = hda_info();
+
+        shell_print_line(hda_status());
+        if (info->present) {
+            shell_print_hex_u32_prefixed("mmio: ", info->mmio_base);
+            shell_print_hex_u32_prefixed("gcap: ", info->global_cap);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "aac") == 0) {
+        aac_info_t info;
+        char path[PATH_MAX_LEN];
+
+        if (argc < 2) {
+            const aac_info_t *last = aac_last_info();
+
+            shell_print_line(aac_status());
+            if (last->valid) {
+                shell_print_line(last->codec);
+                shell_print_u32_prefixed("sample rate: ", last->sample_rate);
+                shell_print_u32_prefixed("channels: ", last->channels);
+                shell_print_u32_prefixed("frame length: ", last->frame_length);
+                shell_print_u32_prefixed("duration ms: ", last->duration_ms);
+            }
+            return;
+        }
+        if (!shell_resolve_path(argv[1], path)) {
+            shell_print_line("invalid path");
+            return;
+        }
+        if (!aac_probe_file(path, &info)) {
+            shell_print_line(aac_status());
+            return;
+        }
+        shell_print_line(aac_status());
+        shell_print_line(info.codec);
+        shell_print_u32_prefixed("sample rate: ", info.sample_rate);
+        shell_print_u32_prefixed("channels: ", info.channels);
+        shell_print_u32_prefixed("frame length: ", info.frame_length);
+        shell_print_u32_prefixed("frames: ", info.estimated_frames);
+        shell_print_u32_prefixed("duration ms: ", info.duration_ms);
+        return;
+    }
+
+    if (strcmp(argv[0], "pcnet") == 0) {
+        const pcnet_info_t *info = pcnet_info();
+
+        shell_print_line(pcnet_status());
+        if (info->present) {
+            shell_print_line(info->mac_text);
+            shell_print_hex_u32_prefixed("io: ", info->io_base);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "lwip") == 0) {
+        const lwip_info_t *info = lwip_info();
+        uint16_t port;
+
+        if (argc >= 5 && strcmp(argv[1], "send") == 0) {
+            char payload[SHELL_STREAM_MAX];
+
+            if (!shell_parse_u16_arg(argv[3], &port)) {
+                shell_print_line("usage: lwip send <ip/name> <port> <text>");
+                return;
+            }
+            if (!shell_join_args(argc, argv, 4, payload, sizeof(payload))) {
+                shell_print_line("lwip payload too long");
+                return;
+            }
+            shell_print_line(lwip_udp_send(argv[2], port, (const uint8_t *) payload, (uint16_t) strlen(payload)) ? lwip_status() : lwip_status());
+            return;
+        }
+        shell_print_line(lwip_status());
+        shell_print_line(info->driver);
+        shell_print_line(info->netif_up ? "netif: up" : "netif: down");
+        shell_print_line(info->ip);
+        shell_print_line(info->gateway);
+        shell_print_line(info->dns);
+        shell_print_line(info->dhcp_configured ? "dhcp: yes" : "dhcp: no");
+        shell_print_line(info->dns_configured ? "dns: yes" : "dns: no");
+        shell_print_u32_prefixed("udp sockets: ", info->udp_sockets);
+        shell_print_u32_prefixed("tcp pcbs: ", info->tcp_pcbs);
+        shell_print_u32_prefixed("tx: ", info->tx_packets);
+        shell_print_u32_prefixed("rx: ", info->rx_packets);
+        return;
+    }
+
+    if (strcmp(argv[0], "xhci") == 0) {
+        const xhci_info_t *info = xhci_info();
+
+        shell_print_line(xhci_status());
+        if (info->present) {
+            shell_print_hex_u32_prefixed("mmio: ", info->mmio_base);
+            shell_print_hex_u32_prefixed("hci version: ", info->hci_version);
+            shell_print_u32_prefixed("cap length: ", info->cap_length);
+            shell_print_u32_prefixed("max slots: ", info->max_slots);
+            shell_print_u32_prefixed("max ports: ", info->max_ports);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "usbext") == 0) {
+        const usb_ext_info_t *info = usb_ext_info();
+
+        shell_print_line(usb_ext_status());
+        shell_print_line(info->legacy_ready ? "legacy: yes" : "legacy: no");
+        shell_print_line(info->native_host_present ? "native: yes" : "native: no");
+        shell_print_line(info->xhci_present ? "xhci: yes" : "xhci: no");
+        shell_print_u32_prefixed("root ports: ", info->root_ports);
+        shell_print_u32_prefixed("max slots: ", info->max_slots);
+        return;
+    }
+
+    if (strcmp(argv[0], "hid") == 0) {
+        const hid_info_t *info = hid_info();
+
+        shell_print_line(hid_status());
+        shell_print_line(info->legacy_keyboard ? "legacy keyboard: yes" : "legacy keyboard: no");
+        shell_print_line(info->legacy_mouse ? "legacy mouse: yes" : "legacy mouse: no");
+        shell_print_line(info->usb_legacy ? "usb legacy: yes" : "usb legacy: no");
+        shell_print_line(info->xhci_present ? "xhci: yes" : "xhci: no");
+        shell_print_u32_prefixed("key events: ", info->key_events_seen);
+        shell_print_i32_prefixed("mouse x: ", info->mouse_x);
+        shell_print_i32_prefixed("mouse y: ", info->mouse_y);
+        shell_print_u32_prefixed("buttons: ", info->mouse_buttons);
+        return;
+    }
+
+    if (strcmp(argv[0], "ntfs") == 0) {
+        const ntfs_info_t *info = ntfs_info();
+
+        shell_print_line(ntfs_status());
+        if (info->present) {
+            shell_print_u32_prefixed("volume lba: ", info->volume_lba);
+            shell_print_u32_prefixed("bytes/sector: ", info->bytes_per_sector);
+            shell_print_u32_prefixed("sectors/cluster: ", info->sectors_per_cluster);
+            shell_print_u64_prefixed("total sectors: ", info->total_sectors);
+            shell_print_u64_prefixed("mft lcn: ", info->mft_lcn);
+            shell_print_u64_prefixed("mftmirr lcn: ", info->mftmirr_lcn);
+            shell_print_u32_prefixed("cluster size: ", info->cluster_size);
+            shell_print_u32_prefixed("mft record: ", info->mft_record_size);
+            shell_print_u32_prefixed("index record: ", info->index_record_size);
+            shell_print_u32_prefixed("mft0 lba: ", info->mft0_lba);
+            shell_print_line(info->mft0_readable ? "mft0: readable" : "mft0: unreadable");
+            shell_print_hex_u32_prefixed("serial low: ", info->serial_low);
+            shell_print_hex_u32_prefixed("serial high: ", info->serial_high);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "extfs") == 0) {
+        const extfs_info_t *info = extfs_info();
+
+        shell_print_line(extfs_status());
+        if (info->present) {
+            shell_print_u32_prefixed("volume lba: ", info->volume_lba);
+            shell_print_u32_prefixed("block size: ", info->block_size);
+            shell_print_u32_prefixed("blocks: ", info->blocks_count);
+            shell_print_u32_prefixed("inodes: ", info->inodes_count);
+            shell_print_u32_prefixed("inode size: ", info->inode_size);
+            shell_print_hex_u32_prefixed("compat: ", info->feature_compat);
+            shell_print_hex_u32_prefixed("incompat: ", info->feature_incompat);
+            shell_print_hex_u32_prefixed("ro compat: ", info->feature_ro_compat);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "fscache") == 0) {
+        const fs_cache_info_t *info = fs_cache_info();
+
+        if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+            fs_cache_invalidate_all();
+            shell_print_line(fs_cache_status());
+            return;
+        }
+        shell_print_line(fs_cache_status());
+        shell_print_line(info->enabled ? "enabled: yes" : "enabled: no");
+        shell_print_line(file_backend_name());
+        shell_print_u32_prefixed("slots: ", info->slots);
+        shell_print_u32_prefixed("block size: ", info->block_size);
+        shell_print_u32_prefixed("hits: ", info->hits);
+        shell_print_u32_prefixed("misses: ", info->misses);
+        shell_print_u32_prefixed("fills: ", info->fills);
+        shell_print_u32_prefixed("invalidations: ", info->invalidations);
+        return;
+    }
+
+    if (strcmp(argv[0], "iic") == 0) {
+        uint8_t addrs[32];
+        uint32_t probe;
+
+        if (argc >= 2 && strcmp(argv[1], "scan") == 0) {
+            uint32_t count = iic_scan(addrs, sizeof(addrs));
+
+            shell_print_line(iic_status());
+            for (uint32_t i = 0; i < count; i++) {
+                shell_print_hex_u32_prefixed("addr: ", addrs[i]);
+            }
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "probe") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &probe) || probe > 0x7F) {
+                shell_print_line("usage: iic probe <addr>");
+                return;
+            }
+            shell_print_line(iic_probe((uint8_t) probe) ? iic_status() : iic_status());
+            return;
+        }
+        shell_print_line(iic_status());
+        shell_print_u32_prefixed("adapters: ", iic_info()->adapters);
+        shell_print_u32_prefixed("found: ", iic_info()->found_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "bios") == 0) {
+        const bios_info_t *info = bios_info();
+
+        shell_print_line(bios_status());
+        shell_print_hex_u32_prefixed("equipment: ", info->equipment_word);
+        shell_print_u32_prefixed("conv kb: ", info->conventional_kb);
+        shell_print_hex_u32_prefixed("ebda seg: ", info->ebda_segment);
+        shell_print_u32_prefixed("com ports: ", info->com_ports);
+        return;
+    }
+
+    if (strcmp(argv[0], "gop") == 0) {
+        const gop_info_t *info = gop_info();
+
+        shell_print_line(gop_status());
+        shell_print_line(info->backend);
+        shell_print_hex_u32_prefixed("fb: ", info->framebuffer);
+        shell_print_u32_prefixed("width: ", info->width);
+        shell_print_u32_prefixed("height: ", info->height);
+        shell_print_u32_prefixed("pitch: ", info->pitch_bytes);
+        return;
+    }
+
+    if (strcmp(argv[0], "rtc") == 0) {
+        char text[20];
+
+        shell_print_line(rtc_status());
+        if (rtc_format_time(text, sizeof(text))) {
+            shell_print_line(text);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "heap") == 0) {
+        const heap_info_t *info = heap_info();
+
+        shell_print_line(heap_status());
+        shell_print_hex_u64_prefixed("base: ", info->base);
+        shell_print_u64_prefixed("size: ", info->size);
+        shell_print_u64_prefixed("used: ", info->used);
+        shell_print_u64_prefixed("free: ", info->free_bytes);
+        shell_print_u64_prefixed("high water: ", info->high_water_used);
+        shell_print_u32_prefixed("allocs: ", info->alloc_count);
+        shell_print_u32_prefixed("frees: ", info->free_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "frame") == 0) {
+        const frame_info_t *info = frame_info();
+        uint32_t count = 1;
+
+        if (argc >= 2 && strcmp(argv[1], "alloc") == 0) {
+            uint64_t base;
+
+            if (argc >= 3 && !shell_parse_u32_arg(argv[2], &count)) {
+                shell_print_line("usage: frame alloc [count]");
+                return;
+            }
+            base = frame_alloc(count);
+            if (base == 0) {
+                shell_print_line(frame_status());
+            } else {
+                shell_print_hex_u64_prefixed("frame: ", base);
+            }
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "free") == 0) {
+            uint64_t base;
+
+            if (!shell_parse_u64_arg(argv[2], &base)) {
+                shell_print_line("usage: frame free <base> [count]");
+                return;
+            }
+            if (argc >= 4 && !shell_parse_u32_arg(argv[3], &count)) {
+                shell_print_line("usage: frame free <base> [count]");
+                return;
+            }
+            shell_print_line(frame_free(base, count) ? frame_status() : frame_status());
+            return;
+        }
+        shell_print_line(frame_status());
+        shell_print_u32_prefixed("used: ", info->used_frames);
+        shell_print_u32_prefixed("reserved: ", info->reserved_frames);
+        shell_print_u32_prefixed("total: ", info->total_frames);
+        shell_print_hex_u64_prefixed("last base: ", info->last_base);
+        return;
+    }
+
+    if (strcmp(argv[0], "vma") == 0) {
+        vma_entry_t entry;
+
+        shell_print_line(vma_status());
+        for (uint32_t i = 0; i < vma_count(); i++) {
+            if (vma_snapshot(i, &entry) && entry.used) {
+                shell_print_u32_prefixed("id: ", entry.id);
+                shell_print_line(entry.name);
+                shell_print_hex_u64_prefixed("base: ", entry.base);
+                shell_print_u64_prefixed("size: ", entry.size);
+                shell_print_hex_u32_prefixed("flags: ", entry.flags);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "lazyalloc") == 0) {
+        lazy_region_t region;
+        uint64_t addr;
+
+        if (argc >= 3 && strcmp(argv[1], "touch") == 0) {
+            if (!shell_parse_u64_arg(argv[2], &addr)) {
+                shell_print_line("usage: lazyalloc touch <addr>");
+                return;
+            }
+            shell_print_line(lazyalloc_touch(addr) ? lazyalloc_status() : lazyalloc_status());
+            return;
+        }
+        shell_print_line(lazyalloc_status());
+        for (uint32_t i = 0; i < lazyalloc_count(); i++) {
+            if (lazyalloc_snapshot(i, &region) && region.used) {
+                shell_print_u32_prefixed("id: ", region.id);
+                shell_print_hex_u64_prefixed("base: ", region.base);
+                shell_print_u32_prefixed("pages: ", region.total_pages);
+                shell_print_u32_prefixed("committed: ", region.committed_pages);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "vmext") == 0) {
+        const vmext_info_t *info = vmext_info();
+
+        shell_print_line(vmext_status());
+        shell_print_line(info->paging_active ? "paging: active" : "paging: inactive");
+        shell_print_u32_prefixed("vma regions: ", info->vma_regions);
+        shell_print_u32_prefixed("lazy regions: ", info->lazy_regions);
+        shell_print_hex_u64_prefixed("pml4: ", info->pml4_phys);
+        return;
+    }
+
+    if (strcmp(argv[0], "bitmap") == 0) {
+        const bitmap_stats_t *stats = bitmap_stats();
+
+        shell_print_line(bitmap_status());
+        shell_print_u32_prefixed("set ops: ", stats->set_ops);
+        shell_print_u32_prefixed("clear ops: ", stats->clear_ops);
+        shell_print_u32_prefixed("alloc ops: ", stats->alloc_ops);
+        shell_print_u32_prefixed("free ops: ", stats->free_ops);
+        return;
+    }
+
+    if (strcmp(argv[0], "buddy") == 0) {
+        const buddy_info_t *info = buddy_info();
+        uint32_t order = 0;
+
+        if (argc >= 2 && strcmp(argv[1], "alloc") == 0) {
+            uint64_t base;
+
+            if (argc >= 3 && !shell_parse_u32_arg(argv[2], &order)) {
+                shell_print_line("usage: buddy alloc [order]");
+                return;
+            }
+            base = buddy_alloc(order);
+            if (base == 0) {
+                shell_print_line(buddy_status());
+            } else {
+                shell_print_hex_u64_prefixed("buddy: ", base);
+            }
+            return;
+        }
+        if (argc >= 4 && strcmp(argv[1], "free") == 0) {
+            uint64_t base;
+
+            if (!shell_parse_u64_arg(argv[2], &base) || !shell_parse_u32_arg(argv[3], &order)) {
+                shell_print_line("usage: buddy free <base> <order>");
+                return;
+            }
+            shell_print_line(buddy_free(base, order) ? buddy_status() : buddy_status());
+            return;
+        }
+        shell_print_line(buddy_status());
+        shell_print_u32_prefixed("max order: ", info->max_order);
+        shell_print_u32_prefixed("allocs: ", info->alloc_count);
+        shell_print_u32_prefixed("frees: ", info->free_count);
+        shell_print_u32_prefixed("failures: ", info->failed_allocs);
+        return;
+    }
+
+    if (strcmp(argv[0], "eevdf") == 0) {
+        const eevdf_info_t *info = eevdf_info();
+
+        shell_print_line(eevdf_status());
+        shell_print_u32_prefixed("tracked: ", info->tracked_tasks);
+        shell_print_u32_prefixed("dispatches: ", info->dispatches);
+        shell_print_u64_prefixed("min deadline: ", info->min_deadline);
+        shell_print_u64_prefixed("last deadline: ", info->last_deadline);
+        return;
+    }
+
+    if (strcmp(argv[0], "muqss") == 0) {
+        const muqss_info_t *info = muqss_info();
+
+        shell_print_line(muqss_status());
+        shell_print_u32_prefixed("tracked: ", info->tracked_tasks);
+        shell_print_u32_prefixed("dispatches: ", info->dispatches);
+        shell_print_u32_prefixed("active score: ", info->active_score);
+        shell_print_u32_prefixed("last task: ", info->last_task);
+        return;
+    }
+
+    if (strcmp(argv[0], "scheduler") == 0) {
+        const scheduler_info_t *info = scheduler_info();
+
+        if (argc >= 3 && strcmp(argv[1], "set") == 0) {
+            scheduler_policy_t policy = SCHED_POLICY_RR;
+
+            if (strcmp(argv[2], "rr") == 0) {
+                policy = SCHED_POLICY_RR;
+            } else if (strcmp(argv[2], "eevdf") == 0) {
+                policy = SCHED_POLICY_EEVDF;
+            } else if (strcmp(argv[2], "muqss") == 0) {
+                policy = SCHED_POLICY_MUQSS;
+            } else {
+                shell_print_line("usage: scheduler set [rr|eevdf|muqss]");
+                return;
+            }
+            shell_print_line(scheduler_set_policy(policy) ? scheduler_status() : "scheduler: set failed");
+            return;
+        }
+        shell_print_line(scheduler_status());
+        shell_print_line(scheduler_policy_name(info->policy));
+        shell_print_u32_prefixed("tasks: ", info->task_count);
+        shell_print_u32_prefixed("dispatches: ", info->dispatches);
+        shell_print_u32_prefixed("last task: ", info->last_task);
+        return;
+    }
+
+    if (strcmp(argv[0], "pcb") == 0) {
+        pcb_t pcb;
+
+        shell_print_line(pcb_status());
+        shell_print_u32_prefixed("current pid: ", pcb_current_pid() < 0 ? 0u : (uint32_t) pcb_current_pid());
+        for (uint32_t i = 0; i < pcb_capacity(); i++) {
+            if (pcb_snapshot(i, &pcb) && pcb.used) {
+                shell_print_u32_prefixed("pid: ", pcb.pid);
+                shell_print_line(pcb.name);
+                shell_print_line(pcb_state_name(pcb.state));
+                shell_print_u32_prefixed("signals: ", pcb.pending_signals);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "pool") == 0) {
+        const pool_stats_t *stats = pool_stats();
+
+        shell_print_line(pool_status());
+        shell_print_u32_prefixed("pools: ", stats->pools);
+        shell_print_u32_prefixed("slots total: ", stats->slots_total);
+        shell_print_u32_prefixed("slots used: ", stats->slots_used);
+        shell_print_u32_prefixed("alloc ops: ", stats->alloc_ops);
+        shell_print_u32_prefixed("free ops: ", stats->free_ops);
+        return;
+    }
+
+    if (strcmp(argv[0], "prsys") == 0) {
+        const prsys_info_t *info = prsys_info();
+
+        shell_print_line(prsys_status());
+        shell_print_u32_prefixed("processes: ", info->processes);
+        shell_print_u32_prefixed("tasks: ", info->tasks);
+        shell_print_u64_prefixed("uptime ticks: ", info->uptime_ticks);
+        shell_print_u32_prefixed("policy id: ", info->scheduler_policy);
+        return;
+    }
+
+    if (strcmp(argv[0], "futex") == 0) {
+        uint64_t addr;
+        uint32_t count = 1;
+
+        if (argc >= 4 && strcmp(argv[1], "wait") == 0) {
+            uint32_t expected = 0;
+            uint32_t timeout = 0;
+
+            if (!shell_parse_u64_arg(argv[2], &addr) || !shell_parse_u32_arg(argv[3], &expected)) {
+                shell_print_line("usage: futex wait <addr> <expected> [timeout]");
+                return;
+            }
+            if (argc >= 5 && !shell_parse_u32_arg(argv[4], &timeout)) {
+                shell_print_line("usage: futex wait <addr> <expected> [timeout]");
+                return;
+            }
+            shell_print_u32_prefixed("waiters: ", (uint32_t) futex_wait(addr, expected, timeout));
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "wake") == 0) {
+            if (!shell_parse_u64_arg(argv[2], &addr)) {
+                shell_print_line("usage: futex wake <addr> [count]");
+                return;
+            }
+            if (argc >= 4 && !shell_parse_u32_arg(argv[3], &count)) {
+                shell_print_line("usage: futex wake <addr> [count]");
+                return;
+            }
+            shell_print_u32_prefixed("woken: ", futex_wake(addr, count));
+            return;
+        }
+        shell_print_line(futex_status());
+        shell_print_u32_prefixed("waiters: ", futex_info()->total_waiters);
+        shell_print_u32_prefixed("slots: ", futex_info()->used_slots);
+        return;
+    }
+
+    if (strcmp(argv[0], "ipc") == 0) {
+        int32_t port_id;
+        uint32_t port_value;
+        char text[SHELL_STREAM_MAX];
+
+        if (argc >= 3 && strcmp(argv[1], "create") == 0) {
+            port_id = ipc_port_create(argv[2]);
+            if (port_id < 0) {
+                shell_print_line(ipc_status());
+            } else {
+                shell_print_u32_prefixed("port: ", (uint32_t) port_id);
+            }
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "close") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &port_value)) {
+                shell_print_line("usage: ipc close <port>");
+                return;
+            }
+            shell_print_line(ipc_port_close((int32_t) port_value) ? ipc_status() : ipc_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "broadcast") == 0) {
+            if (!shell_join_args(argc, argv, 2, text, sizeof(text))) {
+                shell_print_line("usage: ipc broadcast <text>");
+                return;
+            }
+            shell_print_u32_prefixed("delivered: ", ipc_broadcast_text(text));
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "peek") == 0) {
+            int32_t size;
+
+            if (!shell_parse_u32_arg(argv[2], &port_value)) {
+                shell_print_line("usage: ipc peek <port>");
+                return;
+            }
+            size = ipc_peek_text((int32_t) port_value, text, sizeof(text));
+            if (size > 0) {
+                shell_print_line(text);
+            } else {
+                shell_print_line(ipc_status());
+            }
+            return;
+        }
+        if (argc >= 4 && strcmp(argv[1], "send") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &port_value) || !shell_join_args(argc, argv, 3, text, sizeof(text))) {
+                shell_print_line("usage: ipc send <port> <text>");
+                return;
+            }
+            port_id = (int32_t) port_value;
+            shell_print_line(ipc_send_text(port_id, text) ? ipc_status() : ipc_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "recv") == 0) {
+            int32_t size;
+
+            if (!shell_parse_u32_arg(argv[2], &port_value)) {
+                shell_print_line("usage: ipc recv <port>");
+                return;
+            }
+            port_id = (int32_t) port_value;
+            size = ipc_recv_text(port_id, text, sizeof(text));
+            if (size > 0) {
+                shell_print_line(text);
+            } else {
+                shell_print_line(ipc_status());
+            }
+            return;
+        }
+        shell_print_line(ipc_status());
+        shell_print_u32_prefixed("ports: ", ipc_info()->port_count);
+        shell_print_u32_prefixed("sent: ", ipc_info()->sent_count);
+        shell_print_u32_prefixed("recv: ", ipc_info()->recv_count);
+        shell_print_u32_prefixed("dropped: ", ipc_info()->dropped_count);
+        shell_print_u32_prefixed("capacity: ", ipc_info()->max_ports);
+        shell_print_u32_prefixed("queue depth: ", ipc_info()->queue_depth);
+        shell_print_u32_prefixed("message size: ", ipc_info()->message_size);
+        return;
+    }
+
+    if (strcmp(argv[0], "signal") == 0) {
+        uint32_t pid = 0;
+        uint32_t signo = 0;
+
+        if (argc >= 4 && strcmp(argv[1], "send") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &pid) || !shell_parse_u32_arg(argv[3], &signo)) {
+                shell_print_line("usage: signal send <pid> <signo>");
+                return;
+            }
+            shell_print_line(signal_send((int32_t) pid, (uint8_t) signo) ? signal_status() : signal_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "take") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &pid)) {
+                shell_print_line("usage: signal take <pid>");
+                return;
+            }
+            shell_print_hex_u32_prefixed("pending: ", signal_take_pending((int32_t) pid));
+            return;
+        }
+        shell_print_line(signal_status());
+        shell_print_u32_prefixed("sent: ", signal_info()->sent_count);
+        shell_print_u32_prefixed("fetched: ", signal_info()->fetch_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "socket") == 0) {
+        uint32_t handle_value;
+        uint16_t port;
+
+        if (argc < 2) {
+            shell_print_line(socket_status());
+            shell_print_u32_prefixed("open: ", socket_count());
+            return;
+        }
+        if (strcmp(argv[1], "open") == 0) {
+            int32_t handle;
+
+            port = 0;
+            if (argc >= 3 && !shell_parse_u16_arg(argv[2], &port)) {
+                shell_print_line("bad port");
+                return;
+            }
+            handle = socket_udp_open(port);
+            if (handle > 0) {
+                shell_print_u32_prefixed("socket: ", (uint32_t) handle);
+            } else {
+                shell_print_line(socket_status());
+            }
+            return;
+        }
+        if (strcmp(argv[1], "close") == 0) {
+            if (argc < 3 || !shell_parse_u32_arg(argv[2], &handle_value)) {
+                shell_print_line("usage: socket close <handle>");
+                return;
+            }
+            shell_print_line(socket_close((int32_t) handle_value) ? socket_status() : socket_status());
+            return;
+        }
+        if (strcmp(argv[1], "send") == 0) {
+            char payload[SHELL_STREAM_MAX];
+
+            if (argc < 6 ||
+                !shell_parse_u32_arg(argv[2], &handle_value) ||
+                !shell_parse_u16_arg(argv[4], &port)) {
+                shell_print_line("usage: socket send <handle> <ip/name> <port> <text>");
+                return;
+            }
+            if (!shell_join_args(argc, argv, 5, payload, sizeof(payload))) {
+                shell_print_line("socket payload too long");
+                return;
+            }
+            (void) socket_sendto_ipv4((int32_t) handle_value, argv[3], port, (const uint8_t *) payload, (uint16_t) strlen(payload));
+            shell_print_line(socket_status());
+            return;
+        }
+        if (strcmp(argv[1], "recv") == 0) {
+            char src_ip[16];
+            uint16_t src_port = 0;
+            uint8_t payload[SOCKET_MAX_PAYLOAD + 1];
+            int32_t size;
+
+            if (argc < 3 || !shell_parse_u32_arg(argv[2], &handle_value)) {
+                shell_print_line("usage: socket recv <handle>");
+                return;
+            }
+            size = socket_recvfrom_ipv4((int32_t) handle_value, src_ip, &src_port, payload, SOCKET_MAX_PAYLOAD);
+            if (size <= 0) {
+                shell_print_line(socket_status());
+                return;
+            }
+            payload[size] = '\0';
+            shell_print_line(src_ip);
+            shell_print_u32_prefixed("port: ", src_port);
+            shell_print_line((const char *) payload);
+            return;
+        }
+        shell_print_line("usage: socket [open [port]|send|recv|close]");
+        return;
+    }
+
     if (strcmp(argv[0], "udp") == 0) {
         char payload[SHELL_STREAM_MAX];
         uint32_t port = 0;
@@ -2310,6 +3558,43 @@ static void shell_run_command(char *line, bool elevated_once)
         return;
     }
 
+    if (strcmp(argv[0], "gui") == 0) {
+        const gui_info_t *info = gui_info();
+
+        shell_print_line(gui_status());
+        shell_print_line(info->app_framework_ready ? "framework: yes" : "framework: no");
+        shell_print_u32_prefixed("widgets: ", info->widgets_registered);
+        shell_print_u32_prefixed("windows: ", info->windows);
+        shell_print_u32_prefixed("focused: ", info->focused);
+        return;
+    }
+
+    if (strcmp(argv[0], "gpu") == 0) {
+        const gpu_info_t *info = gpu_info();
+
+        shell_print_line(gpu_status());
+        shell_print_line(info->backend);
+        shell_print_u32_prefixed("width: ", info->width);
+        shell_print_u32_prefixed("height: ", info->height);
+        shell_print_u32_prefixed("bpp: ", info->bpp);
+        shell_print_u32_prefixed("pitch: ", info->pitch);
+        shell_print_u32_prefixed("submits: ", info->submit_count);
+        shell_print_u32_prefixed("presents: ", info->present_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "power") == 0) {
+        const power_info_t *info = power_info();
+
+        shell_print_line(power_status());
+        shell_print_line(info->acpi_ready ? "acpi: yes" : "acpi: no");
+        shell_print_line(info->power_button_ready ? "button: yes" : "button: no");
+        shell_print_line(info->cpu_frequency_detected ? "cpu freq: detected" : "cpu freq: no");
+        shell_print_line(info->device_power_ready ? "device pm: yes" : "device pm: no");
+        shell_print_u32_prefixed("sci irq: ", info->sci_irq);
+        return;
+    }
+
     if (strcmp(argv[0], "term") == 0) {
         const terminal_info_t *term = terminal_info();
 
@@ -2327,6 +3612,18 @@ static void shell_run_command(char *line, bool elevated_once)
         shell_print_u32_prefixed("logical processors: ", info->logical_processors);
         shell_print_u32_prefixed("online processors: ", info->online_processors);
         shell_print_line(info->bootstrap_only ? "mode: bootstrap processor only" : "mode: ap scheduler");
+        return;
+    }
+
+    if (strcmp(argv[0], "schedopt") == 0) {
+        const schedopt_info_t *info = schedopt_info();
+
+        shell_print_line(schedopt_status());
+        shell_print_line(info->policy);
+        shell_print_u32_prefixed("logical processors: ", info->logical_processors);
+        shell_print_u32_prefixed("online processors: ", info->online_processors);
+        shell_print_u32_prefixed("dispatches: ", info->dispatches);
+        shell_print_line(info->load_balancer_ready ? "load balancer: yes" : "load balancer: pending");
         return;
     }
 

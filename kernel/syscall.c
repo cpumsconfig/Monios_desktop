@@ -2,8 +2,10 @@
 #include "console.h"
 #include "exec.h"
 #include "file.h"
+#include "futex.h"
 #include "graphics.h"
 #include "interrupt.h"
+#include "ipc.h"
 #include "keyboard.h"
 #include "kernel.h"
 #include "mmu.h"
@@ -11,6 +13,8 @@
 #include "net.h"
 #include "path.h"
 #include "shell.h"
+#include "signal.h"
+#include "socket.h"
 #include "syscall.h"
 #include "system_status.h"
 #include "task.h"
@@ -270,6 +274,124 @@ uint64_t syscall_interrupt_dispatch(void *frame_ptr)
     case SYS_OPEN_CUBE3D_WINDOW:
         graphics_open_cube3d_window();
         return 0;
+    case SYS_SOCKET_CALL:
+        if (frame->rbx == SOCKET_CALL_UDP_OPEN) {
+            socket_open_request_t *request = (socket_open_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->handle = socket_udp_open(request->local_port);
+            return request->handle >= 0 ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == SOCKET_CALL_CLOSE) {
+            return socket_close((int32_t) frame->rcx) ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == SOCKET_CALL_SENDTO) {
+            socket_sendto_request_t *request = (socket_sendto_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            return (uint64_t) socket_sendto_ipv4(request->handle,
+                                                request->dst_host,
+                                                request->dst_port,
+                                                request->payload,
+                                                request->payload_len);
+        }
+        if (frame->rbx == SOCKET_CALL_RECVFROM) {
+            socket_recvfrom_request_t *request = (socket_recvfrom_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            return (uint64_t) socket_recvfrom_ipv4(request->handle,
+                                                  request->src_ip,
+                                                  &request->src_port,
+                                                  request->buffer,
+                                                  request->buffer_size);
+        }
+        return (uint64_t) -1;
+    case SYS_FUTEX_CALL:
+        if (frame->rbx == FUTEX_CALL_WAIT) {
+            futex_wait_request_t *request = (futex_wait_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->result = futex_wait(request->address, request->expected, request->timeout_ticks);
+            return request->result >= 0 ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == FUTEX_CALL_WAKE) {
+            futex_wake_request_t *request = (futex_wake_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->result = futex_wake(request->address, request->count);
+            return 0;
+        }
+        if (frame->rbx == FUTEX_CALL_COUNT) {
+            futex_wake_request_t *request = (futex_wake_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->result = futex_waiter_count(request->address);
+            return 0;
+        }
+        return (uint64_t) -1;
+    case SYS_IPC_CALL:
+        if (frame->rbx == IPC_CALL_CREATE) {
+            ipc_create_request_t *request = (ipc_create_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->port_id = ipc_port_create(request->name);
+            return request->port_id >= 0 ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == IPC_CALL_SEND) {
+            ipc_send_request_t *request = (ipc_send_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            return ipc_send_text(request->port_id, request->text) ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == IPC_CALL_RECV) {
+            ipc_recv_request_t *request = (ipc_recv_request_t *) frame->rcx;
+
+            if (request == NULL || frame->rdx < sizeof(*request)) {
+                return (uint64_t) -1;
+            }
+            request->result = ipc_recv_text(request->port_id, request->buffer, request->buffer_size);
+            return request->result >= 0 ? 0 : (uint64_t) -1;
+        }
+        return (uint64_t) -1;
+    case SYS_SIGNAL_CALL: {
+        signal_request_t *request = (signal_request_t *) frame->rcx;
+
+        if (request == NULL || frame->rdx < sizeof(*request)) {
+            return (uint64_t) -1;
+        }
+        if (frame->rbx == SIGNAL_CALL_SEND) {
+            return signal_send(request->pid, (uint8_t) request->signo) ? 0 : (uint64_t) -1;
+        }
+        if (frame->rbx == SIGNAL_CALL_PENDING) {
+            request->mask = signal_pending(request->pid);
+            return 0;
+        }
+        if (frame->rbx == SIGNAL_CALL_TAKE) {
+            request->mask = signal_take_pending(request->pid);
+            return 0;
+        }
+        if (frame->rbx == SIGNAL_CALL_CLEAR) {
+            signal_clear(request->pid);
+            return 0;
+        }
+        return (uint64_t) -1;
+    }
     default:
         return (uint64_t) -1;
     }

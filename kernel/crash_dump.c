@@ -2,6 +2,7 @@
 #include "common.h"
 #include "interrupt.h"
 #include "fat16.h"
+#include "kernel_layout.h"
 
 #define DUMP_BUF_PA   0x9F000U
 #define DUMP_BUF_SIZE 0x10000U
@@ -56,8 +57,8 @@ static void dump_hex32(uint32_t v)
 void crash_dump_init(void)
 {
     dump_serial_init();
-    g_kernel_phys = 0x100000U;
-    g_kernel_size = 0x200000U;
+    g_kernel_phys = KERNEL_PHYS_BASE;
+    g_kernel_size = KERNEL_EARLY_MAP_LIMIT - KERNEL_PHYS_BASE;
     dump_hdr->magic = 0;
     dump_hdr->version = 0;
 }
@@ -92,7 +93,7 @@ void crash_dump_capture(const char *process_name,
     dump_hdr->cr3         = cr3;
     dump_hdr->cr4         = cr4;
     dump_hdr->gs_base     = gs_base;
-    dump_hdr->kernel_rip  = 0x100000UL;
+    dump_hdr->kernel_rip  = KERNEL_PHYS_BASE;
     dump_hdr->uptime_ticks = uptime;
 
     if (process_name != NULL) {
@@ -158,9 +159,9 @@ void crash_dump_flush_serial(void)
     dump_serial_write_str("\"\r\n");
 
     /* Hex dump of kernel image start */
-    dump_serial_write_str("\r\n-- kernel (phys 0x100000, first 256 bytes) --\r\n");
+    dump_serial_write_str("\r\n-- kernel (runtime phys base, first 256 bytes) --\r\n");
     uint32_t col = 0;
-    for (uint32_t i = 0; i < 256 && (dump_hdr->kernel_phys + i) < 0x200000U; i++) {
+    for (uint32_t i = 0; i < 256 && (dump_hdr->kernel_phys + i) < KERNEL_EARLY_MAP_LIMIT; i++) {
         uint8_t b = ((const volatile uint8_t *)(uintptr_t)(dump_hdr->kernel_phys + i))[0];
         dump_serial_putc("0123456789ABCDEF"[b >> 4]);
         dump_serial_putc("0123456789ABCDEF"[b & 0x0F]);

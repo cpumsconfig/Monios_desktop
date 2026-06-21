@@ -26,6 +26,10 @@
 #define SYS_GRAPHICS_PRESENT     20
 #define SYS_AUDIO_PLAY_FILE      21
 #define SYS_OPEN_CUBE3D_WINDOW   22
+#define SYS_SOCKET_CALL          23
+#define SYS_FUTEX_CALL           24
+#define SYS_IPC_CALL             25
+#define SYS_SIGNAL_CALL          26
 
 void syscall_init(void);
 uint64_t syscall_interrupt_dispatch(void *frame_ptr);

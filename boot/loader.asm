@@ -241,6 +241,14 @@ SetupLongMode:
     mov dword [PageTablesBasePhys + 2000h + 14h], 0
     mov dword [PageTablesBasePhys + 2000h + 18h], 00600083h
     mov dword [PageTablesBasePhys + 2000h + 1Ch], 0
+    mov dword [PageTablesBasePhys + 2000h + 20h], 00800083h
+    mov dword [PageTablesBasePhys + 2000h + 24h], 0
+    mov dword [PageTablesBasePhys + 2000h + 28h], 00A00083h
+    mov dword [PageTablesBasePhys + 2000h + 2Ch], 0
+    mov dword [PageTablesBasePhys + 2000h + 30h], 00C00083h
+    mov dword [PageTablesBasePhys + 2000h + 34h], 0
+    mov dword [PageTablesBasePhys + 2000h + 38h], 00E00083h
+    mov dword [PageTablesBasePhys + 2000h + 3Ch], 0
 
     mov eax, PageTablesBasePhys
     mov cr3, eax

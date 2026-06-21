@@ -1,8 +1,10 @@
+#include "aac.h"
 #include "audio.h"
 #include "common.h"
 #include "dma.h"
 #include "es1371.h"
 #include "file.h"
+#include "hda.h"
 #include "interrupt.h"
 #include "kernel.h"
 #include "memory.h"
@@ -10,6 +12,7 @@
 
 #define PCI_CLASS_MULTIMEDIA 0x04
 #define PCI_SUBCLASS_AUDIO   0x01
+#define PCI_SUBCLASS_HDA     0x03
 #define PCI_VENDOR_INTEL     0x8086
 #define PCI_DEVICE_ICH_AC97  0x2415
 
@@ -561,7 +564,8 @@ static bool audio_detect_callback(const pci_device_info_t *info, void *ctx)
 {
     audio_device_info_t *device = (audio_device_info_t *) ctx;
 
-    if (info->class_code != PCI_CLASS_MULTIMEDIA || info->subclass != PCI_SUBCLASS_AUDIO) {
+    if (info->class_code != PCI_CLASS_MULTIMEDIA ||
+        (info->subclass != PCI_SUBCLASS_AUDIO && info->subclass != PCI_SUBCLASS_HDA)) {
         return true;
     }
 
@@ -579,7 +583,11 @@ static bool audio_detect_callback(const pci_device_info_t *info, void *ctx)
     device->variable_rate_audio = false;
     device->present = true;
 
-    if (audio_is_supported_ac97(info)) {
+    if (info->subclass == PCI_SUBCLASS_HDA) {
+        device->kind = AUDIO_DEVICE_HDA;
+        device->mixer_base = info->bar0 & 0xFFFFFFF0u;
+        device->bus_master_base = 0;
+    } else if (audio_is_supported_ac97(info)) {
         device->kind = AUDIO_DEVICE_AC97;
     } else if (es1371_supported(info)) {
         device->kind = AUDIO_DEVICE_ES1371;
@@ -855,6 +863,7 @@ static bool audio_read_wav_header(const uint8_t *data, uint32_t size, wav_pcm_fm
 
 bool audio_play_file(const char *path)
 {
+    aac_info_t info;
     char wav_path[96];
     uint32_t len;
 
@@ -867,12 +876,46 @@ bool audio_play_file(const char *path)
     }
     if (len >= 4 && strcasecmp(path + len - 4, ".m4a") == 0) {
         if (len + 1 >= sizeof(wav_path)) {
+            if (aac_probe_file(path, &info)) {
+                log_write(aac_status());
+                log_write("audio: aac/mp4 decode unavailable");
+            } else {
+                log_write(aac_status());
+            }
             return false;
         }
         strcpy(wav_path, path);
         strcpy(wav_path + len - 4, ".wav");
-        audio_log_path("audio: m4a sidecar ", wav_path);
-        return audio_play_wav_file(wav_path);
+        if (file_exists(wav_path)) {
+            audio_log_path("audio: m4a sidecar ", wav_path);
+            return audio_play_wav_file(wav_path);
+        }
+        if (aac_probe_file(path, &info)) {
+            log_write(aac_status());
+            log_write("audio: aac/mp4 decode unavailable");
+        } else {
+            log_write(aac_status());
+        }
+        return false;
+    }
+    if (len >= 4 && strcasecmp(path + len - 4, ".mp4") == 0) {
+        if (aac_probe_file(path, &info)) {
+            log_write(aac_status());
+            log_write("audio: aac/mp4 decode unavailable");
+        } else {
+            log_write(aac_status());
+        }
+        return false;
+    }
+    if ((len >= 4 && strcasecmp(path + len - 4, ".aac") == 0) ||
+        (len >= 5 && strcasecmp(path + len - 5, ".adts") == 0)) {
+        if (aac_probe_file(path, &info)) {
+            log_write(aac_status());
+            log_write("audio: aac decode unavailable");
+        } else {
+            log_write(aac_status());
+        }
+        return false;
     }
     log_write("audio: unsupported media file");
     return false;

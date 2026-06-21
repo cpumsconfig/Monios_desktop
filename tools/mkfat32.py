@@ -156,7 +156,16 @@ class Fat32Image:
     def save(self) -> None:
         self.flush_dirs()
         self.flush_fats()
-        self.path.write_bytes(self.data)
+        if self.path.exists() and self.path.stat().st_size == len(self.data):
+            with self.path.open("r+b") as image:
+                image.seek(0)
+                image.write(self.data)
+            return
+
+        temp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with temp_path.open("w+b") as image:
+            image.write(self.data)
+        temp_path.replace(self.path)
 
 
 def main() -> None:

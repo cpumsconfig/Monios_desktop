@@ -28,7 +28,7 @@ void ftrace_init(void);
  * addrs       – array of uint64_t entry point addresses (physical)
  * names       – matching array of const char* names
  * count       – number of entries
- * base_offset – physical base of kernel (0x100000)
+ * base_offset - physical base of kernel image
  */
 void ftrace_set_symbols(const uint64_t *addrs, const char * const *names,
                         uint32_t count, uint64_t base_offset);

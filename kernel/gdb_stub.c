@@ -363,7 +363,7 @@ static void gdb_handle_packet(const uint8_t *pkt, uint32_t len)
         }
         else if (starts_with(cmd, "qOffsets")) {
             /* qOffsets – report section offsets for GDB 'load' command.
-             * Text section offset from where it was linked (0x100000). */
+             * Text/Data/BSS already use the linked runtime base. */
             strcpy(reply_buf, "Text=0;Data=0;Bss=0");
         }
         else if (starts_with(cmd, "qXfer:memory-map:read:")) {

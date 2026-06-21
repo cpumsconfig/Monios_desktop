@@ -5,5 +5,6 @@
 
 bool init_usb(void);
 bool usb_legacy_compat(void);
+bool usb_native_host_present(void);
 
 #endif

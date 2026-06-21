@@ -1,9 +1,13 @@
 #include "common.h"
+#include "dns.h"
 #include "e1000.h"
 #include "ip.h"
+#include "ipv4.h"
 #include "kernel.h"
 #include "net.h"
 #include "pci.h"
+#include "pcnet.h"
+#include "socket.h"
 #include "tcp.h"
 
 #define PCI_CLASS_NETWORK          0x02
@@ -475,6 +479,7 @@ static void net_handle_udp(const uint8_t *packet, uint16_t length)
 {
     const uint8_t *ip;
     const uint8_t *udp;
+    const uint8_t *udp_payload;
     uint16_t ip_total;
     uint16_t src_port;
     uint16_t dst_port;
@@ -495,9 +500,13 @@ static void net_handle_udp(const uint8_t *packet, uint16_t length)
     if (udp_len < 8 || (uint32_t) udp_len + 20 > ip_total) {
         return;
     }
+    udp_payload = udp + 8;
     if (src_port == NET_DHCP_SERVER_PORT && dst_port == NET_DHCP_CLIENT_PORT) {
-        net_handle_dhcp(udp + 8, (uint16_t) (udp_len - 8));
+        net_handle_dhcp(udp_payload, (uint16_t) (udp_len - 8));
+        return;
     }
+    dns_handle_udp(ip + 12, src_port, udp_payload, (uint16_t) (udp_len - 8));
+    socket_handle_udp(ip + 12, src_port, dst_port, udp_payload, (uint16_t) (udp_len - 8));
 }
 
 static void net_handle_arp(const uint8_t *packet, uint16_t length)
@@ -704,6 +713,8 @@ bool net_driver_init(void)
     g_dhcp_offer_valid = false;
     g_ping_seq = 0;
     tcp_init();
+    dns_init();
+    socket_init();
     strcpy(g_net_info.driver, "none");
     strcpy(g_net_info.mac_text, "--:--:--:--:--:--");
     net_refresh_ip_texts();
@@ -729,6 +740,9 @@ bool net_driver_init(void)
         e1000_init(&info, &g_net_info, g_mac)) {
         g_net_backend_ready = e1000_ready();
         strcpy(g_net_status, "net: e1000 ring ready");
+    } else if (pcnet_supported(&info) && pcnet_init(&info, &g_net_info, g_mac)) {
+        g_net_backend_ready = pcnet_ready();
+        strcpy(g_net_status, pcnet_status());
     } else {
         if (e1000_supported(&info) && mmio_bar >= 0xF0000000u) {
             log_write("net: e1000 skipped high MMIO BAR");
@@ -785,6 +799,35 @@ void net_update(void)
 const uint8_t *net_local_ip(void)
 {
     return g_local_ip;
+}
+
+bool net_get_dns_ip(uint8_t out[4])
+{
+    if (out == NULL || (g_dns_ip[0] == 0 && g_dns_ip[1] == 0 && g_dns_ip[2] == 0 && g_dns_ip[3] == 0)) {
+        return false;
+    }
+    memcpy(out, g_dns_ip, 4);
+    return true;
+}
+
+bool net_resolve_ipv4(const char *target, uint8_t out[4])
+{
+    if (target == NULL || out == NULL) {
+        return false;
+    }
+    if (strcmp(target, "gateway") == 0) {
+        memcpy(out, g_gateway_ip, 4);
+        return true;
+    }
+    if (strcmp(target, "host") == 0) {
+        memcpy(out, g_host_ip, 4);
+        return true;
+    }
+    if (strcmp(target, "local") == 0 || strcmp(target, "self") == 0) {
+        memcpy(out, g_local_ip, 4);
+        return true;
+    }
+    return dns_resolve_ipv4(target, out);
 }
 
 bool net_send_ipv4_packet(const uint8_t dst_ip[4], uint8_t proto, const uint8_t *payload, uint16_t payload_len)
@@ -845,16 +888,25 @@ bool net_send_ipv4_packet(const uint8_t dst_ip[4], uint8_t proto, const uint8_t 
 bool net_udp_send(const char *dst_ip_text, uint16_t dst_port, const uint8_t *payload, uint16_t payload_len)
 {
     uint8_t dst_ip[4];
-    uint8_t udp[1480];
-    uint16_t udp_len;
-    uint16_t src_port = 49152;
 
     if (dst_ip_text == NULL || payload == NULL || payload_len > 1472 || dst_port == 0) {
         strcpy(g_net_status, "net: udp invalid");
         return false;
     }
-    if (!ip_parse_ipv4(dst_ip_text, dst_ip)) {
-        strcpy(g_net_status, "net: udp bad ip");
+    if (!net_resolve_ipv4(dst_ip_text, dst_ip)) {
+        strcpy(g_net_status, "net: udp resolve failed");
+        return false;
+    }
+    return net_udp_send_to(dst_ip, 49152, dst_port, payload, payload_len);
+}
+
+bool net_udp_send_to(const uint8_t dst_ip[4], uint16_t src_port, uint16_t dst_port, const uint8_t *payload, uint16_t payload_len)
+{
+    uint8_t udp[1480];
+    uint16_t udp_len;
+
+    if (dst_ip == NULL || payload == NULL || payload_len > 1472 || src_port == 0 || dst_port == 0) {
+        strcpy(g_net_status, "net: udp invalid");
         return false;
     }
     udp_len = (uint16_t) (8 + payload_len);
@@ -905,12 +957,8 @@ bool net_ping(const char *target)
         log_write(g_net_status);
         return false;
     }
-    if (strcmp(target, "gateway") == 0) {
-        memcpy(target_ip, g_gateway_ip, 4);
-    } else if (strcmp(target, "host") == 0) {
-        memcpy(target_ip, g_host_ip, 4);
-    } else if (!ip_parse_ipv4(target, target_ip)) {
-        strcpy(g_net_status, "net: dns not implemented");
+    if (!net_resolve_ipv4(target, target_ip)) {
+        strcpy(g_net_status, dns_status());
         log_write(g_net_status);
         return false;
     }
@@ -988,6 +1036,7 @@ void net_shutdown(void)
 {
     if (g_net_info.present) {
         e1000_shutdown();
+        pcnet_shutdown();
         strcpy(g_net_status, "net: shutdown");
         g_net_info.connected = false;
         g_rx_started = false;

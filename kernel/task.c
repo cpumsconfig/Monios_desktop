@@ -1,19 +1,12 @@
 #include "common.h"
 #include "interrupt.h"
+#include "scheduler.h"
 #include "task.h"
+#include "tcb.h"
 
 #define MAX_TASKS 8
 
-typedef struct {
-    bool used;
-    const char *name;
-    task_fn_t fn;
-    void *arg;
-    uint32_t period_ticks;
-    uint64_t next_tick;
-} task_t;
-
-static task_t tasks[MAX_TASKS];
+static tcb_t tasks[MAX_TASKS];
 static bool g_task_scheduler_stopping;
 
 void task_init(void)
@@ -33,11 +26,15 @@ int task_create(const char *name, task_fn_t fn, void *arg, uint32_t period_ticks
     for (int i = 0; i < MAX_TASKS; i++) {
         if (!tasks[i].used) {
             tasks[i].used = true;
+            tasks[i].id = (uint32_t) i;
             tasks[i].name = name;
-            tasks[i].fn = fn;
+            tasks[i].entry = fn;
             tasks[i].arg = arg;
             tasks[i].period_ticks = period_ticks == 0 ? 1 : period_ticks;
             tasks[i].next_tick = run_immediately ? now : now + tasks[i].period_ticks;
+            tasks[i].last_run_tick = 0;
+            tasks[i].run_count = 0;
+            scheduler_register_task(tasks[i].id, tasks[i].period_ticks);
             return i;
         }
     }
@@ -53,11 +50,14 @@ void task_run_ready(void)
     }
 
     for (int i = 0; i < MAX_TASKS; i++) {
-        if (!tasks[i].used || tasks[i].fn == NULL) {
+        if (!tasks[i].used || tasks[i].entry == NULL) {
             continue;
         }
         if (now >= tasks[i].next_tick) {
-            tasks[i].fn(tasks[i].arg);
+            tasks[i].entry(tasks[i].arg);
+            tasks[i].last_run_tick = now;
+            tasks[i].run_count++;
+            scheduler_note_run(tasks[i].id, tasks[i].period_ticks, now);
             tasks[i].next_tick = now + tasks[i].period_ticks;
         }
     }
@@ -84,4 +84,18 @@ uint32_t task_count(void)
         }
     }
     return count;
+}
+
+uint32_t tcb_capacity(void)
+{
+    return MAX_TASKS;
+}
+
+bool tcb_snapshot(uint32_t index, tcb_t *out)
+{
+    if (index >= MAX_TASKS || out == NULL) {
+        return false;
+    }
+    *out = tasks[index];
+    return true;
 }

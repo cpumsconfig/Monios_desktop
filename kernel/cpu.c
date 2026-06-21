@@ -4,7 +4,7 @@
 
 static cpu_info_t g_cpu_info;
 
-static void cpu_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+bool cpu_cpuid_query(uint32_t leaf, uint32_t subleaf, cpuid_regs_t *regs)
 {
     uint32_t a;
     uint32_t b;
@@ -17,10 +17,24 @@ static void cpu_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *
         : "a" (leaf), "c" (subleaf)
     );
 
-    if (eax != NULL) *eax = a;
-    if (ebx != NULL) *ebx = b;
-    if (ecx != NULL) *ecx = c;
-    if (edx != NULL) *edx = d;
+    if (regs != NULL) {
+        regs->eax = a;
+        regs->ebx = b;
+        regs->ecx = c;
+        regs->edx = d;
+    }
+    return true;
+}
+
+static void cpu_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+    cpuid_regs_t regs;
+
+    cpu_cpuid_query(leaf, subleaf, &regs);
+    if (eax != NULL) *eax = regs.eax;
+    if (ebx != NULL) *ebx = regs.ebx;
+    if (ecx != NULL) *ecx = regs.ecx;
+    if (edx != NULL) *edx = regs.edx;
 }
 
 static void cpu_copy_reg_string(uint32_t value, char *dst)
@@ -47,6 +61,7 @@ void cpu_enable_fpu_sse(void)
     asm volatile ("mov %0, %%cr4" :: "r" (cr4) : "memory");
 
     asm volatile ("fninit");
+    g_cpu_info.fpu_enabled = true;
 }
 
 void cpu_detect(cpu_info_t *info)
@@ -65,6 +80,7 @@ void cpu_detect(cpu_info_t *info)
     memset(info, 0, sizeof(*info));
 
     cpu_cpuid(0, 0, &max_basic_leaf, &ebx, &ecx, &edx);
+    info->max_basic_leaf = max_basic_leaf;
     cpu_copy_reg_string(ebx, &info->vendor[0]);
     cpu_copy_reg_string(edx, &info->vendor[4]);
     cpu_copy_reg_string(ecx, &info->vendor[8]);
@@ -77,13 +93,20 @@ void cpu_detect(cpu_info_t *info)
         info->has_msr = (edx & (1u << 5)) != 0;
         info->has_apic = (edx & (1u << 9)) != 0;
         info->has_mmx = (edx & (1u << 23)) != 0;
+        info->has_fxsr = (edx & (1u << 24)) != 0;
         info->has_sse = (edx & (1u << 25)) != 0;
         info->has_sse2 = (edx & (1u << 26)) != 0;
         info->has_sse3 = (ecx & (1u << 0)) != 0;
+        info->has_ssse3 = (ecx & (1u << 9)) != 0;
+        info->has_sse41 = (ecx & (1u << 19)) != 0;
+        info->has_sse42 = (ecx & (1u << 20)) != 0;
         info->has_x2apic = (ecx & (1u << 21)) != 0;
+        info->has_xsave = (ecx & (1u << 26)) != 0;
+        info->has_avx = (ecx & (1u << 28)) != 0;
     }
 
     cpu_cpuid(0x80000000u, 0, &max_extended_leaf, NULL, NULL, NULL);
+    info->max_extended_leaf = max_extended_leaf;
     if (max_extended_leaf >= 0x80000001u) {
         cpu_cpuid(0x80000001u, 0, &eax, &ebx, &ecx, &edx);
         info->has_long_mode = (edx & (1u << 29)) != 0;
@@ -106,6 +129,11 @@ const cpu_info_t *cpu_current_info(void)
     return &g_cpu_info;
 }
 
+bool cpu_fpu_enabled(void)
+{
+    return g_cpu_info.fpu_enabled;
+}
+
 void cpu_log_info(void)
 {
     char line[80] = "cpu: vendor=";
@@ -121,10 +149,17 @@ void cpu_log_info(void)
     }
 
     log_write_bool_event("cpu fpu", g_cpu_info.has_fpu);
+    log_write_bool_event("cpu fpu enabled", g_cpu_info.fpu_enabled);
+    log_write_bool_event("cpu fxsr", g_cpu_info.has_fxsr);
     log_write_bool_event("cpu mmx", g_cpu_info.has_mmx);
     log_write_bool_event("cpu sse", g_cpu_info.has_sse);
     log_write_bool_event("cpu sse2", g_cpu_info.has_sse2);
     log_write_bool_event("cpu sse3", g_cpu_info.has_sse3);
+    log_write_bool_event("cpu ssse3", g_cpu_info.has_ssse3);
+    log_write_bool_event("cpu sse4.1", g_cpu_info.has_sse41);
+    log_write_bool_event("cpu sse4.2", g_cpu_info.has_sse42);
+    log_write_bool_event("cpu xsave", g_cpu_info.has_xsave);
+    log_write_bool_event("cpu avx", g_cpu_info.has_avx);
     log_write_bool_event("cpu apic", g_cpu_info.has_apic);
     log_write_bool_event("cpu x2apic", g_cpu_info.has_x2apic);
     log_write_bool_event("cpu tsc", g_cpu_info.has_tsc);

@@ -5,6 +5,7 @@
 #include "stdint.h"
 
 bool file_init(void);
+const char *file_backend_name(void);
 bool file_exists(const char *path);
 bool file_is_dir(const char *path);
 int32_t file_size(const char *path);

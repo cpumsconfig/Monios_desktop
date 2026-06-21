@@ -26,6 +26,19 @@ static void session_add_user(const char *name, const char *home)
     g_user_count++;
 }
 
+static int32_t session_find_user_index(const char *name)
+{
+    if (name == NULL) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < g_user_count; i++) {
+        if (strcmp(g_users[i].name, name) == 0) {
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
 static void session_trim_in_place(char *text)
 {
     uint32_t start = 0;
@@ -86,6 +99,8 @@ static void session_init_defaults(void)
     strcpy(g_default_desktop_app, "/apps/explorar.exe");
     strcpy(g_default_logon_app, "/apps/monilog.exe");
     session_add_user("root", "/home/root");
+    session_add_user("guest", "/home/guest");
+    session_add_user("dev", "/home/dev");
 }
 
 void session_init(void)
@@ -145,13 +160,13 @@ bool session_login(uint32_t index)
 
 bool session_login_name(const char *name)
 {
-    for (uint32_t i = 0; i < g_user_count; i++) {
-        if (strcmp(g_users[i].name, name) == 0) {
-            g_current_user_index = i;
-            return true;
-        }
+    int32_t index = session_find_user_index(name);
+
+    if (index < 0) {
+        return false;
     }
-    return false;
+    g_current_user_index = (uint32_t) index;
+    return true;
 }
 
 bool session_validate_credentials(const char *username, const char *password)
@@ -163,10 +178,10 @@ bool session_validate_credentials(const char *username, const char *password)
     char *expected_hash;
     int32_t size;
 
-    if (username == NULL || password == NULL || strcmp(username, "root") != 0) {
+    if (username == NULL || password == NULL || username[0] == '\0') {
         return false;
     }
-    if (!session_login_name("root")) {
+    if (session_find_user_index(username) < 0) {
         return false;
     }
 
@@ -203,7 +218,10 @@ bool session_validate_credentials(const char *username, const char *password)
     if (!session_compute_salted_password_hash(salt, password, computed, sizeof(computed))) {
         return false;
     }
-    return strcmp(expected_hash, computed) == 0;
+    if (strcmp(expected_hash, computed) != 0) {
+        return false;
+    }
+    return session_login_name(username);
 }
 
 const char *session_default_desktop_app(void)

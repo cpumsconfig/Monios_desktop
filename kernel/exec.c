@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "mmu.h"
 #include "path.h"
+#include "pcb.h"
 #include "session.h"
 
 #define ELF_MAGIC_0 0x7F
@@ -337,6 +338,7 @@ bool exec_run(const char *path, uint32_t argc, char *argv[], const char *cwd, ch
     exec_runtime_context_t runtime_context;
     exec_entry_t entry;
     uint8_t *kernel_stack = NULL;
+    int32_t pid = -1;
 
     if (!path_resolve(cwd, path, resolved_path, sizeof(resolved_path))) {
         return false;
@@ -377,6 +379,7 @@ bool exec_run(const char *path, uint32_t argc, char *argv[], const char *cwd, ch
         return false;
     }
 
+    pid = pcb_process_start(resolved_path);
     runtime_context.launch_info = user_launch_info;
     runtime_context.exit_code = -1;
     runtime_context.completed = false;
@@ -395,6 +398,13 @@ bool exec_run(const char *path, uint32_t argc, char *argv[], const char *cwd, ch
     g_exec_context = NULL;
     if (exit_code != NULL) {
         *exit_code = runtime_context.exit_code;
+    }
+    if (pid >= 0) {
+        if (runtime_context.completed) {
+            pcb_process_exit(pid, runtime_context.exit_code);
+        } else {
+            pcb_process_abort(pid, runtime_context.exit_code);
+        }
     }
 
     if (kernel_stack != NULL) {

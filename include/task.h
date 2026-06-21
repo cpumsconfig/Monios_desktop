@@ -3,8 +3,9 @@
 
 #include "stdbool.h"
 #include "stdint.h"
+#include "tcb.h"
 
-typedef void (*task_fn_t)(void *arg);
+typedef tcb_entry_t task_fn_t;
 
 void task_init(void);
 int task_create(const char *name, task_fn_t fn, void *arg, uint32_t period_ticks, bool run_immediately);

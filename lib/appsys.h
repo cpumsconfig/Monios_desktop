@@ -83,6 +83,19 @@ void app_open_cube3d_window(void);
 int app_audio_play_file(const char *path);
 int app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
 void app_graphics_present(void);
+int app_socket_udp_open(uint16_t local_port);
+int app_socket_close(int handle);
+int app_socket_sendto(int handle, const char *dst_host, uint16_t dst_port, const void *payload, uint16_t payload_len);
+int app_socket_recvfrom(int handle, char *src_ip, uint16_t *src_port, void *buffer, uint16_t buffer_size);
+int app_futex_wait(uint64_t address, uint32_t expected, uint32_t timeout_ticks);
+int app_futex_wake(uint64_t address, uint32_t count);
+int app_ipc_create(const char *name);
+int app_ipc_send(int port_id, const char *text);
+int app_ipc_recv(int port_id, char *buffer, uint32_t buffer_size);
+int app_signal_send(int pid, uint32_t signo);
+uint32_t app_signal_pending(int pid);
+uint32_t app_signal_take(int pid);
+void app_signal_clear(int pid);
 void app_exit(int code);
 
 #endif

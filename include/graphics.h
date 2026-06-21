@@ -39,6 +39,11 @@ uint32_t graphics_gpu_present_count(void);
 uint32_t graphics_gpu_pending_count(void);
 uint32_t graphics_window_count(void);
 uint32_t graphics_focused_window_index(void);
+uint32_t graphics_framebuffer_address(void);
+uint32_t graphics_framebuffer_pitch_bytes(void);
+uint32_t graphics_framebuffer_width(void);
+uint32_t graphics_framebuffer_height(void);
+const char *graphics_backend_name(void);
 
 // Double buffering functions
 void graphics_set_double_buffer(bool enabled);

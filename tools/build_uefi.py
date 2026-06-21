@@ -4,9 +4,9 @@
 This generates a standalone .efi binary that:
   1. Called by UEFI firmware with SystemTable pointer in RDI (X64 SysV ABI)
   2. Uses UEFI Boot Services to open KERNEL.BIN from the ESP
-  3. Reads the kernel ELF image into memory at 0x100000
+  3. Reads the kernel ELF image into memory at 0x200000
   4. Sets up long-mode paging (identity-mapped 1 GiB window)
-  5. Jumps to kernel entry at 0x100000
+  5. Jumps to kernel entry at 0x200000
 
 The generated .efi file is placed in out/monios.efi and can be placed on
 an ESP partition as \\EFI\\MONIOS\\MONIOS.EFI
@@ -19,6 +19,7 @@ import struct, sys, os, shutil
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(PROJECT_DIR, "out")
+KERNEL_LOAD_PHYS = 0x200000
 
 # ── Helpers ────────────────────────────────────────────────────
 def u8(v):  return struct.pack("<B", v & 0xFF)
@@ -260,7 +261,7 @@ def asm_bytes():
 
 
 # ── Simpler approach: write the boot code as a well-structured NASM source ──
-NASM_UEFI_BOOT = r"""
+NASM_UEFI_BOOT = rf"""
 ; MoniOS UEFI bootloader – nasm -f bin -o monios.efi
 ; This is compiled as a PE/COFF with the PE wrapper added by Python.
 ; Entry: _start(SystemTable, ImageHandle)
@@ -307,7 +308,7 @@ _start:
 
     ; ── LocateProtocol(SimpleFileSystemProtocol, NULL, &fs) ──
     ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL GUID:
-    ;   {0965E976-8B0A-11D3-9957-0011242F718A}
+    ;   {{0965E976-8B0A-11D3-9957-0011242F718A}}
     ; Call: LocateProtocol(Protocol*, Registration, Interface)
     sub rsp, 32
     mov qword [rsp], 0x0965E9768B0A11D3  ; part 1 of GUID (little-endian)
@@ -360,7 +361,7 @@ _start:
     jne .halt
 
     ; ── Setup Long Mode (paging) ────────────────────────────────
-    ; Build 4-level paging: identity-map 0x100000..0x50000000
+    ; Build 4-level paging: identity-map {KERNEL_LOAD_PHYS:#x}..0x50000000
     ; Page tables at 0x90000 (16 KiB)
     mov edi, 0x90000
     mov ecx, 4096 * 4
@@ -387,13 +388,13 @@ _start:
     add eax, 0x200000         ; next 2M block
     loop .pd_loop
 
-    ; Also map 0x100000..0x50000000 with explicit entries
+    ; Also map {KERNEL_LOAD_PHYS:#x}..0x50000000 with explicit entries
     ; PD[0x100] → PT at 0x93000
     mov dword [0x92000 + 0x100*8],     0x93003
     mov dword [0x92000 + 0x100*8 + 4], 0
 
-    ; PT: map 0x100000..0x400000 (256 × 2M pages) = 0x100 pages of 2M each
-    mov eax, 0x100003          ; 0x100000 + flags
+    ; PT: map {KERNEL_LOAD_PHYS:#x}..0x400000 (256 x 2M pages) = 0x100 pages of 2M each
+    mov eax, {KERNEL_LOAD_PHYS + 3:#x}          ; {KERNEL_LOAD_PHYS:#x} + flags
     mov ecx, 256
     mov edi, 0x93000
 .pt_loop:
@@ -432,19 +433,19 @@ _start:
     ; ELF header already at .kernel_buf
     ; e_phoff = offset of program headers, e_phentsize, e_phnum
     ; For simplicity, do a flat load:
-    ; Copy KERNEL.BIN sectors from FAT to 0x100000
+    ; Copy KERNEL.BIN sectors from FAT to {KERNEL_LOAD_PHYS:#x}
     ; Since we already have it in .kernel_buf (512 bytes),
     ; we need to read the rest.
     ; For now: assume kernel is contiguous on FAT.
     ; Read entire kernel: file_size bytes (stored at .file_size)
     ; Actually, Read already populated .kernel_buf with 512 bytes
-    ; Continue reading the rest directly to 0x100000
+    ; Continue reading the rest directly to {KERNEL_LOAD_PHYS:#x}
     mov rbx, [rsp+48]         ; file handle
     mov qword [rsp], 0x200000  ; read 2 MB
-    mov rax, 0x100000
-    mov qword [rsp+8], rax     ; buffer = 0x100000
+    mov rax, {KERNEL_LOAD_PHYS:#x}
+    mov qword [rsp+8], rax     ; buffer = {KERNEL_LOAD_PHYS:#x}
     mov rcx, rbx
-    call [rbx + 0x28]         ; Read(file, &size, buf=0x100000)
+    call [rbx + 0x28]         ; Read(file, &size, buf={KERNEL_LOAD_PHYS:#x})
 
     ; Close file
     mov rcx, [rsp+48]
@@ -458,7 +459,7 @@ _start:
     ; Need to get the map key from GetMemoryMap
     ; Skip for now – jump to kernel
     mov rax, [rel .kernel_buf + 24]  ; e_entry (offset 24 in ELF header)
-    add rax, 0x100000          ; virtual address = load_phys + offset
+    add rax, {KERNEL_LOAD_PHYS:#x}          ; virtual address = load_phys + offset
 
     ; UART debug: print 'K'
     push rax
