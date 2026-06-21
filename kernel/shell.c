@@ -122,7 +122,7 @@ static bool g_complete_in_progress;
 #define SHELL_BASE64_OUTPUT_MAX     384
 #define SHELL_COMBINED_SECRET_MAX   256
 #define SHELL_PRINT_BUFFER_MAX      64
-#define SHELL_DEFAULT_DRIVE         "A:"
+#define SHELL_DEFAULT_DRIVE         "C:"
 
 static void shell_print_line(const char *text);
 static void shell_run_command(char *line, bool elevated_once);
@@ -1975,7 +1975,17 @@ static void shell_run_command(char *line, bool elevated_once)
     argc = shell_expand_globs_in_argv(argc, argv);
 
     if (strcmp(argv[0], "help") == 0) {
-        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme storagex hda aac pcnet lwip xhci usbext hid ntfs extfs fscache iic bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail");
+        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme storagex hda aac pcnet lwip xhci usbext hid ntfs extfs fscache iic bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail ver");
+        return;
+    }
+
+    if (strcmp(argv[0], "ver") == 0) {
+        char version_content[SHELL_STREAM_MAX];
+        if (shell_read_input_source("C:/version.txt", version_content, sizeof(version_content))) {
+            console_write(version_content);
+        } else {
+            shell_print_line("version.txt not found");
+        }
         return;
     }
 

@@ -1777,10 +1777,28 @@ static void graphics_draw_window_content(const ui_window_t *window)
         return;
     }
     if (window->kind == UI_WINDOW_ABOUT) {
-        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42), "MONIOS 桌面", 0x0017232E);
-        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 64), "版本 " MONIOS_VERSION, 0x0017232E);
-        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 86), "字体：微软雅黑", 0x0017232E);
-        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 108), "网络 声卡 图形", 0x0017232E);
+        char version_content[2048];
+        char line[256];
+        uint32_t line_num = 0;
+        uint32_t pos = 0;
+        
+        if (file_read("/version.txt", version_content, sizeof(version_content)) > 0) {
+            while (pos < sizeof(version_content) && version_content[pos] != '\0' && line_num < 6) {
+                uint32_t line_pos = 0;
+                while (pos < sizeof(version_content) && version_content[pos] != '\n' && version_content[pos] != '\0' && line_pos < sizeof(line) - 1) {
+                    line[line_pos++] = version_content[pos++];
+                }
+                line[line_pos] = '\0';
+                if (version_content[pos] == '\n') pos++;
+                graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42 + line_num * 22), line, 0x0017232E);
+                line_num++;
+            }
+        } else {
+            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42), "MONIOS 桌面", 0x0017232E);
+            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 64), "版本 " MONIOS_VERSION, 0x0017232E);
+            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 86), "字体：微软雅黑", 0x0017232E);
+            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 108), "网络 声卡 图形", 0x0017232E);
+        }
         return;
     }
     if (window->kind == UI_WINDOW_PLAYER) {

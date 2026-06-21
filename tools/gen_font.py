@@ -5,10 +5,10 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "kernel" / "font_data.inc"
 FONT_CANDIDATES = [
-    Path(r"C:\Windows\Fonts\msyh.ttc"),
-    Path(r"C:\Windows\Fonts\msyhbd.ttc"),
-    Path(r"C:\Windows\Fonts\msyhl.ttc"),
-    Path(r"C:\Windows\Fonts\segoeui.ttf"),
+    Path(r"C:\Windows\\Fonts\\msyh.ttc"),
+    Path(r"C:\Windows\\Fonts\\msyhbd.ttc"),
+    Path(r"C:\Windows\\Fonts\\msyhl.ttc"),
+    Path(r"C:\Windows\\Fonts\\segoeui.ttf"),
 ]
 SIZE = 14
 FIRST = 32
