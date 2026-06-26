@@ -36,6 +36,7 @@ int32_t i2c_transfer(uint8_t bus, i2c_msg_t *msgs, uint32_t num);
 int32_t i2c_read(uint8_t bus, uint8_t addr, uint8_t reg, uint8_t *buf, uint32_t len);
 int32_t i2c_write(uint8_t bus, uint8_t addr, uint8_t reg, const uint8_t *buf, uint32_t len);
 uint32_t i2c_scan(uint8_t bus, uint8_t *buffer, uint32_t capacity);
+int32_t i2c_set_speed(uint8_t bus, uint32_t speed_hz);
 const i2c_info_t *i2c_info(void);
 const char *i2c_status(void);
 

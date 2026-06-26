@@ -1,6 +1,7 @@
 X86_64_CC = x86_64-elf-gcc
 X86_64_LD = x86_64-elf-ld
 X86_64_OBJCOPY = x86_64-elf-objcopy
+OUT_DIR = out
 VMWARE_VMX ?= D:\Users\xiaot\Documents\Virtual Machines\monios_x64\monios_x64.vmx
 UI_FONT_SOURCE ?= C:/Windows/Fonts/msyh.ttc
 UI_FONT_IMAGE = out/msyh.ttc
@@ -11,6 +12,8 @@ QEMU_EFI_CODE ?= C:/Program Files/qemu/share/edk2-x86_64-code.fd
 QEMU_AUDIO ?= -audiodev dsound,id=audio0 -machine pcspk-audiodev=audio0 -device AC97,audiodev=audio0
 QEMU_NET ?= -netdev user,id=net0 -device e1000,netdev=net0
 QEMU_UEFI_PFLASH = -drive "if=pflash,format=raw,readonly=on,file=$(QEMU_EFI_CODE)"
+
+.DEFAULT_GOAL := default
 
 .PHONY : boot boot_bios boot_install run run_bios run_debug run_install run_uefi_iso run_uefi_iso_debug run_uefi_q35 run_uefi_q35_debug uefi uefi_iso run_vmware clean default FORCE
 
@@ -36,6 +39,12 @@ KERNEL_PLATFORM_OBJS = out/bios.o out/gop.o out/rtc.o out/iic.o out/cpu.o out/pc
 KERNEL_NET_OBJS = out/net.o out/lwip.o out/tls.o out/http.o out/wifi.o out/ip.o out/ipv4.o out/ipv6.o out/dns.o out/socket.o out/tcp.o out/e1000.o out/pcnet.o out/aes.o out/rsa.o out/x509.o
 KERNEL_DEBUG_OBJS = out/registry.o out/smbus.o out/intelbus1.o out/amdbus1.o out/gdb_stub.o out/crash_dump.o out/ftrace.o
 KERNEL_OBJS = $(KERNEL_BOOT_OBJS) $(KERNEL_MEM_OBJS) $(KERNEL_RUNTIME_OBJS) $(KERNEL_FS_OBJS) $(KERNEL_UI_OBJS) $(KERNEL_INPUT_OBJS) $(KERNEL_PLATFORM_OBJS) $(KERNEL_NET_OBJS) $(KERNEL_DEBUG_OBJS)
+OUT_TARGETS = out/boot.bin out/loader.bin out/kernel.elf out/kernel.bin out/demo.elf out/explorar.exe out/monilog.exe out/player.elf out/notepad.elf out/taskmgr.elf out/square.elf out/cube3d.elf out/rzdrv.elf out/rzdrv.rzs out/setup.elf out/monios.efi out/monios_uefi_esp.img out/monios_uefi_installer.iso $(KERNEL_OBJS) $(APP_RUNTIME_OBJS) out/app_demo.o out/app_explorar.o out/app_monilogon.o out/app_player.o out/app_notepad.o out/app_taskmgr.o out/app_square.o out/app_cube3d.o out/app_rzdrv.o out/app_setup.o $(UI_FONT_IMAGE) $(UEFI_FONT_IMAGE)
+
+$(OUT_TARGETS): | $(OUT_DIR)
+
+$(OUT_DIR):
+	if not exist $(OUT_DIR) mkdir $(OUT_DIR)
 
 out/%.bin : kernel/arch/boot/%.asm kernel/arch/boot/include/fat32hdr.inc kernel/arch/boot/include/load.inc kernel/arch/boot/include/pm.inc
 	nasm -I kernel/arch/boot/include -o out/$*.bin kernel/arch/boot/$*.asm
@@ -259,6 +268,9 @@ out/monios.efi : out/kernel.bin tools/build_uefi.py
 out/monios_uefi_installer.iso : out/monios.efi out/kernel.bin out/setup.elf $(UEFI_FONT_IMAGE) pwd.txt tools/build_uefi_iso.py
 	python tools/build_uefi_iso.py --output out/monios_uefi_installer.iso --esp out/monios_uefi_esp.img --font $(UEFI_FONT_IMAGE) --password pwd.txt
 
+hd_uefi.img : out/boot.bin out/loader.bin out/kernel.bin out/demo.elf out/explorar.exe out/monilog.exe out/player.elf out/notepad.elf out/taskmgr.elf out/square.elf out/cube3d.elf out/rzdrv.rzs out/setup.elf out/monios.efi $(UI_FONT_IMAGE) pwd.txt music_vm.wav bgm.m4a bgm.wav version.txt tools/mkfat32.py
+	python tools/mkfat32.py --image hd_uefi.img --boot out/boot.bin --copy out/loader.bin:/loader.bin --copy out/kernel.bin:/kernel.bin --copy out/monios.efi:/EFI/BOOT/BOOTX64.EFI --copy out/monios.efi:/BOOTX64.EFI --copy out/kernel.bin:/KERNEL.BIN --copy out/explorar.exe:/apps/explorar.exe --copy out/monilog.exe:/apps/monilog.exe --copy out/setup.elf:/apps/setup.elf --copy out/player.elf:/home/root/desktop/player.elf --copy music_vm.wav:/home/root/desktop/music.wav --copy bgm.m4a:/home/root/desktop/bgm.m4a --copy bgm.wav:/home/root/desktop/bgm.wav --copy out/notepad.elf:/home/root/desktop/notepad.elf --copy out/taskmgr.elf:/home/root/desktop/taskmgr.elf --copy out/square.elf:/home/root/desktop/square.elf --copy out/cube3d.elf:/home/root/desktop/cube3d.elf --copy out/setup.elf:/home/root/desktop/setup.elf --copy out/rzdrv.rzs:/drivers/rzdrv.rzs --copy out/rzdrv.rzs:/home/root/desktop/rzdrv.rzs --copy $(UI_FONT_IMAGE):/fonts/msyh.ttc --copy pwd.txt:/pwd.txt --copy version.txt:/version.txt
+
 bgm.wav : bgm.m4a tools/aac_to_wav.py
 	python tools/aac_to_wav.py bgm.m4a bgm.wav --placeholder-ok
 
@@ -311,7 +323,7 @@ run_vmware : hd.vmdk
 clean :
 	if exist out cmd /c del /f /s /q out
 
-default : clean run
+default : hd.img
 $(UI_FONT_IMAGE) : tools/stage_font.py
 	python tools/stage_font.py "$(UI_FONT_SOURCE)" "$(UI_FONT_IMAGE)"
 

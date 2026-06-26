@@ -1587,27 +1587,6 @@ static void graphics_wait_ticks(uint64_t wait_ticks)
     }
 }
 
-static void graphics_draw_boot_logo(uint16_t x, uint16_t y, uint32_t panel_color, uint32_t accent_color)
-{
-    graphics_fill_rect(x, y, 72, 72, panel_color);
-    graphics_draw_rect_outline(x, y, 72, 72, accent_color);
-    graphics_fill_rect((uint16_t) (x + 12), (uint16_t) (y + 14), 8, 44, accent_color);
-    graphics_fill_rect((uint16_t) (x + 52), (uint16_t) (y + 14), 8, 44, accent_color);
-    graphics_fill_rect((uint16_t) (x + 32), (uint16_t) (y + 30), 8, 28, accent_color);
-    for (int16_t offset = 0; offset < 3; offset++) {
-        graphics_draw_line((int16_t) (x + 20 + offset), (int16_t) (y + 14), (int16_t) (x + 36 + offset), (int16_t) (y + 40), accent_color);
-        graphics_draw_line((int16_t) (x + 52 - offset), (int16_t) (y + 14), (int16_t) (x + 36 - offset), (int16_t) (y + 40), accent_color);
-    }
-}
-
-static uint32_t graphics_boot_ease(uint32_t value)
-{
-    if (value > 100) {
-        value = 100;
-    }
-    return (value * value * (300u - 2u * value)) / 10000u;
-}
-
 static void graphics_draw_boot_frame(uint32_t progress, bool show_text)
 {
     const uint16_t bar_w = 264;

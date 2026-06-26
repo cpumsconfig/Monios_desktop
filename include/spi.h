@@ -49,6 +49,7 @@ int32_t spi_transfer(uint8_t bus, uint8_t cs, spi_transfer_t *xfers, uint32_t nu
 int32_t spi_write(uint8_t bus, uint8_t cs, const uint8_t *buf, uint32_t len);
 int32_t spi_read(uint8_t bus, uint8_t cs, uint8_t *buf, uint32_t len);
 int32_t spi_write_then_read(uint8_t bus, uint8_t cs, const uint8_t *tx, uint32_t tx_len, uint8_t *rx, uint32_t rx_len);
+int32_t spi_set_cs(uint8_t bus, uint8_t cs, bool assert);
 const spi_info_t *spi_info(void);
 const char *spi_status(void);
 

@@ -12,9 +12,18 @@ V0.0.2B: 目录重构与功能扩展
 - TLS/SSL 完善：集成密码学后端，支持 AES-CBC 加密、HMAC 完整性校验、RSA 密钥交换
 - 内存管理扩展：页管理（page）、大页支持（hugetlb 2MB/1GB）、连续内存分配器（CMA）、获取用户页（GUP）、压缩内存分配器（zsmalloc）
 - Bootloader 增强：动态文件系统检测（FAT32/FAT16）、BIOS E820 内存探测、动态内存分配加载 kernel
-- 字符串库扩展：strncpy、strrchr、memmove、strncmp
+- 字符串库扩展：strncpy、strrchr、memmove、strncmp等
+- ISO支持
+- UEFI支持
+- 添加了启动动画
+- 移除了开机测试音
+- 加强了权限管理
+- 修复了一些bug
+
+总代码行数约47000+
 
 V0.0.1B: 初代版本
+- 框架基本搭建
 
 ## 当前重点
 
@@ -140,8 +149,6 @@ graphics: desktop drawn
 
 这是测试性内核。以下模块已经有接口、探测和状态输出，但还不是完整生产级实现：
 
-- NTFS 仍以元数据和只读探测为主，尚未实现完整目录遍历、日志恢复和写入。
-- extfs 已实现基础读写（文件创建/删除/写入、目录操作、符号链接），但尚未支持日志、扩展属性和高级特性。
 - TLS/SSL 已集成密码学后端（AES、RSA、哈希）和 X.509 证书链验证，完整握手流程和会话管理仍待完善。
 - HTTP/HTTPS 目前能构造请求和记录 URL 状态，完整响应解析和 HTTPS 传输仍需继续实现。
 - WiFi/蓝牙以控制器/传输探测和 HCI 框架为主，尚未实现扫描、认证、配对和数据面。
@@ -149,4 +156,4 @@ graphics: desktop drawn
 - xHCI/HID/USB 扩展已经暴露 root hub/legacy/native 状态，完整 USB 枚举和 endpoint 调度仍待实现。
 - ACPI 电源管理依赖固件表是否能在当前早期映射范围内被解析；QEMU 中可能退回 fallback 电源路径。
 - 新增驱动（I2C/I3C/SPI/TPM/MCB/MD/OPP/OD）目前为框架级实现，实际硬件交互仍待完善。
-- 网络连接可能会失败
+- ISO文件目前依然需要完善，比如文件等无法读取

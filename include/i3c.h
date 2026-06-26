@@ -68,6 +68,8 @@ int32_t i3c_write(uint8_t bus, uint8_t addr, const uint8_t *buf, uint32_t len);
 int32_t i3c_send_ccc(uint8_t bus, uint8_t ccc, const uint8_t *data, uint32_t len);
 int32_t i3c_do_daa(uint8_t bus, i3c_device_t *devices, uint32_t max_devices);
 uint32_t i3c_scan(uint8_t bus, uint8_t *buffer, uint32_t capacity);
+int32_t i3c_get_device_info(uint8_t index, i3c_device_t *info);
+int32_t i3c_set_frequency(uint8_t bus, uint32_t freq_hz);
 const i3c_info_t *i3c_info(void);
 const char *i3c_status(void);
 
