@@ -5,6 +5,7 @@
 #include "bluetooth.h"
 #include "browser.h"
 #include "buddy.h"
+#include "cdrom.h"
 #include "common.h"
 #include "console.h"
 #include "device.h"
@@ -21,19 +22,26 @@
 #include "hda.h"
 #include "heap.h"
 #include "hid.h"
+#include "i2c.h"
+#include "i3c.h"
 #include "iic.h"
 #include "ide.h"
 #include "ipc.h"
+#include "iso9660.h"
 #include "ipv6.h"
 #include "keyboard.h"
 #include "lazyalloc.h"
 #include "kernel.h"
 #include "lwip.h"
+#include "mcb.h"
+#include "md.h"
 #include "http.h"
 #include "muqss.h"
 #include "net.h"
 #include "ntfs.h"
 #include "nvme.h"
+#include "od.h"
+#include "opp.h"
 #include "pcb.h"
 #include "pcnet.h"
 #include "power.h"
@@ -44,9 +52,11 @@
 #include "schedopt.h"
 #include "signal.h"
 #include "smp.h"
+#include "spi.h"
 #include "storage_ext.h"
 #include "tls.h"
 #include "terminal.h"
+#include "tpm.h"
 #include "usb_ext.h"
 #include "vma.h"
 #include "vmext.h"
@@ -70,7 +80,9 @@ static const device_entry_t g_devices[] = {
     { "ide", "storage", true, false },
     { "ahci", "storage", true, false },
     { "nvme", "storage", true, false },
+    { "cdrom", "storage", true, false },
     { "ntfs", "fs", true, false },
+    { "iso9660", "fs", true, false },
     { "extfs", "fs", true, false },
     { "fscache", "fs", true, false },
     { "pcnet", "net", true, false },
@@ -85,6 +97,14 @@ static const device_entry_t g_devices[] = {
     { "hda", "audio", true, false },
     { "aac", "audio", true, false },
     { "iic", "bus", true, false },
+    { "i2c", "bus", true, false },
+    { "i3c", "bus", true, false },
+    { "spi", "bus", true, false },
+    { "tpm", "security", true, false },
+    { "mcb", "memory", true, false },
+    { "md", "storage", true, false },
+    { "opp", "power", true, false },
+    { "od", "power", true, false },
     { "bios", "firmware", true, false },
     { "gop", "graphics", true, false },
     { "rtc", "clock", true, false },
@@ -346,6 +366,25 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
     }
+    if (strcmp(dev->name, "cdrom") == 0) {
+        const cdrom_info_t *info = cdrom_info();
+
+        device_append(buffer, size, cdrom_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\nready ");
+        device_append(buffer, size, info->ready ? "yes" : "no");
+        device_append(buffer, size, "\nsectors ");
+        device_append_u32(buffer, size, info->total_sectors);
+        device_append(buffer, size, "\nsector_size ");
+        device_append_u32(buffer, size, info->sector_size);
+        if (info->present) {
+            device_append(buffer, size, "\nproduct ");
+            device_append(buffer, size, info->product);
+        }
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
     if (strcmp(dev->name, "ntfs") == 0) {
         const ntfs_info_t *info = ntfs_info();
 
@@ -367,6 +406,25 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
             device_append_u32(buffer, size, info->index_record_size);
             device_append(buffer, size, "\nmft0 ");
             device_append(buffer, size, info->mft0_readable ? "readable" : "unreadable");
+        }
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "iso9660") == 0) {
+        const iso9660_info_t *info = iso9660_info();
+
+        device_append(buffer, size, iso9660_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\nready ");
+        device_append(buffer, size, info->ready ? "yes" : "no");
+        device_append(buffer, size, "\nblocks ");
+        device_append_u32(buffer, size, info->total_blocks);
+        device_append(buffer, size, "\nblock ");
+        device_append_u32(buffer, size, info->block_size);
+        if (info->volume_id[0] != '\0') {
+            device_append(buffer, size, "\nvolume ");
+            device_append(buffer, size, info->volume_id);
         }
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
@@ -553,6 +611,136 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append_u32(buffer, size, info->adapters);
         device_append(buffer, size, "\nfound ");
         device_append_u32(buffer, size, info->found_count);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "i2c") == 0) {
+        const i2c_info_t *info = i2c_info();
+
+        device_append(buffer, size, i2c_status());
+        device_append(buffer, size, "\navailable ");
+        device_append(buffer, size, info->available ? "yes" : "no");
+        device_append(buffer, size, "\nbuses ");
+        device_append_u32(buffer, size, info->bus_count);
+        device_append(buffer, size, "\nspeed ");
+        device_append_u32(buffer, size, info->bus_speed);
+        device_append(buffer, size, "\ntransfers ");
+        device_append_u32(buffer, size, info->transfer_count);
+        device_append(buffer, size, "\nerrors ");
+        device_append_u32(buffer, size, info->error_count);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "i3c") == 0) {
+        const i3c_info_t *info = i3c_info();
+
+        device_append(buffer, size, i3c_status());
+        device_append(buffer, size, "\navailable ");
+        device_append(buffer, size, info->available ? "yes" : "no");
+        device_append(buffer, size, "\nbuses ");
+        device_append_u32(buffer, size, info->bus_count);
+        device_append(buffer, size, "\ndevices ");
+        device_append_u32(buffer, size, info->device_count);
+        device_append(buffer, size, "\nscl ");
+        device_append_u32(buffer, size, info->scl_freq);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "spi") == 0) {
+        const spi_info_t *info = spi_info();
+
+        device_append(buffer, size, spi_status());
+        device_append(buffer, size, "\navailable ");
+        device_append(buffer, size, info->available ? "yes" : "no");
+        device_append(buffer, size, "\nbuses ");
+        device_append_u32(buffer, size, info->bus_count);
+        device_append(buffer, size, "\nspeed ");
+        device_append_u32(buffer, size, info->current_speed);
+        device_append(buffer, size, "\nmode ");
+        device_append_u32(buffer, size, info->mode);
+        device_append(buffer, size, "\ntransfers ");
+        device_append_u32(buffer, size, info->transfer_count);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "tpm") == 0) {
+        const tpm_info_t *info = tpm_info();
+
+        device_append(buffer, size, tpm_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\nready ");
+        device_append(buffer, size, info->ready ? "yes" : "no");
+        device_append(buffer, size, "\ninterface ");
+        device_append_u32(buffer, size, info->interface_type);
+        device_append(buffer, size, "\nvendor ");
+        device_append(buffer, size, info->vendor_name);
+        device_append(buffer, size, "\ncommands ");
+        device_append_u32(buffer, size, info->command_count);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "mcb") == 0) {
+        const mcb_info_t *info = mcb_info();
+
+        device_append(buffer, size, mcb_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\nchannels ");
+        device_append_u32(buffer, size, info->channel_count);
+        device_append(buffer, size, "\ndimms ");
+        device_append_u32(buffer, size, info->dimm_count);
+        device_append(buffer, size, "\nsize_mb ");
+        device_append_u32(buffer, size, info->total_size_mb);
+        device_append(buffer, size, "\nclock ");
+        device_append_u32(buffer, size, info->clock_mhz);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "md") == 0) {
+        const md_info_t *info = md_info();
+
+        device_append(buffer, size, md_status());
+        device_append(buffer, size, "\narrays ");
+        device_append_u32(buffer, size, info->array_count);
+        device_append(buffer, size, "\ndevices ");
+        device_append_u32(buffer, size, info->device_count);
+        device_append(buffer, size, "\nsize_mb ");
+        device_append_u32(buffer, size, info->total_size_mb);
+        device_append(buffer, size, "\nresync ");
+        device_append(buffer, size, info->resync_active ? "active" : "idle");
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "opp") == 0) {
+        const opp_info_t *info = opp_info();
+
+        device_append(buffer, size, opp_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\ndomains ");
+        device_append_u32(buffer, size, info->domain_count);
+        device_append(buffer, size, "\ngovernor ");
+        device_append(buffer, size, info->governor);
+        device_append(buffer, size, "\nscaling ");
+        device_append(buffer, size, info->scaling_enabled ? "yes" : "no");
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "od") == 0) {
+        const od_info_t *info = od_info();
+
+        device_append(buffer, size, od_status());
+        device_append(buffer, size, "\npresent ");
+        device_append(buffer, size, info->present ? "yes" : "no");
+        device_append(buffer, size, "\nenabled ");
+        device_append(buffer, size, info->enabled ? "yes" : "no");
+        device_append(buffer, size, "\ndomains ");
+        device_append_u32(buffer, size, info->domain_count);
+        device_append(buffer, size, "\ntdp ");
+        device_append_u32(buffer, size, info->tdp_watts);
+        device_append(buffer, size, "\ntemp_limit ");
+        device_append_u32(buffer, size, info->temp_limit_c);
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
     }

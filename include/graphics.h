@@ -5,8 +5,8 @@
 #include "stdint.h"
 #include "keyboard.h"
 
-#define GRAPHICS_WIDTH  1024
-#define GRAPHICS_HEIGHT 768
+#define GRAPHICS_WIDTH  1280
+#define GRAPHICS_HEIGHT 800
 
 void graphics_init(void);
 bool graphics_active(void);

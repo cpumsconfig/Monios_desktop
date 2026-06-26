@@ -3272,6 +3272,7 @@ void graphics_enter_mode(void)
     char hex[9];
     graphics_pci_device_t dev;
     uint32_t addr;
+    uint64_t framebuffer_map_length;
 
     if (g_graphics_active) {
         return;
@@ -3286,10 +3287,11 @@ void graphics_enter_mode(void)
         g_graphics_vmware_backend = false;
         return;
     }
-    /* Ensure kernel page-tables will map the framebuffer physical page
-     * when the kernel switches to its own CR3. Map 2MiB aligned page.
+    /* Ensure kernel page-tables map enough framebuffer space for the
+     * selected mode before we switch to the kernel CR3.
      */
-    mmu_map_identity((uint64_t)addr, 0x200000);
+    framebuffer_map_length = (uint64_t) FB_PIXELS * sizeof(uint32_t) + 0x400000ULL;
+    mmu_map_identity((uint64_t)addr, framebuffer_map_length);
     /* If kernel page-tables are not yet active (we're still on loader/boot
      * page-tables), avoid performing writes to high MMIO framebuffer
      * addresses which will cause page faults. Defer graphics activation

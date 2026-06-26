@@ -7,6 +7,7 @@
 #include "browser.h"
 #include "bsod.h"
 #include "buddy.h"
+#include "cdrom.h"
 #include "common.h"
 #include "console.h"
 #include "cpu.h"
@@ -28,19 +29,26 @@
 #include "heap.h"
 #include "hid.h"
 #include "http.h"
+#include "i2c.h"
+#include "i3c.h"
 #include "iic.h"
 #include "ide.h"
 #include "ipc.h"
+#include "iso9660.h"
 #include "ipv4.h"
 #include "ipv6.h"
 #include "lazyalloc.h"
 #include "kernel.h"
 #include "lwip.h"
+#include "mcb.h"
+#include "md.h"
 #include "memory.h"
 #include "muqss.h"
 #include "net.h"
 #include "ntfs.h"
 #include "nvme.h"
+#include "od.h"
+#include "opp.h"
 #include "path.h"
 #include "pcb.h"
 #include "pcnet.h"
@@ -55,11 +63,13 @@
 #include "signal.h"
 #include "smp.h"
 #include "socket.h"
+#include "spi.h"
 #include "storage_ext.h"
 #include "tcb.h"
 #include "string.h"
 #include "terminal.h"
 #include "tls.h"
+#include "tpm.h"
 #include "usb_ext.h"
 #include "vma.h"
 #include "vmext.h"
@@ -430,11 +440,12 @@ static void shell_complete_command(const char *prefix, uint32_t prefix_len)
         "upper", "lower", "mkdir", "touch", "write", "rm", "rmdir",
         "run", "hash", "base64", "env", "set", "unset", "sudo", "su",
         "exit", "shutdown", "net", "dhcp", "dns", "ipv4", "ipv6",
-        "cpu", "fpu", "cpuid", "tcb", "ide", "ahci", "nvme", "hda",
+        "cpu", "fpu", "cpuid", "tcb", "ide", "ahci", "nvme", "cdrom", "hda",
         "aac", "pcnet", "lwip", "xhci", "usbext", "hid", "ntfs", "extfs", "fscache",
         "tls", "ssl", "http", "https", "wifi", "bluetooth", "storagex", "gpu", "gui",
         "browser", "power", "vmext", "schedopt",
-        "iic", "bios", "gop", "rtc", "heap", "frame", "vma",
+        "iic", "i2c", "i3c", "spi", "tpm", "mcb", "md", "opp", "od", "iso9660",
+        "bios", "gop", "rtc", "heap", "frame", "vma",
         "lazyalloc", "bitmap", "buddy", "eevdf", "futex", "ipc",
         "muqss", "pcb", "pool", "prsys", "scheduler", "signal",
         "socket", "udp", "ping", "dev",
@@ -1976,7 +1987,7 @@ static void shell_run_command(char *line, bool admin_once)
     argc = shell_expand_globs_in_argv(argc, argv);
 
     if (strcmp(argv[0], "help") == 0) {
-        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme storagex hda aac pcnet lwip xhci usbext hid ntfs extfs fscache iic bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail ver");
+        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme cdrom storagex hda aac pcnet lwip xhci usbext hid ntfs iso9660 extfs fscache iic i2c i3c spi tpm mcb md opp od bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail ver");
         return;
     }
 
@@ -2805,6 +2816,22 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
+    if (strcmp(argv[0], "cdrom") == 0) {
+        const cdrom_info_t *info = cdrom_info();
+
+        shell_print_line(cdrom_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_line(info->ready ? "ready: yes" : "ready: no");
+        shell_print_u32_prefixed("sectors: ", info->total_sectors);
+        shell_print_u32_prefixed("sector size: ", info->sector_size);
+        if (info->present) {
+            shell_print_line(info->vendor);
+            shell_print_line(info->product);
+            shell_print_line(info->revision);
+        }
+        return;
+    }
+
     if (strcmp(argv[0], "hda") == 0) {
         const hda_info_t *info = hda_info();
 
@@ -2975,6 +3002,23 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
+    if (strcmp(argv[0], "iso9660") == 0) {
+        const iso9660_info_t *info = iso9660_info();
+
+        shell_print_line(iso9660_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_line(info->ready ? "ready: yes" : "ready: no");
+        shell_print_u32_prefixed("blocks: ", info->total_blocks);
+        shell_print_u32_prefixed("block size: ", info->block_size);
+        shell_print_u32_prefixed("root extent: ", info->root_extent);
+        shell_print_u32_prefixed("root size: ", info->root_size);
+        if (info->volume_id[0] != '\0') {
+            shell_print_line(info->volume_id);
+        }
+        shell_print_u32_prefixed("root entries: ", iso9660_root_entry_count());
+        return;
+    }
+
     if (strcmp(argv[0], "fscache") == 0) {
         const fs_cache_info_t *info = fs_cache_info();
 
@@ -3019,6 +3063,252 @@ static void shell_run_command(char *line, bool admin_once)
         shell_print_line(iic_status());
         shell_print_u32_prefixed("adapters: ", iic_info()->adapters);
         shell_print_u32_prefixed("found: ", iic_info()->found_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "i2c") == 0) {
+        const i2c_info_t *info = i2c_info();
+        uint32_t bus = 0;
+        uint32_t speed = 0;
+        uint8_t addrs[32];
+        uint32_t probe;
+
+        if (argc >= 2 && strcmp(argv[1], "scan") == 0) {
+            if (argc >= 3 && !shell_parse_u32_arg(argv[2], &bus)) {
+                shell_print_line("usage: i2c scan [bus]");
+                return;
+            }
+            uint32_t count = i2c_scan((uint8_t) bus, addrs, sizeof(addrs));
+
+            shell_print_line(i2c_status());
+            for (uint32_t i = 0; i < count; i++) {
+                shell_print_hex_u32_prefixed("addr: ", addrs[i]);
+            }
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "probe") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &probe) || probe > 0x7F) {
+                shell_print_line("usage: i2c probe <addr>");
+                return;
+            }
+            shell_print_line(i2c_probe(0, (uint8_t) probe) ? i2c_status() : i2c_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "speed") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &speed)) {
+                shell_print_line("usage: i2c speed <hz>");
+                return;
+            }
+            shell_print_line(i2c_set_speed(0, speed) == 0 ? i2c_status() : i2c_status());
+            return;
+        }
+        shell_print_line(i2c_status());
+        shell_print_line(info->available ? "available: yes" : "available: no");
+        shell_print_u32_prefixed("buses: ", info->bus_count);
+        shell_print_u32_prefixed("speed: ", info->bus_speed);
+        shell_print_u32_prefixed("last addr: ", info->last_address);
+        shell_print_u32_prefixed("transfers: ", info->transfer_count);
+        shell_print_u32_prefixed("errors: ", info->error_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "i3c") == 0) {
+        const i3c_info_t *info = i3c_info();
+        uint32_t bus = 0;
+        uint32_t freq = 0;
+        uint8_t addrs[32];
+        uint32_t probe;
+
+        if (argc >= 2 && strcmp(argv[1], "scan") == 0) {
+            if (argc >= 3 && !shell_parse_u32_arg(argv[2], &bus)) {
+                shell_print_line("usage: i3c scan [bus]");
+                return;
+            }
+            uint32_t count = i3c_scan((uint8_t) bus, addrs, sizeof(addrs));
+
+            shell_print_line(i3c_status());
+            for (uint32_t i = 0; i < count; i++) {
+                shell_print_hex_u32_prefixed("addr: ", addrs[i]);
+            }
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "probe") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &probe) || probe > 0x7F) {
+                shell_print_line("usage: i3c probe <addr>");
+                return;
+            }
+            shell_print_line(i3c_probe(0, (uint8_t) probe) ? i3c_status() : i3c_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "freq") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &freq)) {
+                shell_print_line("usage: i3c freq <hz>");
+                return;
+            }
+            shell_print_line(i3c_set_frequency(0, freq) == 0 ? i3c_status() : i3c_status());
+            return;
+        }
+        shell_print_line(i3c_status());
+        shell_print_line(info->available ? "available: yes" : "available: no");
+        shell_print_u32_prefixed("buses: ", info->bus_count);
+        shell_print_u32_prefixed("devices: ", info->device_count);
+        shell_print_line(info->i2c_devices_present ? "i2c compat: yes" : "i2c compat: no");
+        shell_print_u32_prefixed("scl: ", info->scl_freq);
+        shell_print_u32_prefixed("transfers: ", info->transfer_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "spi") == 0) {
+        const spi_info_t *info = spi_info();
+        uint32_t mode;
+        uint32_t speed;
+
+        if (argc >= 4 && strcmp(argv[1], "setup") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &mode) || !shell_parse_u32_arg(argv[3], &speed) || mode > 3) {
+                shell_print_line("usage: spi setup <mode> <speed>");
+                return;
+            }
+            shell_print_line(spi_setup(0, (uint8_t) mode, speed, 8) ? spi_status() : spi_status());
+            return;
+        }
+        shell_print_line(spi_status());
+        shell_print_line(info->available ? "available: yes" : "available: no");
+        shell_print_u32_prefixed("buses: ", info->bus_count);
+        shell_print_u32_prefixed("max speed: ", info->max_speed);
+        shell_print_u32_prefixed("speed: ", info->current_speed);
+        shell_print_u32_prefixed("mode: ", info->mode);
+        shell_print_u32_prefixed("bits: ", info->bits_per_word);
+        shell_print_u32_prefixed("transfers: ", info->transfer_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "tpm") == 0) {
+        const tpm_info_t *info = tpm_info();
+
+        if (argc >= 2 && strcmp(argv[1], "selftest") == 0) {
+            shell_print_line(tpm_self_test(false) == 0 ? tpm_status() : tpm_status());
+            return;
+        }
+        shell_print_line(tpm_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_line(info->ready ? "ready: yes" : "ready: no");
+        shell_print_u32_prefixed("interface: ", info->interface_type);
+        shell_print_u32_prefixed("version major: ", info->version_major);
+        shell_print_u32_prefixed("version minor: ", info->version_minor);
+        shell_print_hex_u32_prefixed("vendor id: ", info->vendor_id);
+        shell_print_hex_u32_prefixed("device id: ", info->device_id);
+        shell_print_line(info->vendor_name);
+        shell_print_u32_prefixed("commands: ", info->command_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "mcb") == 0) {
+        const mcb_info_t *info = mcb_info();
+
+        shell_print_line(mcb_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_u32_prefixed("channels: ", info->channel_count);
+        shell_print_u32_prefixed("dimms: ", info->dimm_count);
+        shell_print_u32_prefixed("type: ", info->memory_type);
+        shell_print_u32_prefixed("width: ", info->data_width);
+        shell_print_u32_prefixed("size mb: ", info->total_size_mb);
+        shell_print_u32_prefixed("clock mhz: ", info->clock_mhz);
+        shell_print_line(info->ecc_enabled ? "ecc: yes" : "ecc: no");
+        shell_print_u32_prefixed("commands: ", info->command_count);
+        return;
+    }
+
+    if (strcmp(argv[0], "md") == 0) {
+        const md_info_t *info = md_info();
+        uint32_t index;
+        md_array_info_t array;
+
+        if (argc >= 3 && strcmp(argv[1], "array") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &index) || md_get_array_info((uint8_t) index, &array) != 0) {
+                shell_print_line("usage: md array <index>");
+                return;
+            }
+            shell_print_line(array.name);
+            shell_print_i32_prefixed("level: ", array.raid_level);
+            shell_print_u32_prefixed("state: ", array.state);
+            shell_print_u32_prefixed("disks: ", array.num_disks);
+            shell_print_u64_prefixed("size sectors: ", array.size_sectors);
+            return;
+        }
+        shell_print_line(md_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_u32_prefixed("arrays: ", info->array_count);
+        shell_print_u32_prefixed("devices: ", info->device_count);
+        shell_print_u32_prefixed("size mb: ", info->total_size_mb);
+        shell_print_line(info->resync_active ? "resync: active" : "resync: idle");
+        shell_print_u32_prefixed("resync progress: ", info->resync_progress);
+        return;
+    }
+
+    if (strcmp(argv[0], "opp") == 0) {
+        const opp_info_t *info = opp_info();
+        uint32_t index;
+        opp_domain_info_t domain;
+
+        if (argc >= 3 && strcmp(argv[1], "domain") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &index) || opp_get_domain_info((uint8_t) index, &domain) != 0) {
+                shell_print_line("usage: opp domain <index>");
+                return;
+            }
+            shell_print_line(domain.name);
+            shell_print_u32_prefixed("type: ", domain.type);
+            shell_print_u32_prefixed("points: ", domain.point_count);
+            shell_print_u32_prefixed("current hz: ", domain.current_freq_hz);
+            shell_print_u32_prefixed("voltage uv: ", domain.current_voltage_uv);
+            shell_print_u32_prefixed("min hz: ", domain.min_freq_hz);
+            shell_print_u32_prefixed("max hz: ", domain.max_freq_hz);
+            return;
+        }
+        shell_print_line(opp_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_line(info->scaling_enabled ? "scaling: yes" : "scaling: no");
+        shell_print_u32_prefixed("domains: ", info->domain_count);
+        shell_print_u32_prefixed("current domain: ", info->current_domain);
+        shell_print_u32_prefixed("transitions: ", info->transition_count);
+        shell_print_line(info->governor);
+        return;
+    }
+
+    if (strcmp(argv[0], "od") == 0) {
+        const od_info_t *info = od_info();
+        uint32_t index;
+        od_domain_info_t domain;
+
+        if (argc >= 2 && strcmp(argv[1], "on") == 0) {
+            shell_print_line(od_enable(true) == 0 ? od_status() : od_status());
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "off") == 0) {
+            shell_print_line(od_enable(false) == 0 ? od_status() : od_status());
+            return;
+        }
+        if (argc >= 3 && strcmp(argv[1], "domain") == 0) {
+            if (!shell_parse_u32_arg(argv[2], &index) || od_get_domain_info((uint8_t) index, &domain) != 0) {
+                shell_print_line("usage: od domain <index>");
+                return;
+            }
+            shell_print_line(domain.name);
+            shell_print_u32_prefixed("type: ", domain.type);
+            shell_print_u32_prefixed("state: ", domain.state);
+            shell_print_u32_prefixed("base mhz: ", domain.base_freq_mhz);
+            shell_print_u32_prefixed("current mhz: ", domain.current_freq_mhz);
+            shell_print_u32_prefixed("temperature c: ", domain.temperature_c);
+            shell_print_u32_prefixed("power w: ", domain.power_watts);
+            return;
+        }
+        shell_print_line(od_status());
+        shell_print_line(info->present ? "present: yes" : "present: no");
+        shell_print_line(info->enabled ? "enabled: yes" : "enabled: no");
+        shell_print_u32_prefixed("domains: ", info->domain_count);
+        shell_print_hex_u32_prefixed("features: ", info->feature_flags);
+        shell_print_u32_prefixed("tdp w: ", info->tdp_watts);
+        shell_print_u32_prefixed("power limit w: ", info->power_limit_watts);
+        shell_print_u32_prefixed("temp limit c: ", info->temp_limit_c);
         return;
     }
 
