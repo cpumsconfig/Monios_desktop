@@ -2,14 +2,16 @@
 #include "common.h"
 #include "string.h"
 
-#define ATA_DATA_PORT         0x1F0
-#define ATA_SECTOR_COUNT_PORT 0x1F2
-#define ATA_LBA_LOW_PORT      0x1F3
-#define ATA_LBA_MID_PORT      0x1F4
-#define ATA_LBA_HIGH_PORT     0x1F5
-#define ATA_DRIVE_PORT        0x1F6
-#define ATA_COMMAND_PORT      0x1F7
-#define ATA_STATUS_PORT       0x1F7
+#define ATA_PRIMARY_IO_BASE   0x1F0
+#define ATA_SECONDARY_IO_BASE 0x170
+#define ATA_DATA_PORT         (g_cdrom_io_base + 0)
+#define ATA_SECTOR_COUNT_PORT (g_cdrom_io_base + 2)
+#define ATA_LBA_LOW_PORT      (g_cdrom_io_base + 3)
+#define ATA_LBA_MID_PORT      (g_cdrom_io_base + 4)
+#define ATA_LBA_HIGH_PORT     (g_cdrom_io_base + 5)
+#define ATA_DRIVE_PORT        (g_cdrom_io_base + 6)
+#define ATA_COMMAND_PORT      (g_cdrom_io_base + 7)
+#define ATA_STATUS_PORT       (g_cdrom_io_base + 7)
 
 #define ATA_CMD_PACKET        0xA0
 #define ATA_STATUS_BSY        0x80
@@ -22,6 +24,7 @@
 
 static cdrom_info_t g_cdrom_info;
 static uint8_t g_atapi_packet[12];
+static uint16_t g_cdrom_io_base = ATA_PRIMARY_IO_BASE;
 static uint8_t g_cdrom_drive = ATA_DRIVE_MASTER;
 static uint32_t g_cdrom_packet_bytes = CDROM_SECTOR_SIZE;
 
@@ -226,9 +229,12 @@ bool cdrom_read_sectors(uint32_t lba, uint32_t count, void *buffer)
     return true;
 }
 
-static bool cdrom_probe_drive(uint8_t drive)
+static bool cdrom_probe_drive(uint16_t io_base, uint8_t drive, const char *ready_status)
 {
+    g_cdrom_io_base = io_base;
     g_cdrom_drive = drive;
+    g_cdrom_info.present = false;
+    g_cdrom_info.ready = false;
     g_cdrom_info.sector_size = CDROM_SECTOR_SIZE;
 
     if (!cdrom_test_unit_ready()) {
@@ -244,8 +250,7 @@ static bool cdrom_probe_drive(uint8_t drive)
         return false;
     }
     g_cdrom_info.ready = true;
-    strcpy(g_cdrom_info.status,
-           drive == ATA_DRIVE_MASTER ? "cdrom: primary master ready" : "cdrom: primary slave ready");
+    strcpy(g_cdrom_info.status, ready_status);
     return true;
 }
 
@@ -255,7 +260,10 @@ void cdrom_init(void)
     g_cdrom_info.sector_size = CDROM_SECTOR_SIZE;
     strcpy(g_cdrom_info.status, "cdrom: detecting...");
 
-    if (cdrom_probe_drive(ATA_DRIVE_MASTER) || cdrom_probe_drive(ATA_DRIVE_SLAVE)) {
+    if (cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: primary master ready") ||
+        cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: primary slave ready") ||
+        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: secondary master ready") ||
+        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: secondary slave ready")) {
         return;
     }
     memset(&g_cdrom_info, 0, sizeof(g_cdrom_info));

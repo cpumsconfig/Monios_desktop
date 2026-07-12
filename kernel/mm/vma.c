@@ -22,6 +22,19 @@ static void vma_copy_name(char *dst, uint32_t size, const char *src)
     dst[index] = '\0';
 }
 
+static bool vma_range_valid(uint64_t base, uint64_t size)
+{
+    return size != 0 && base <= 0xFFFFFFFFFFFFFFFFULL - size;
+}
+
+static bool vma_ranges_overlap(uint64_t base_a, uint64_t size_a, uint64_t base_b, uint64_t size_b)
+{
+    uint64_t end_a = base_a + size_a;
+    uint64_t end_b = base_b + size_b;
+
+    return base_a < end_b && base_b < end_a;
+}
+
 void vma_init(void)
 {
     memset(g_vmas, 0, sizeof(g_vmas));
@@ -39,9 +52,19 @@ int32_t vma_add(uint64_t base, uint64_t size, uint32_t flags, const char *name)
 {
     vma_entry_t *entry;
 
-    if (size == 0 || g_vma_count >= VMA_MAX_ENTRIES) {
+    if (!vma_range_valid(base, size)) {
+        strcpy(g_vma_status, "vma: invalid range");
+        return -1;
+    }
+    if (g_vma_count >= VMA_MAX_ENTRIES) {
         strcpy(g_vma_status, "vma: table full");
         return -1;
+    }
+    for (uint32_t index = 0; index < g_vma_count; index++) {
+        if (g_vmas[index].used && vma_ranges_overlap(base, size, g_vmas[index].base, g_vmas[index].size)) {
+            strcpy(g_vma_status, "vma: overlap");
+            return -1;
+        }
     }
     entry = &g_vmas[g_vma_count];
     memset(entry, 0, sizeof(*entry));
@@ -61,7 +84,7 @@ const vma_entry_t *vma_find(uint64_t address)
     for (uint32_t index = 0; index < g_vma_count; index++) {
         const vma_entry_t *entry = &g_vmas[index];
 
-        if (entry->used && address >= entry->base && address < entry->base + entry->size) {
+        if (entry->used && address >= entry->base && address - entry->base < entry->size) {
             return entry;
         }
     }

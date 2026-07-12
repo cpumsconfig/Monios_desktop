@@ -186,6 +186,20 @@ void cpu_write_msr(uint32_t msr, uint64_t value)
     );
 }
 
+uint64_t cpu_read_tsc(void)
+{
+    uint32_t lo;
+    uint32_t hi;
+
+    asm volatile (
+        "rdtsc"
+        : "=a" (lo), "=d" (hi)
+        :
+        : "memory"
+    );
+    return ((uint64_t) hi << 32) | lo;
+}
+
 void cpu_log_info(void)
 {
     char line[80] = "cpu: vendor=";

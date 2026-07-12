@@ -309,8 +309,12 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append(buffer, size, info->mac_text);
         device_append(buffer, size, "\nip ");
         device_append(buffer, size, info->ip_text);
+        device_append(buffer, size, "\nmask ");
+        device_append(buffer, size, info->netmask_text);
         device_append(buffer, size, "\ngateway ");
         device_append(buffer, size, info->gateway_text);
+        device_append(buffer, size, "\ndns ");
+        device_append(buffer, size, info->dns_text);
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
     }
@@ -1022,6 +1026,14 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append_u32(buffer, size, info->pages_requested);
         device_append(buffer, size, "\nlast ");
         device_append(buffer, size, info->last_url);
+        device_append(buffer, size, "\ntitle ");
+        device_append(buffer, size, info->last_title);
+        device_append(buffer, size, "\nstatus ");
+        device_append_i32(buffer, size, info->last_status_code);
+        device_append(buffer, size, "\nbytes ");
+        device_append_u32(buffer, size, info->last_body_length);
+        device_append(buffer, size, "\ntype ");
+        device_append(buffer, size, info->content_type);
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
     }

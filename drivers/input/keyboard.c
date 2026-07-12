@@ -5,6 +5,10 @@
 #define PS2_DATA_PORT 0x60
 #define PS2_STATUS_PORT 0x64
 #define PS2_STATUS_OUTPUT_FULL 0x01
+#define PS2_STATUS_INPUT_FULL 0x02
+#define PS2_KEYBOARD_CMD_LEDS 0xED
+#define PS2_KEYBOARD_ACK 0xFA
+#define KEYBOARD_WAIT_LIMIT 100000U
 
 static bool extended_prefix;
 static bool pause_prefix_e1;
@@ -16,6 +20,58 @@ static keyboard_status_t kb_status;
 static volatile key_event_t g_key_events[KEYBOARD_EVENT_QUEUE_SIZE];
 static volatile uint32_t g_key_event_head;
 static volatile uint32_t g_key_event_tail;
+
+static bool keyboard_wait_input_ready(void)
+{
+    for (uint32_t i = 0; i < KEYBOARD_WAIT_LIMIT; i++) {
+        if ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool keyboard_wait_output_ready(void)
+{
+    for (uint32_t i = 0; i < KEYBOARD_WAIT_LIMIT; i++) {
+        if ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool keyboard_write_data(uint8_t value)
+{
+    if (!keyboard_wait_input_ready()) {
+        return false;
+    }
+    outb(PS2_DATA_PORT, value);
+    return true;
+}
+
+static void keyboard_consume_ack(void)
+{
+    if (keyboard_wait_output_ready() && inb(PS2_DATA_PORT) != PS2_KEYBOARD_ACK) {
+        /* Ignore non-ACK bytes here; the next hardware IRQ will resync. */
+    }
+}
+
+static void keyboard_update_leds(void)
+{
+    uint8_t leds = (kb_status.scroll_lock_on ? 0x01U : 0U) |
+                   (kb_status.num_lock_on ? 0x02U : 0U) |
+                   (kb_status.caps_lock_on ? 0x04U : 0U);
+
+    if (!keyboard_write_data(PS2_KEYBOARD_CMD_LEDS)) {
+        return;
+    }
+    keyboard_consume_ack();
+    if (!keyboard_write_data(leds)) {
+        return;
+    }
+    keyboard_consume_ack();
+}
 
 static const char keymap_base[128] = {
     [0x02] = '1', [0x03] = '2', [0x04] = '3', [0x05] = '4',
@@ -141,6 +197,7 @@ void init_keyboard(void)
     kb_status.win_down = false;
     kb_status.caps_lock_on = false;
     kb_status.num_lock_on = true;
+    kb_status.scroll_lock_on = false;
     kb_status.insert_mode = false;
     kb_status.last_function = 0;
     extended_prefix = false;
@@ -148,6 +205,7 @@ void init_keyboard(void)
     pause_sequence_index = 0;
     g_key_event_head = 0;
     g_key_event_tail = 0;
+    keyboard_update_leds();
 }
 
 const keyboard_status_t *keyboard_status(void)
@@ -234,13 +292,22 @@ void keyboard_interrupt_dispatch(void)
 
     if (!release && scancode == 0x3A) {
         kb_status.caps_lock_on = !kb_status.caps_lock_on;
+        keyboard_update_leds();
         extended_prefix = false;
         return;
     }
 
     if (!release && scancode == 0x45) {
         kb_status.num_lock_on = !kb_status.num_lock_on;
+        keyboard_update_leds();
         keyboard_emit_event(KEY_EVENT_NUM, 0);
+        extended_prefix = false;
+        return;
+    }
+
+    if (!release && scancode == 0x46) {
+        kb_status.scroll_lock_on = !kb_status.scroll_lock_on;
+        keyboard_update_leds();
         extended_prefix = false;
         return;
     }

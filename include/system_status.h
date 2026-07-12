@@ -6,6 +6,8 @@
 
 typedef struct {
     uint32_t task_count;
+    uint32_t process_count;
+    int32_t current_pid;
     bool scheduler_stopping;
     bool shutdown_requested;
     bool reboot_requested;

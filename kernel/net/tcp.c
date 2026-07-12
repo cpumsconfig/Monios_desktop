@@ -1,4 +1,5 @@
 #include "common.h"
+#include "cpu.h"
 #include "ip.h"
 #include "kernel.h"
 #include "net.h"
@@ -7,6 +8,30 @@
 static tcp_connection_t g_connections[TCP_MAX_CONNECTIONS];
 static uint32_t g_tcp_packets;
 static uint16_t g_next_ephemeral_port;
+static uint32_t g_seq_secret;
+
+static uint32_t tcp_mix32(uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
+}
+
+static bool tcp_seq_between(uint32_t value, uint32_t start, uint32_t end)
+{
+    return (int32_t) (value - start) >= 0 && (int32_t) (end - value) >= 0;
+}
+
+static bool tcp_ack_valid(const tcp_connection_t *conn, uint32_t ack)
+{
+    if (conn == NULL) {
+        return false;
+    }
+    return tcp_seq_between(ack, conn->remote_ack, conn->seq_num);
+}
 
 static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4], const uint8_t *segment, uint16_t length)
 {
@@ -36,8 +61,7 @@ static bool tcp_send_segment(const uint8_t dst_ip[4], uint16_t src_port, uint16_
                               uint32_t seq, uint32_t ack, uint8_t flags, 
                               const uint8_t *data, uint16_t data_len)
 {
-    uint8_t tcp[60];
-    uint8_t *packet;
+    uint8_t tcp[20 + TCP_MAX_SEGMENT_SIZE];
     uint16_t total_len;
     const uint8_t *src_ip = net_local_ip();
     uint8_t data_offset = 5;
@@ -118,8 +142,24 @@ static uint16_t tcp_alloc_ephemeral_port(void)
 
 static uint32_t tcp_generate_seq(void)
 {
-    static uint32_t seq = 0x12345678;
-    seq += 0x1000;
+    uint64_t tsc = cpu_read_tsc();
+
+    g_seq_secret ^= (uint32_t) tsc;
+    g_seq_secret ^= (uint32_t) (tsc >> 32);
+    g_seq_secret = tcp_mix32(g_seq_secret + 0x9E3779B9u);
+    return g_seq_secret;
+}
+
+static uint32_t tcp_generate_conn_seq(const uint8_t remote_ip[4], uint16_t remote_port, uint16_t local_port)
+{
+    uint32_t seq = tcp_generate_seq();
+
+    seq ^= ((uint32_t) remote_ip[0] << 24) |
+           ((uint32_t) remote_ip[1] << 16) |
+           ((uint32_t) remote_ip[2] << 8) |
+           remote_ip[3];
+    seq ^= ((uint32_t) remote_port << 16) | local_port;
+    seq ^= (uint32_t) timer_ticks();
     return seq;
 }
 
@@ -128,6 +168,14 @@ void tcp_init(void)
     memset(g_connections, 0, sizeof(g_connections));
     g_tcp_packets = 0;
     g_next_ephemeral_port = 49152;
+    {
+        uint64_t tsc = cpu_read_tsc();
+
+        g_seq_secret = tcp_mix32((uint32_t) timer_ticks() ^
+                                 (uint32_t) tsc ^
+                                 (uint32_t) (tsc >> 32) ^
+                                 0xA5366B4Du);
+    }
     log_write("tcp: ipv4 stack ready");
 }
 
@@ -167,7 +215,7 @@ int32_t tcp_connect(const uint8_t remote_ip[4], uint16_t remote_port, uint16_t l
     memcpy(conn->remote_ip, remote_ip, 4);
     conn->remote_port = remote_port;
     conn->local_port = local_port;
-    conn->seq_num = tcp_generate_seq();
+    conn->seq_num = tcp_generate_conn_seq(remote_ip, remote_port, local_port);
     conn->ack_num = 0;
     conn->rx_len = 0;
     conn->rx_read_pos = 0;
@@ -323,16 +371,25 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
     if (ip_total < 40 || (uint32_t) ip_total + 14 > length) {
         return;
     }
+    if (ip_checksum(ip, 20) != 0 || (ip_get16(ip + 6) & 0x3FFFu) != 0) {
+        return;
+    }
     if (!ip_equal(ip + 16, net_local_ip())) {
         return;
     }
 
     tcp = ip + 20;
+    if (tcp_checksum(ip + 12, ip + 16, tcp, (uint16_t) (ip_total - 20)) != 0) {
+        return;
+    }
     src_port = ip_get16(tcp + 0);
     dst_port = ip_get16(tcp + 2);
     seq = ((uint32_t) tcp[4] << 24) | ((uint32_t) tcp[5] << 16) | ((uint32_t) tcp[6] << 8) | tcp[7];
     ack = ((uint32_t) tcp[8] << 24) | ((uint32_t) tcp[9] << 16) | ((uint32_t) tcp[10] << 8) | tcp[11];
     data_offset = (tcp[12] >> 4) & 0x0F;
+    if (data_offset < 5 || (uint32_t) data_offset * 4u > (uint32_t) ip_total - 20u) {
+        return;
+    }
     flags = tcp[13];
     window = ip_get16(tcp + 14);
     data = tcp + data_offset * 4;
@@ -363,16 +420,16 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
 
     switch (conn->state) {
         case TCP_STATE_SYN_SENT:
-            if ((flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) != 0) {
+            if ((flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) != 0 && ack == conn->seq_num) {
                 conn->state = TCP_STATE_ESTABLISHED;
                 conn->ack_num = seq + 1;
-                conn->remote_seq = seq;
+                conn->remote_seq = seq + 1;
                 conn->remote_ack = ack;
                 conn->remote_window = window;
                 tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
                                  conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
                 log_write("tcp: connection established");
-            } else if ((flags & TCP_FLAG_RST) != 0) {
+            } else if ((flags & TCP_FLAG_RST) != 0 && tcp_ack_valid(conn, ack)) {
                 memset(conn, 0, sizeof(*conn));
                 log_write("tcp: connection reset");
             }
@@ -380,14 +437,26 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
 
         case TCP_STATE_ESTABLISHED:
             if ((flags & TCP_FLAG_RST) != 0) {
-                memset(conn, 0, sizeof(*conn));
-                log_write("tcp: connection reset");
+                if (seq == conn->ack_num || tcp_ack_valid(conn, ack)) {
+                    memset(conn, 0, sizeof(*conn));
+                    log_write("tcp: connection reset");
+                }
+                break;
+            }
+
+            if ((flags & TCP_FLAG_ACK) != 0 && !tcp_ack_valid(conn, ack)) {
+                break;
+            }
+            if (seq != conn->ack_num) {
+                tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
+                                 conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
                 break;
             }
 
             if ((flags & TCP_FLAG_FIN) != 0) {
                 conn->state = TCP_STATE_CLOSE_WAIT;
                 conn->ack_num = seq + 1;
+                conn->remote_seq = conn->ack_num;
                 tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
                                  conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
                 log_write("tcp: close wait");
@@ -401,6 +470,7 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
                     conn->rx_len += data_len;
                     conn->rx_ready = true;
                     conn->ack_num = seq + data_len;
+                    conn->remote_seq = conn->ack_num;
                     tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
                                      conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
                 }
@@ -408,10 +478,10 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
             break;
 
         case TCP_STATE_FIN_WAIT_1:
-            if ((flags & TCP_FLAG_ACK) != 0) {
+            if ((flags & TCP_FLAG_ACK) != 0 && ack == conn->seq_num) {
                 conn->state = TCP_STATE_FIN_WAIT_2;
             }
-            if ((flags & TCP_FLAG_FIN) != 0) {
+            if ((flags & TCP_FLAG_FIN) != 0 && seq == conn->ack_num) {
                 conn->ack_num = seq + 1;
                 tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
                                  conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
@@ -422,7 +492,7 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
             break;
 
         case TCP_STATE_FIN_WAIT_2:
-            if ((flags & TCP_FLAG_FIN) != 0) {
+            if ((flags & TCP_FLAG_FIN) != 0 && seq == conn->ack_num) {
                 conn->ack_num = seq + 1;
                 tcp_send_segment(conn->remote_ip, conn->local_port, conn->remote_port,
                                  conn->seq_num, conn->ack_num, TCP_FLAG_ACK, NULL, 0);
@@ -436,7 +506,7 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
             break;
 
         case TCP_STATE_LAST_ACK:
-            if ((flags & TCP_FLAG_ACK) != 0) {
+            if ((flags & TCP_FLAG_ACK) != 0 && ack == conn->seq_num) {
                 memset(conn, 0, sizeof(*conn));
                 log_write("tcp: connection closed");
             }

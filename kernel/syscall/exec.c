@@ -2,6 +2,7 @@
 #include "exec.h"
 #include "file.h"
 #include "hash.h"
+#include "rsa.h"
 #include "memory.h"
 #include "mmu.h"
 #include "path.h"
@@ -24,13 +25,70 @@
 #define RZS_MAGIC_3 '1'
 #define RZS_VERSION 1U
 #define RZS_SIGNATURE_SIZE 64U
+#define RZS_SIGNED_MANIFEST_SIZE (4U + 2U + 2U + 4U + 4U + 4U + HASH_SHA256_DIGEST_SIZE)
 
-#define EXEC_LOAD_BASE   0x04000000ULL
-#define EXEC_LOAD_LIMIT  0x04400000ULL
-#define EXEC_IMAGE_LIMIT 0x043C0000ULL
-#define EXEC_USER_DATA_BASE 0x043C0000ULL
-#define EXEC_USER_DATA_LIMIT 0x043F0000ULL
-#define EXEC_USER_STACK_TOP 0x04400000ULL
+static const uint8_t g_rzs_public_modulus[RSA_MAX_MODULUS_BYTES] = {
+    0x8C, 0x39, 0xED, 0x88, 0x71, 0xA8, 0xED, 0xF7,
+    0x3B, 0xFB, 0x66, 0x36, 0x1D, 0xFF, 0x1A, 0x10,
+    0x8E, 0x9F, 0x46, 0x72, 0xD8, 0xA2, 0xA6, 0x71,
+    0xA5, 0x30, 0x25, 0x86, 0x39, 0x5F, 0xE8, 0x80,
+    0x12, 0x3B, 0x86, 0x5F, 0xC6, 0x04, 0x95, 0xAB,
+    0x45, 0x90, 0xF3, 0xFA, 0x5A, 0x92, 0x00, 0x68,
+    0x97, 0x9F, 0x1C, 0xC5, 0x1F, 0xDF, 0x49, 0xD9,
+    0x71, 0x5F, 0x70, 0x4B, 0xA6, 0x52, 0x4D, 0xDD
+};
+
+static const uint8_t g_rzs_public_exponent[] = { 0x01, 0x00, 0x01 };
+
+static void exec_write_u16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t) (value & 0xFF);
+    dst[1] = (uint8_t) ((value >> 8) & 0xFF);
+}
+
+static void exec_write_u32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t) (value & 0xFF);
+    dst[1] = (uint8_t) ((value >> 8) & 0xFF);
+    dst[2] = (uint8_t) ((value >> 16) & 0xFF);
+    dst[3] = (uint8_t) ((value >> 24) & 0xFF);
+}
+
+static void exec_build_rzs_manifest(const uint8_t magic[4],
+                                    uint16_t version,
+                                    uint16_t header_size,
+                                    uint32_t image_size,
+                                    uint32_t image_flags,
+                                    uint32_t signature_size,
+                                    const uint8_t image_hash[HASH_SHA256_DIGEST_SIZE],
+                                    uint8_t manifest[RZS_SIGNED_MANIFEST_SIZE])
+{
+    uint32_t offset = 0;
+
+    memcpy(manifest + offset, magic, 4);
+    offset += 4;
+    exec_write_u16(manifest + offset, version);
+    offset += 2;
+    exec_write_u16(manifest + offset, header_size);
+    offset += 2;
+    exec_write_u32(manifest + offset, image_size);
+    offset += 4;
+    exec_write_u32(manifest + offset, image_flags);
+    offset += 4;
+    exec_write_u32(manifest + offset, signature_size);
+    offset += 4;
+    memcpy(manifest + offset, image_hash, HASH_SHA256_DIGEST_SIZE);
+}
+
+static bool exec_rzs_signature_zero(const uint8_t signature[RZS_SIGNATURE_SIZE])
+{
+    for (uint32_t i = 0; i < RZS_SIGNATURE_SIZE; i++) {
+        if (signature[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 typedef struct {
     uint8_t e_ident[16];
@@ -76,21 +134,25 @@ typedef int32_t (*exec_entry_t)(const exec_launch_info_t *info);
 typedef struct {
     const exec_launch_info_t *launch_info;
     int32_t exit_code;
+    uint8_t fault_vector;
+    uint64_t fault_error_code;
     bool completed;
+    bool faulted;
     uint8_t *kernel_stack;
     uint64_t resume_rsp;
 } exec_runtime_context_t;
 
 static exec_runtime_context_t *g_exec_context;
-static const uint8_t g_rzs_signature_key[] = {
-    'M','O','N','I','O','S','-','R','Z','S','-','D','E','V','-','K','E','Y'
-};
 
 extern void exec_enter_user_mode(uint64_t entry,
                                  uint64_t user_stack_top,
                                  uint64_t launch_info_ptr,
                                  uint64_t kernel_resume_stack_top,
                                  uint64_t resume_rsp_slot_ptr);
+extern void exec_enter_kernel_mode(uint64_t entry,
+                                   uint64_t launch_info_ptr,
+                                   uint64_t kernel_stack_top,
+                                   uint64_t resume_rsp_slot_ptr);
 
 static bool exec_range_valid(uint64_t start, uint64_t size)
 {
@@ -233,28 +295,14 @@ static bool exec_path_basename_equals(const char *path, const char *name)
     return strcasecmp(base, name) == 0;
 }
 
-static void exec_compute_rzs_signature(const uint8_t digest[HASH_SHA256_DIGEST_SIZE], uint8_t signature[RZS_SIGNATURE_SIZE])
-{
-    sha256_ctx_t ctx;
-
-    sha256_init(&ctx);
-    sha256_update(&ctx, g_rzs_signature_key, sizeof(g_rzs_signature_key));
-    sha256_update(&ctx, digest, HASH_SHA256_DIGEST_SIZE);
-    sha256_update(&ctx, g_rzs_signature_key, sizeof(g_rzs_signature_key));
-    sha256_final(&ctx, signature);
-
-    sha256_init(&ctx);
-    sha256_update(&ctx, digest, HASH_SHA256_DIGEST_SIZE);
-    sha256_update(&ctx, g_rzs_signature_key, sizeof(g_rzs_signature_key));
-    sha256_update(&ctx, signature, HASH_SHA256_DIGEST_SIZE);
-    sha256_final(&ctx, signature + HASH_SHA256_DIGEST_SIZE);
-}
-
 static bool exec_verify_rzs_header(const uint8_t *image, uint32_t image_size, const uint8_t **elf_image, uint32_t *elf_size, uint32_t *image_flags)
 {
     const rzs_header_t *header;
     uint8_t digest[HASH_SHA256_DIGEST_SIZE];
-    uint8_t expected_signature[RZS_SIGNATURE_SIZE];
+    uint8_t manifest[RZS_SIGNED_MANIFEST_SIZE];
+    uint8_t manifest_digest[HASH_SHA256_DIGEST_SIZE];
+    rsa_pubkey_t rzs_pubkey;
+    bool signature_valid = false;
 
     if (image == NULL || elf_image == NULL || elf_size == NULL || image_flags == NULL) {
         return false;
@@ -272,24 +320,54 @@ static bool exec_verify_rzs_header(const uint8_t *image, uint32_t image_size, co
     if (header->version != RZS_VERSION || header->header_size < sizeof(rzs_header_t)) {
         return false;
     }
-    if (header->signature_size != RZS_SIGNATURE_SIZE) {
+    if (header->header_size > image_size ||
+        header->image_size == 0 ||
+        header->image_size > image_size - header->header_size ||
+        header->signature_size != RZS_SIGNATURE_SIZE) {
         return false;
     }
-    if ((uint32_t) header->header_size + header->image_size > image_size) {
-        return false;
-    }
-
     *elf_image = image + header->header_size;
     *elf_size = header->image_size;
     hash_sha256(*elf_image, *elf_size, digest);
     if (memcmp(digest, header->image_sha256, sizeof(digest)) != 0) {
         return false;
     }
-    exec_compute_rzs_signature(digest, expected_signature);
-    if (memcmp(expected_signature, header->signature, sizeof(expected_signature)) != 0) {
+    exec_build_rzs_manifest(header->magic,
+                            header->version,
+                            header->header_size,
+                            header->image_size,
+                            header->image_flags,
+                            header->signature_size,
+                            digest,
+                            manifest);
+    hash_sha256(manifest, sizeof(manifest), manifest_digest);
+    if (!exec_rzs_signature_zero(header->signature)) {
+        if (rsa_pubkey_init(&rzs_pubkey,
+                            g_rzs_public_modulus, sizeof(g_rzs_public_modulus),
+                            g_rzs_public_exponent, sizeof(g_rzs_public_exponent)) != 0) {
+            return false;
+        }
+        signature_valid = rsa_verify_pkcs1_v15(&rzs_pubkey,
+                                               header->signature,
+                                               RZS_SIGNATURE_SIZE,
+                                               manifest_digest,
+                                               sizeof(manifest_digest),
+                                               RSA_HASH_SHA256) == 0;
+        if (!signature_valid) {
+            return false;
+        }
+    } else if ((header->image_flags & EXEC_IMAGE_FLAG_NEEDS_R0) != 0) {
         return false;
     }
-    *image_flags = header->image_flags | EXEC_IMAGE_FLAG_SIGNED;
+    *image_flags = header->image_flags &
+                   (EXEC_IMAGE_FLAG_CONSOLE |
+                    EXEC_IMAGE_FLAG_GUI |
+                    EXEC_IMAGE_FLAG_DRIVER |
+                    EXEC_IMAGE_FLAG_NEEDS_R2 |
+                    EXEC_IMAGE_FLAG_NEEDS_R0);
+    if (signature_valid) {
+        *image_flags |= EXEC_IMAGE_FLAG_SIGNED;
+    }
     return true;
 }
 
@@ -405,7 +483,7 @@ uint32_t exec_image_flags_for_path(const char *path)
     }
     if (path_resolve(exec_current_cwd(), path, resolved_path, sizeof(resolved_path))) {
         if (exec_path_has_suffix(resolved_path, ".rzs")) {
-            return EXEC_IMAGE_FLAG_DRIVER | EXEC_IMAGE_FLAG_SIGNED | EXEC_IMAGE_FLAG_NEEDS_R2;
+            return EXEC_IMAGE_FLAG_DRIVER | EXEC_IMAGE_FLAG_NEEDS_R2;
         }
         if (exec_path_basename_equals(resolved_path, "player.elf") ||
             exec_path_basename_equals(resolved_path, "notepad.elf") ||
@@ -431,6 +509,35 @@ bool exec_active(void)
     return g_exec_context != NULL;
 }
 
+bool exec_address_in_active_image(uint64_t address)
+{
+    return g_exec_context != NULL && address >= EXEC_LOAD_BASE && address < EXEC_LOAD_LIMIT;
+}
+
+bool exec_user_range_valid(const void *ptr, uint64_t size)
+{
+    uint64_t start = (uint64_t) ptr;
+    uint64_t end;
+
+    if (size == 0) {
+        return true;
+    }
+    if (ptr == NULL) {
+        return false;
+    }
+    if (g_exec_context == NULL) {
+        return true;
+    }
+    if (start < EXEC_USER_ADDRESS_MIN || start >= EXEC_USER_ADDRESS_MAX) {
+        return false;
+    }
+    end = start + size;
+    if (end < start || end > EXEC_USER_ADDRESS_MAX) {
+        return false;
+    }
+    return true;
+}
+
 const exec_launch_info_t *exec_current_launch_info(void)
 {
     if (g_exec_context == NULL) {
@@ -445,6 +552,7 @@ void exec_complete_from_syscall(int32_t exit_code)
         return;
     }
     g_exec_context->completed = true;
+    g_exec_context->faulted = false;
     g_exec_context->exit_code = exit_code;
 }
 
@@ -461,6 +569,9 @@ void exec_abort_from_exception(uint8_t vector, uint64_t error_code)
         exit_code -= (int32_t) (error_code & 0xFF);
     }
     g_exec_context->completed = true;
+    g_exec_context->faulted = true;
+    g_exec_context->fault_vector = vector;
+    g_exec_context->fault_error_code = error_code;
     g_exec_context->exit_code = exit_code;
 }
 
@@ -470,6 +581,7 @@ void exec_shutdown_active(void)
         return;
     }
     g_exec_context->completed = true;
+    g_exec_context->faulted = false;
     g_exec_context->exit_code = -1;
 }
 
@@ -478,7 +590,7 @@ uint64_t exec_kernel_stack_top(void)
     if (g_exec_context == NULL || g_exec_context->kernel_stack == NULL) {
         return 0;
     }
-    return (uint64_t) (g_exec_context->kernel_stack + 8192);
+    return (uint64_t) (g_exec_context->kernel_stack + EXEC_KERNEL_STACK_SIZE);
 }
 
 uint64_t exec_user_stack_top(void)
@@ -519,7 +631,8 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
     exec_entry_t entry;
     uint8_t *kernel_stack = NULL;
     int32_t pid = -1;
-    uint32_t privilege_level = (run_flags & EXEC_RUN_FLAG_ELEVATED) != 0 ? EXEC_PRIV_R2 : EXEC_PRIV_R3;
+    uint32_t privilege_level;
+    bool run_as_r0_driver = false;
 
     if (g_exec_context != NULL) {
         return false;
@@ -547,17 +660,23 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
         kfree(image);
         return false;
     }
+    if ((run_flags & EXEC_RUN_FLAG_CONSOLE_WINDOW) != 0) {
+        image_flags |= EXEC_IMAGE_FLAG_CONSOLE;
+    }
+    run_as_r0_driver = (image_flags & EXEC_IMAGE_FLAG_DRIVER) != 0 &&
+                       (image_flags & EXEC_IMAGE_FLAG_SIGNED) != 0 &&
+                       (image_flags & EXEC_IMAGE_FLAG_NEEDS_R0) != 0 &&
+                       (run_flags & EXEC_RUN_FLAG_TRUSTED_R0) != 0;
+    privilege_level = run_as_r0_driver ? EXEC_PRIV_R0 :
+                      ((run_flags & EXEC_RUN_FLAG_ELEVATED) != 0 ? EXEC_PRIV_R2 : EXEC_PRIV_R3);
     if ((image_flags & EXEC_IMAGE_FLAG_NEEDS_R0) != 0 &&
-        (((image_flags & EXEC_IMAGE_FLAG_DRIVER) == 0) || privilege_level > EXEC_PRIV_R2)) {
+        (((image_flags & EXEC_IMAGE_FLAG_DRIVER) == 0) || privilege_level != EXEC_PRIV_R0)) {
         kfree(image);
         return false;
     }
     if ((image_flags & EXEC_IMAGE_FLAG_NEEDS_R2) != 0 && privilege_level > EXEC_PRIV_R2) {
         kfree(image);
         return false;
-    }
-    if ((run_flags & EXEC_RUN_FLAG_CONSOLE_WINDOW) != 0) {
-        image_flags |= EXEC_IMAGE_FLAG_CONSOLE;
     }
 
     if (!path_resolve("/", cwd == NULL ? "/" : cwd, cwd_copy, sizeof(cwd_copy))) {
@@ -570,7 +689,7 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
         return false;
     }
 
-    kernel_stack = (uint8_t *) kmalloc(8192);
+    kernel_stack = (uint8_t *) kmalloc(EXEC_KERNEL_STACK_SIZE);
     if (kernel_stack == NULL) {
         kfree(image);
         return false;
@@ -579,18 +698,28 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
     pid = pcb_process_start(resolved_path);
     runtime_context.launch_info = user_launch_info;
     runtime_context.exit_code = -1;
+    runtime_context.fault_vector = 0;
+    runtime_context.fault_error_code = 0;
     runtime_context.completed = false;
+    runtime_context.faulted = false;
     runtime_context.kernel_stack = kernel_stack;
     runtime_context.resume_rsp = 0;
     g_exec_context = &runtime_context;
     tss_set_rsp0(exec_kernel_stack_top());
 
     entry = (exec_entry_t) (uint64_t) header->e_entry;
-    exec_enter_user_mode((uint64_t) entry,
-                         exec_user_stack_top(),
-                         (uint64_t) user_launch_info,
-                         exec_kernel_stack_top(),
-                         (uint64_t) &runtime_context.resume_rsp);
+    if (run_as_r0_driver) {
+        exec_enter_kernel_mode((uint64_t) entry,
+                               (uint64_t) user_launch_info,
+                               exec_kernel_stack_top(),
+                               (uint64_t) &runtime_context.resume_rsp);
+    } else {
+        exec_enter_user_mode((uint64_t) entry,
+                             exec_user_stack_top(),
+                             (uint64_t) user_launch_info,
+                             exec_kernel_stack_top(),
+                             (uint64_t) &runtime_context.resume_rsp);
+    }
 
     g_exec_context = NULL;
     if (exit_code != NULL) {
@@ -598,7 +727,14 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
     }
     if (pid >= 0) {
         if (runtime_context.completed) {
-            pcb_process_exit(pid, runtime_context.exit_code);
+            if (runtime_context.faulted) {
+                pcb_process_fault(pid,
+                                  runtime_context.fault_vector,
+                                  runtime_context.fault_error_code,
+                                  runtime_context.exit_code);
+            } else {
+                pcb_process_exit(pid, runtime_context.exit_code);
+            }
         } else {
             pcb_process_abort(pid, runtime_context.exit_code);
         }

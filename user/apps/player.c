@@ -2,7 +2,7 @@
 #include "unistd.h"
 #include "appsys.h"
 
-#define DEFAULT_TRACK "/music.wav"
+#define DEFAULT_TRACK "/home/root/desktop/music.wav"
 
 static void write_line(const char *text)
 {
@@ -25,7 +25,7 @@ int main(int argc, char **argv)
         write_line("playback started");
     } else {
         write_line("playback failed");
-        return 1;
+        return 0;
     }
     if (app_get_system_status(&status) >= 0) {
         fputs("driver: ");

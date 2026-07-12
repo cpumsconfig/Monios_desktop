@@ -47,6 +47,14 @@ int main(int argc, char **argv)
     if (app_get_system_status(&status) >= 0) {
         fputs("tasks: ");
         write_u32_line(status.task_count);
+        fputs("processes: ");
+        write_u32_line(status.process_count);
+        fputs("current pid: ");
+        if (status.current_pid < 0) {
+            write_line("none");
+        } else {
+            write_u32_line((uint32_t) status.current_pid);
+        }
         fputs("net: ");
         write_line(status.net_status);
         fputs("mac: ");

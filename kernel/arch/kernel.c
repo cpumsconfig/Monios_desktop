@@ -28,6 +28,7 @@
 #include "md.h"
 #include "input.h"
 #include "interrupt.h"
+#include "installer.h"
 #include "ipc.h"
 #include "ipv6.h"
 #include "kernel.h"
@@ -83,6 +84,7 @@ static keyboard_status_t g_keyboard_status;
 static uint8_t g_last_mouse_buttons;
 static bool g_shutdown_requested;
 static bool g_reboot_requested;
+static bool g_installer_boot_media;
 
 static void u32_to_2dec(char *dst, uint32_t value)
 {
@@ -379,6 +381,10 @@ static void task_poll_keyboard_events(void *arg)
     key_event_t event;
     (void) arg;
 
+    if (exec_active()) {
+        return;
+    }
+
     while (keyboard_poll_event(&event)) {
         kernel_handle_key_event(&event);
     }
@@ -398,9 +404,45 @@ static void task_handle_graphics_request(void *arg)
     }
 }
 
+static void kernel_write_file_if_missing(const char *path, const char *text)
+{
+    if (path == NULL || text == NULL || file_exists(path)) {
+        return;
+    }
+    file_write(path, text, (uint32_t) strlen(text));
+}
+
+static void kernel_delete_file_if_present(const char *path)
+{
+    if (path != NULL && file_exists(path) && !file_is_dir(path)) {
+        file_delete(path);
+    }
+}
+
 static void ensure_desktop_layout(void)
 {
     session_init();
+    if (!file_exists("/home/root/desktop")) {
+        file_mkdir("/home/root/desktop");
+    }
+    kernel_delete_file_if_present("/home/root/desktop/player.elf");
+    kernel_delete_file_if_present("/home/root/desktop/notepad.elf");
+    kernel_delete_file_if_present("/home/root/desktop/taskmgr.elf");
+    kernel_delete_file_if_present("/home/root/desktop/square.elf");
+    kernel_delete_file_if_present("/home/root/desktop/cube3d.elf");
+    kernel_delete_file_if_present("/home/root/desktop/setup.elf");
+    kernel_delete_file_if_present("/home/root/desktop/appdev.elf");
+    kernel_write_file_if_missing("/home/root/desktop/files.lnk", "/apps/explorar.exe\n");
+    kernel_write_file_if_missing("/home/root/desktop/apps.lnk", "/apps\n");
+    kernel_write_file_if_missing("/home/root/desktop/player.lnk", "/apps/player.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/notes.lnk", "/apps/notepad.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/taskmgr.lnk", "/apps/taskmgr.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/square.lnk", "/apps/square.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/cube3d.lnk", "/apps/cube3d.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/setup.lnk", "/apps/setup.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/dev.lnk", "/apps/appdev.elf\n");
+    kernel_write_file_if_missing("/home/root/desktop/dll.lnk", "/apps/moniapi.dll\n");
+    kernel_write_file_if_missing("/home/root/desktop/blank.txt", "");
 }
 
 static void task_poll_graphics_input(void *arg)
@@ -455,8 +497,30 @@ void kernel_run_periodic_work(void)
     running = false;
 }
 
-void kernel_main(void)
+void kernel_run_exec_periodic_work(void)
 {
+    static bool running;
+
+    if (running) {
+        return;
+    }
+    running = true;
+    audio_update();
+    net_update();
+    lwip_update();
+    hid_update();
+    futex_update();
+    task_poll_keyboard_events(NULL);
+    task_poll_graphics_input(NULL);
+    task_update_desktop_shell(NULL);
+    task_handle_graphics_request(NULL);
+    running = false;
+}
+
+void kernel_main(uint64_t boot_mode)
+{
+    bool boot_is_uefi = (boot_mode & 1ULL) != 0;
+
     asm volatile ("cli");
     serial_init();
     serial_write("KERNEL BOOT\r\n");
@@ -584,6 +648,8 @@ void kernel_main(void)
     } else {
         log_write("boot: filesystem mount failed");
     }
+    g_installer_boot_media = (file_exists("/INSTALL.FLG") && file_exists("/SETUP.ELF")) ||
+                             installer_boot_media_present();
     /* Filesystem auto-mounted during boot. */
     log_write("boot: init registry");
     registry_init();
@@ -618,11 +684,13 @@ void kernel_main(void)
     init_input();
     hid_init();
 
-     log_write("boot: enter graphics");
-     /* Defer entering graphics mode until MMU/kernel page-tables are active.
-         Set request flag; task_handle_graphics_request will call graphics_enter_mode()
-         when appropriate. This prevents framebuffer/MMIO accesses before CR3 active. */
-     g_graphics_mode_requested = true;
+    if (!g_installer_boot_media) {
+        log_write("boot: graphics animation pending");
+        g_graphics_mode_requested = false;
+    } else {
+        log_write("boot: installer media detected");
+        g_graphics_mode_requested = false;
+    }
     log_write("boot: create tasks");
     task_create("keypoll", task_poll_keyboard_events, NULL, 1, true);
     task_create("guipoll", task_poll_graphics_input, NULL, 1, true);
@@ -631,9 +699,25 @@ void kernel_main(void)
     task_create("grreq", task_handle_graphics_request, NULL, 1, true);
     log_write("boot: init shell");
     shell_init();
+    shell_env_set("MONIOS_BOOT_MODE", boot_is_uefi ? "uefi" : "mbr");
+
+    if (!g_installer_boot_media) {
+        log_write("boot: enter graphics");
+        graphics_set_boot_animation_mode(true);
+        graphics_enter_mode();
+        graphics_boot_animation();
+        graphics_set_boot_animation_mode(false);
+        graphics_draw_shell();
+    }
 
     log_write("boot: enable interrupts");
     asm volatile ("sti");
+    if (g_installer_boot_media && file_exists("/SETUP.ELF")) {
+        log_write("boot: launch setup");
+        graphics_set_installer_mode(true);
+        graphics_enter_mode();
+        shell_exec_path_admin("/SETUP.ELF");
+    }
     log_write("boot: main loop");
     while (1) {
         /* 调试：主循环心跳 */

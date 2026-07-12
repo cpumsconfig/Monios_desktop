@@ -1,4 +1,4 @@
-MoniOS v0.0.2
-Build: 20260625
+MoniOS v0.0.3
+Build: 20260712
 Kernel: x86_64
 Status: Beta

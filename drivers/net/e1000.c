@@ -35,6 +35,7 @@
 #define E1000_STATUS_LU               0x00000002
 #define E1000_CTRL_SLU                0x00000040
 #define E1000_CTRL_ASDE               0x00000020
+#define E1000_RAH_AV                  0x80000000
 #define E1000_RCTL_EN                 0x00000002
 #define E1000_RCTL_SBP                0x00000004
 #define E1000_RCTL_UPE                0x00000008
@@ -187,6 +188,42 @@ static void e1000_write32(uint32_t reg, uint32_t value)
     *ptr = value;
 }
 
+static bool e1000_read_receive_address(uint8_t mac[6])
+{
+    uint32_t ral = e1000_read32(E1000_REG_RAL0);
+    uint32_t rah = e1000_read32(E1000_REG_RAH0);
+
+    if (mac == NULL || (ral == 0 && (rah & 0xFFFFu) == 0)) {
+        return false;
+    }
+    mac[0] = (uint8_t) (ral & 0xFF);
+    mac[1] = (uint8_t) ((ral >> 8) & 0xFF);
+    mac[2] = (uint8_t) ((ral >> 16) & 0xFF);
+    mac[3] = (uint8_t) ((ral >> 24) & 0xFF);
+    mac[4] = (uint8_t) (rah & 0xFF);
+    mac[5] = (uint8_t) ((rah >> 8) & 0xFF);
+    return true;
+}
+
+static void e1000_write_receive_address(const uint8_t mac[6])
+{
+    uint32_t ral;
+    uint32_t rah;
+
+    if (mac == NULL) {
+        return;
+    }
+    ral = ((uint32_t) mac[0]) |
+          ((uint32_t) mac[1] << 8) |
+          ((uint32_t) mac[2] << 16) |
+          ((uint32_t) mac[3] << 24);
+    rah = ((uint32_t) mac[4]) |
+          ((uint32_t) mac[5] << 8) |
+          E1000_RAH_AV;
+    e1000_write32(E1000_REG_RAL0, ral);
+    e1000_write32(E1000_REG_RAH0, rah);
+}
+
 static void e1000_enable_pci(const pci_device_info_t *info)
 {
     uint16_t command = pci_config_read16(info->bus, info->slot, info->func, PCI_COMMAND_OFFSET);
@@ -253,8 +290,6 @@ static bool e1000_init_rings(void)
 
 bool e1000_init(const pci_device_info_t *info, net_info_t *net, uint8_t mac[6])
 {
-    uint32_t ral = 0;
-    uint32_t rah = 0;
     uint8_t fallback_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
 
     if (!e1000_supported(info) || net == NULL || mac == NULL) {
@@ -274,16 +309,8 @@ bool e1000_init(const pci_device_info_t *info, net_info_t *net, uint8_t mac[6])
     }
 
     net->connected = (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) != 0;
-    ral = e1000_read32(E1000_REG_RAL0);
-    rah = e1000_read32(E1000_REG_RAH0);
-    if (ral != 0 || rah != 0) {
-        mac[0] = (uint8_t) (ral & 0xFF);
-        mac[1] = (uint8_t) ((ral >> 8) & 0xFF);
-        mac[2] = (uint8_t) ((ral >> 16) & 0xFF);
-        mac[3] = (uint8_t) ((ral >> 24) & 0xFF);
-        mac[4] = (uint8_t) (rah & 0xFF);
-        mac[5] = (uint8_t) ((rah >> 8) & 0xFF);
-    }
+    e1000_read_receive_address(mac);
+    e1000_write_receive_address(mac);
     g_ready = e1000_init_rings();
     if (!g_ready) {
         log_write("e1000: init rings failed");
@@ -387,7 +414,7 @@ void e1000_poll(void (*handler)(const uint8_t *packet, uint16_t length))
         if (length >= 14) {
             uint16_t ether_type = (uint16_t) ((packet[12] << 8) | packet[13]);
             char line[128];
-            char tmp[4];
+            char tmp[16];
             strcpy(line, "e1000: rx eth=0x");
             e1000_append_hex32(tmp, ether_type);
             strcat(line, tmp + 4); /* use last 4 hex chars */

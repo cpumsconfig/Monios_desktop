@@ -25,6 +25,7 @@ typedef struct {
     char ip_text[16];
     char gateway_text[16];
     char dns_text[16];
+    char netmask_text[16];
     char last_target[64];
 } net_info_t;
 
@@ -32,6 +33,9 @@ void net_init(void);
 void net_update(void);
 bool net_ping(const char *target);
 bool net_dhcp_request(void);
+bool net_configure_static(const char *ip, const char *mask, const char *gateway, const char *dns);
+uint32_t net_arp_table(char *buffer, uint32_t buffer_size);
+void net_route_summary(char *buffer, uint32_t buffer_size);
 const uint8_t *net_local_ip(void);
 bool net_get_dns_ip(uint8_t out[4]);
 bool net_resolve_ipv4(const char *target, uint8_t out[4]);

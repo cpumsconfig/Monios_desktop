@@ -24,12 +24,15 @@ typedef struct {
     uint64_t start_tick;
     uint64_t end_tick;
     uint32_t pending_signals;
+    uint8_t fault_vector;
+    uint64_t fault_error_code;
 } pcb_t;
 
 void pcb_init(void);
 int32_t pcb_process_start(const char *path);
 void pcb_process_exit(int32_t pid, int32_t exit_code);
 void pcb_process_abort(int32_t pid, int32_t exit_code);
+void pcb_process_fault(int32_t pid, uint8_t vector, uint64_t error_code, int32_t exit_code);
 void pcb_process_stop(int32_t pid);
 int32_t pcb_current_pid(void);
 uint32_t pcb_count(void);

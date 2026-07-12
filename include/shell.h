@@ -18,6 +18,9 @@ void shell_resume_text_mode(void);
 shell_privilege_t shell_privilege(void);
 const char *shell_current_cwd(void);
 bool shell_exec_path(const char *path);
+bool shell_exec_path_with_arg(const char *path, const char *arg);
+bool shell_exec_path_admin(const char *path);
+bool shell_defer_exec_path(const char *path);
 bool shell_output_capture_active(void);
 void shell_output_capture_write(const char *buffer, uint32_t size);
 

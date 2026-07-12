@@ -57,7 +57,7 @@ page_t *page_alloc(uint32_t order)
     uint32_t page_count;
     page_t *page;
 
-    if (!g_page_info.ready || order > 10) {
+    if (!g_page_info.ready || !buddy_info()->ready || frame_info()->total_frames == 0 || order > 10) {
         strcpy(g_page_status, "page: bad order");
         return NULL;
     }
@@ -176,7 +176,13 @@ page_t *page_from_virt(uint64_t virt)
 {
     /* 简化实现，假设虚拟地址和物理地址有固定偏移 */
     uint64_t phys = virt; /* 暂时假设恒等映射 */
-    return page_from_phys(phys);
+    if (!g_page_info.ready || virt < g_page_info.base_phys) {
+        return NULL;
+    }
+    if (((virt - g_page_info.base_phys) >> PAGE_SHIFT) >= g_page_info.total_pages) {
+        return NULL;
+    }
+    return page_from_phys(virt & PAGE_MASK);
 }
 
 uint64_t page_to_phys(page_t *page)

@@ -12,6 +12,7 @@ typedef struct {
     uint32_t size;
     uint32_t compressed_size;
     uint32_t class_idx;
+    zs_pool_t *pool;
     bool compressed;
     uint8_t data[];
 } zs_object_t;
@@ -125,6 +126,10 @@ void *zs_malloc(zs_pool_t *pool, uint32_t size)
         strcpy(g_zs_status, "zs: invalid params");
         return NULL;
     }
+    if (size > 0xFFFFFFFFu - sizeof(zs_object_t)) {
+        strcpy(g_zs_status, "zs: size overflow");
+        return NULL;
+    }
 
     class_idx = zs_find_size_class(pool, size);
     if (class_idx < 0) {
@@ -146,6 +151,7 @@ void *zs_malloc(zs_pool_t *pool, uint32_t size)
     obj->size = size;
     obj->compressed_size = alloc_size;
     obj->class_idx = (uint32_t) class_idx;
+    obj->pool = pool;
     obj->compressed = false;
 
     pool->total_size += alloc_size;
@@ -174,6 +180,13 @@ void zs_free(zs_pool_t *pool, void *ptr)
         strcpy(g_zs_status, "zs: invalid magic");
         return;
     }
+    if (obj->pool != pool ||
+        obj->class_idx >= pool->class_count ||
+        obj->compressed_size != pool->size_classes[obj->class_idx] ||
+        obj->size > obj->compressed_size) {
+        strcpy(g_zs_status, "zs: invalid object");
+        return;
+    }
 
     pool->total_size -= obj->compressed_size;
     pool->used_size -= obj->size;
@@ -184,6 +197,9 @@ void zs_free(zs_pool_t *pool, void *ptr)
     g_zs_info.total_compressed -= obj->compressed_size;
     g_zs_info.total_objects--;
 
+    memset(obj->data, 0, obj->compressed_size);
+    obj->magic = 0;
+    obj->pool = NULL;
     kfree(obj);
 
     strcpy(g_zs_status, "zs: freed");
@@ -207,7 +223,9 @@ void *zs_realloc(zs_pool_t *pool, void *ptr, uint32_t new_size)
     }
 
     old_obj = (zs_object_t *) ((uint8_t *) ptr - sizeof(zs_object_t));
-    if (old_obj->magic != ZS_OBJ_MAGIC) {
+    if (old_obj->magic != ZS_OBJ_MAGIC || old_obj->pool != pool ||
+        old_obj->class_idx >= pool->class_count ||
+        old_obj->compressed_size != pool->size_classes[old_obj->class_idx]) {
         return NULL;
     }
 
@@ -243,11 +261,14 @@ uint32_t zs_malloc_usable_size(void *ptr)
     }
 
     obj = (zs_object_t *) ((uint8_t *) ptr - sizeof(zs_object_t));
-    if (obj->magic != ZS_OBJ_MAGIC) {
+    if (obj->magic != ZS_OBJ_MAGIC || obj->pool == NULL ||
+        obj->class_idx >= obj->pool->class_count ||
+        obj->compressed_size != obj->pool->size_classes[obj->class_idx] ||
+        obj->size > obj->compressed_size) {
         return 0;
     }
 
-    return obj->compressed_size;
+    return obj->size;
 }
 
 uint64_t zs_pool_total_size(zs_pool_t *pool)

@@ -102,6 +102,8 @@ typedef struct {
     /* Keys */
     uint8_t master_secret[48];
     bool master_secret_ready;
+    bool client_cipher_active;
+    bool server_cipher_active;
 
     uint8_t client_write_key[32];
     uint8_t server_write_key[32];
@@ -193,7 +195,7 @@ int32_t tls_encrypt_record(tls_ctx_t *ctx, uint8_t type,
 int32_t tls_derive_keys(tls_ctx_t *ctx, const uint8_t *pre_master_secret, uint32_t pms_len);
 int32_t tls_prf(const uint8_t *secret, uint32_t secret_len,
                 const char *label, const uint8_t *seed, uint32_t seed_len,
-                uint8_t *output, uint32_t output_len);
+                uint8_t *output, uint32_t output_len, bool use_sha256);
 
 /* Certificate verification */
 int32_t tls_verify_certificate(tls_ctx_t *ctx, const x509_trust_store_t *trust_store);

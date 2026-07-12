@@ -11,6 +11,7 @@ typedef struct {
     bool win_down;
     bool caps_lock_on;
     bool num_lock_on;
+    bool scroll_lock_on;
     bool insert_mode;
     uint8_t last_function;
 } keyboard_status_t;

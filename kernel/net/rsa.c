@@ -142,6 +142,51 @@ void bignum_sub(bignum_t *result, const bignum_t *a, const bignum_t *b)
     }
 }
 
+static uint32_t bignum_bit_length(const bignum_t *a)
+{
+    uint32_t top;
+    uint32_t bits;
+
+    if (a == NULL || a->length == 0) {
+        return 0;
+    }
+    top = a->words[a->length - 1];
+    bits = (a->length - 1) * 32;
+    while (top != 0) {
+        bits++;
+        top >>= 1;
+    }
+    return bits == 0 ? 1 : bits;
+}
+
+static bool bignum_get_bit(const bignum_t *a, uint32_t bit)
+{
+    uint32_t word = bit / 32;
+    uint32_t shift = bit % 32;
+
+    if (a == NULL || word >= a->length) {
+        return false;
+    }
+    return ((a->words[word] >> shift) & 1u) != 0;
+}
+
+static void bignum_shl1(bignum_t *a)
+{
+    uint32_t carry = 0;
+
+    if (a == NULL || a->length == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < a->length; i++) {
+        uint32_t next = a->words[i] >> 31;
+        a->words[i] = (a->words[i] << 1) | carry;
+        carry = next;
+    }
+    if (carry != 0 && a->length < RSA_MAX_MODULUS_WORDS * 2) {
+        a->words[a->length++] = carry;
+    }
+}
+
 void bignum_mul(bignum_t *result, const bignum_t *a, const bignum_t *b)
 {
     uint32_t i, j;
@@ -174,17 +219,25 @@ void bignum_mul(bignum_t *result, const bignum_t *a, const bignum_t *b)
 void bignum_mod(bignum_t *result, const bignum_t *a, const bignum_t *m)
 {
     bignum_t temp;
-    uint32_t i;
+    uint32_t bits;
 
-    /* Simple subtraction-based mod (slow but works for our purposes) */
     bignum_init(result);
-    memcpy(result->words, a->words, a->length * 4);
-    result->length = a->length;
+    if (a == NULL || m == NULL || (m->length == 1 && m->words[0] == 0)) {
+        return;
+    }
 
-    while (bignum_cmp(result, m) >= 0) {
-        bignum_sub(&temp, result, m);
-        memcpy(result->words, temp.words, temp.length * 4);
-        result->length = temp.length;
+    bits = bignum_bit_length(a);
+    for (uint32_t bit = bits; bit > 0; bit--) {
+        bignum_shl1(result);
+        if (bignum_get_bit(a, bit - 1)) {
+            result->words[0] |= 1u;
+        }
+        if (bignum_cmp(result, m) >= 0) {
+            bignum_sub(&temp, result, m);
+            memset(result->words, 0, sizeof(result->words));
+            memcpy(result->words, temp.words, temp.length * 4);
+            result->length = temp.length;
+        }
     }
 }
 

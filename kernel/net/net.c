@@ -1,5 +1,6 @@
 #include "common.h"
 #include "dns.h"
+#include "cpu.h"
 #include "e1000.h"
 #include "ip.h"
 #include "ipv4.h"
@@ -20,7 +21,6 @@
 #define NET_IP_PROTO_UDP           17
 #define NET_ICMP_ECHO_REPLY        0
 #define NET_ICMP_ECHO_REQUEST      8
-#define NET_ICMP_ID                0x4D4F
 #define NET_DHCP_CLIENT_PORT       68
 #define NET_DHCP_SERVER_PORT       67
 #define NET_DHCP_MAGIC_COOKIE      0x63825363U
@@ -32,18 +32,21 @@
 static net_info_t g_net_info;
 static char g_net_status[64];
 static uint8_t g_mac[6];
-static uint8_t g_local_ip[4] = { 192, 168, 58, 120 };
-static uint8_t g_gateway_ip[4] = { 192, 168, 58, 2 };
-static uint8_t g_host_ip[4] = { 192, 168, 58, 1 };
+static uint8_t g_local_ip[4] = { 172, 16, 58, 120 };
+static uint8_t g_gateway_ip[4] = { 172, 16, 58, 2 };
+static uint8_t g_host_ip[4] = { 172, 16, 58, 1 };
 static uint8_t g_netmask[4] = { 255, 255, 255, 0 };
-static uint8_t g_dns_ip[4] = { 0, 0, 0, 0 };
+static uint8_t g_dns_ip[4] = { 172, 16, 58, 2 };
 static uint16_t g_ping_seq;
+static uint16_t g_ping_ident;
 static bool g_ping_waiting;
 static uint8_t g_ping_target_ip[4];
 #define ARP_CACHE_SIZE 8
 static uint8_t g_arp_ip[ARP_CACHE_SIZE][4];
 static uint8_t g_arp_mac[ARP_CACHE_SIZE][6];
 static bool g_arp_valid[ARP_CACHE_SIZE];
+static uint8_t g_arp_pending_ip[4];
+static bool g_arp_pending;
 static uint32_t g_arp_next_slot;
 static bool g_net_backend_ready;
 static bool g_rx_started;
@@ -67,10 +70,126 @@ static void net_refresh_ip_texts(void)
     ip_to_text(g_local_ip, g_net_info.ip_text);
     ip_to_text(g_gateway_ip, g_net_info.gateway_text);
     ip_to_text(g_dns_ip, g_net_info.dns_text);
+    ip_to_text(g_netmask, g_net_info.netmask_text);
+}
+
+static bool net_ip_is_zero(const uint8_t ip[4])
+{
+    return ip == NULL || (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+}
+
+static void net_hex_byte(char *out, uint8_t value);
+
+static void net_log_ip_field(const char *prefix, const uint8_t ip[4])
+{
+    char line[80];
+    char ip_text[16];
+
+    if (prefix == NULL || ip == NULL) {
+        return;
+    }
+    strcpy(line, prefix);
+    ip_to_text(ip, ip_text);
+    strcpy(line + strlen(line), ip_text);
+    log_write(line);
+}
+
+static void net_append_text(char *buffer, uint32_t buffer_size, const char *text)
+{
+    uint32_t len;
+    uint32_t add;
+
+    if (buffer == NULL || buffer_size == 0 || text == NULL) {
+        return;
+    }
+    len = (uint32_t) strlen(buffer);
+    if (len >= buffer_size - 1) {
+        return;
+    }
+    add = (uint32_t) strlen(text);
+    if (add > buffer_size - len - 1) {
+        add = buffer_size - len - 1;
+    }
+    memcpy(buffer + len, text, add);
+    buffer[len + add] = '\0';
+}
+
+static void net_append_ip_line(char *buffer, uint32_t buffer_size, const char *prefix, const uint8_t ip[4])
+{
+    char text[16];
+
+    net_append_text(buffer, buffer_size, prefix);
+    ip_to_text(ip, text);
+    net_append_text(buffer, buffer_size, text);
+    net_append_text(buffer, buffer_size, "\n");
+}
+
+static void net_append_mac(char *buffer, uint32_t buffer_size, const uint8_t mac[6])
+{
+    char text[18];
+
+    for (uint32_t i = 0; i < 6; i++) {
+        net_hex_byte(&text[i * 3], mac[i]);
+        if (i < 5) {
+            text[i * 3 + 2] = ':';
+        }
+    }
+    text[17] = '\0';
+    net_append_text(buffer, buffer_size, text);
+}
+
+static void net_log_ipv4_config(const char *tag,
+                                const uint8_t ip[4],
+                                const uint8_t mask[4],
+                                const uint8_t gateway[4],
+                                const uint8_t dns[4],
+                                const uint8_t server[4])
+{
+    char prefix[64];
+
+    if (tag == NULL) {
+        return;
+    }
+    strcpy(prefix, tag);
+    strcpy(prefix + strlen(prefix), " ip ");
+    net_log_ip_field(prefix, ip);
+    strcpy(prefix, tag);
+    strcpy(prefix + strlen(prefix), " mask ");
+    net_log_ip_field(prefix, mask);
+    if (!net_ip_is_zero(gateway)) {
+        strcpy(prefix, tag);
+        strcpy(prefix + strlen(prefix), " gateway ");
+        net_log_ip_field(prefix, gateway);
+    }
+    if (!net_ip_is_zero(dns)) {
+        strcpy(prefix, tag);
+        strcpy(prefix + strlen(prefix), " dns ");
+        net_log_ip_field(prefix, dns);
+    }
+    if (!net_ip_is_zero(server)) {
+        strcpy(prefix, tag);
+        strcpy(prefix + strlen(prefix), " server ");
+        net_log_ip_field(prefix, server);
+    }
 }
 
 /* forward declarations */
+static void arp_cache_add(const uint8_t ip[4], const uint8_t mac[6]);
 static bool net_send_icmp_echo(const uint8_t dst_mac[6], const uint8_t dst_ip[4], uint16_t sequence);
+
+static bool net_mac_is_zero(const uint8_t mac[6])
+{
+    return mac == NULL ||
+           (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 &&
+            mac[3] == 0 && mac[4] == 0 && mac[5] == 0);
+}
+
+static bool net_mac_is_broadcast(const uint8_t mac[6])
+{
+    return mac != NULL &&
+           mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF &&
+           mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF;
+}
 
 static void net_hex_byte(char *out, uint8_t value)
 {
@@ -154,6 +273,8 @@ static bool net_send_arp_request(const uint8_t target_ip[4])
     static const uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
     memset(packet, 0, sizeof(packet));
+    memcpy(g_arp_pending_ip, target_ip, 4);
+    g_arp_pending = true;
     net_write_ether_header(packet, broadcast, NET_ETH_TYPE_ARP);
     ip_put16(packet + 14, 1);
     ip_put16(packet + 16, NET_ETH_TYPE_IPV4);
@@ -255,7 +376,20 @@ static bool net_send_udp_frame(const uint8_t dst_mac[6],
 
 static uint32_t net_make_dhcp_xid(void)
 {
-    return 0x4D4F0000u | ((uint32_t) g_mac[4] << 8) | g_mac[5];
+    uint64_t tsc = cpu_read_tsc();
+    uint32_t tick_mix = (uint32_t) timer_ticks() ^ (uint32_t) tsc ^ (uint32_t) (tsc >> 32);
+    uint32_t mac_mix = ((uint32_t) g_mac[0] << 24) ^
+                       ((uint32_t) g_mac[1] << 16) ^
+                       ((uint32_t) g_mac[2] << 8) ^
+                       g_mac[3] ^
+                       ((uint32_t) g_mac[4] << 11) ^
+                       ((uint32_t) g_mac[5] << 3);
+
+    tick_mix ^= tick_mix << 13;
+    tick_mix ^= tick_mix >> 17;
+    tick_mix ^= tick_mix << 5;
+    tick_mix ^= (uint32_t) g_ping_ident << 16;
+    return 0x4D4F0000u ^ mac_mix ^ tick_mix;
 }
 
 static uint32_t net_read32_be(const uint8_t *data)
@@ -380,7 +514,7 @@ static bool net_send_icmp_echo(const uint8_t dst_mac[6], const uint8_t dst_ip[4]
 
     icmp[0] = NET_ICMP_ECHO_REQUEST;
     icmp[1] = 0;
-    ip_put16(icmp + 4, NET_ICMP_ID);
+    ip_put16(icmp + 4, g_ping_ident);
     ip_put16(icmp + 6, sequence);
     memcpy(icmp + 8, "MONIOS-PING-VMWARE-E1000-ICMP-PAYLOAD", 32);
     ip_put16(icmp + 2, ip_checksum(icmp, 40));
@@ -394,7 +528,22 @@ static bool net_send_icmp_echo(const uint8_t dst_mac[6], const uint8_t dst_ip[4]
     return net_send_frame(packet, sizeof(packet));
 }
 
-static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len)
+static void net_cache_dhcp_peer_mac(const uint8_t server_ip[4], const uint8_t gateway_ip[4], const uint8_t src_mac[6])
+{
+    if (src_mac == NULL) {
+        return;
+    }
+    if (!net_ip_is_zero(server_ip)) {
+        arp_cache_add(server_ip, src_mac);
+        net_log_ip_field("net: dhcp server mac cached ", server_ip);
+    }
+    if (!net_ip_is_zero(gateway_ip) && (net_ip_is_zero(server_ip) || ip_equal(gateway_ip, server_ip))) {
+        arp_cache_add(gateway_ip, src_mac);
+        net_log_ip_field("net: dhcp gateway mac cached ", gateway_ip);
+    }
+}
+
+static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len, const uint8_t src_mac[6])
 {
     const uint8_t *opt;
     const uint8_t *end;
@@ -453,7 +602,17 @@ static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len
     if (message_type != g_dhcp_expected_type) {
         return;
     }
+    if (message_type == NET_DHCP_ACK &&
+        (!g_dhcp_offer_valid ||
+         !ip_equal(udp_payload + 16, g_dhcp_offered_ip) ||
+         !ip_equal(have_server ? server_ip : udp_payload + 20, g_dhcp_server_ip))) {
+        return;
+    }
     if (message_type == NET_DHCP_OFFER) {
+        if (net_ip_is_zero(udp_payload + 16) ||
+            net_ip_is_zero(have_server ? server_ip : udp_payload + 20)) {
+            return;
+        }
         memcpy(g_dhcp_offered_ip, udp_payload + 16, 4);
         memcpy(g_dhcp_server_ip, have_server ? server_ip : udp_payload + 20, 4);
         memcpy(g_dhcp_offer_mask, offered_mask, 4);
@@ -464,6 +623,13 @@ static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len
         strcpy(g_net_status, "net: dhcp offer ");
         ip_to_text(g_dhcp_offered_ip, g_net_status + strlen(g_net_status));
         log_write(g_net_status);
+        net_log_ipv4_config("net: dhcp offer",
+                            g_dhcp_offered_ip,
+                            g_dhcp_offer_mask,
+                            g_dhcp_offer_gateway,
+                            g_dhcp_offer_dns,
+                            g_dhcp_server_ip);
+        net_cache_dhcp_peer_mac(g_dhcp_server_ip, g_dhcp_offer_gateway, src_mac);
         return;
     }
     if (message_type == NET_DHCP_ACK) {
@@ -472,13 +638,24 @@ static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len
         if (offered_gateway[0] != 0 || offered_gateway[1] != 0 || offered_gateway[2] != 0 || offered_gateway[3] != 0) {
             memcpy(g_gateway_ip, offered_gateway, 4);
         }
-        memcpy(g_dns_ip, offered_dns, 4);
+        if (offered_dns[0] != 0 || offered_dns[1] != 0 || offered_dns[2] != 0 || offered_dns[3] != 0) {
+            memcpy(g_dns_ip, offered_dns, 4);
+        } else if (offered_gateway[0] != 0 || offered_gateway[1] != 0 || offered_gateway[2] != 0 || offered_gateway[3] != 0) {
+            memcpy(g_dns_ip, offered_gateway, 4);
+        }
         g_net_info.dhcp_configured = true;
         net_refresh_ip_texts();
         g_dhcp_waiting = false;
         strcpy(g_net_status, "net: dhcp ack ip ");
         strcpy(g_net_status + strlen(g_net_status), g_net_info.ip_text);
         log_write(g_net_status);
+        net_log_ipv4_config("net: dhcp ack",
+                            g_local_ip,
+                            g_netmask,
+                            g_gateway_ip,
+                            g_dns_ip,
+                            g_dhcp_server_ip);
+        net_cache_dhcp_peer_mac(g_dhcp_server_ip, g_gateway_ip, src_mac);
     }
 }
 
@@ -507,9 +684,12 @@ static void net_handle_udp(const uint8_t *packet, uint16_t length)
     if (udp_len < 8 || (uint32_t) udp_len + 20 > ip_total) {
         return;
     }
+    if (ip_get16(udp + 6) != 0 && net_udp_checksum(ip + 12, ip + 16, udp, udp_len) != 0) {
+        return;
+    }
     udp_payload = udp + 8;
     if (src_port == NET_DHCP_SERVER_PORT && dst_port == NET_DHCP_CLIENT_PORT) {
-        net_handle_dhcp(udp_payload, (uint16_t) (udp_len - 8));
+        net_handle_dhcp(udp_payload, (uint16_t) (udp_len - 8), packet + 6);
         return;
     }
     dns_handle_udp(ip + 12, src_port, udp_payload, (uint16_t) (udp_len - 8));
@@ -532,6 +712,14 @@ static bool arp_cache_lookup(const uint8_t ip[4], uint8_t out_mac[6])
 static void arp_cache_add(const uint8_t ip[4], const uint8_t mac[6])
 {
     uint32_t slot = g_arp_next_slot;
+
+    if (ip == NULL || mac == NULL ||
+        net_ip_is_zero(ip) ||
+        net_is_local_ip(ip) ||
+        net_mac_is_zero(mac) ||
+        net_mac_is_broadcast(mac)) {
+        return;
+    }
 
     memcpy(g_arp_ip[slot], ip, 4);
     memcpy(g_arp_mac[slot], mac, 6);
@@ -556,8 +744,14 @@ static void net_handle_arp(const uint8_t *packet, uint16_t length)
     target_ip = packet + 38;
 
     if (opcode == 2) {
-        /* ARP reply: cache sender IP/MAC and log details */
+        if (!ip_equal(target_ip, g_local_ip) ||
+            memcmp(packet, g_mac, 6) != 0 ||
+            !g_arp_pending ||
+            !ip_equal(sender_ip, g_arp_pending_ip)) {
+            return;
+        }
         arp_cache_add(sender_ip, sender_mac);
+        g_arp_pending = false;
         {
             char mac_text[18];
             char ip_text[16];
@@ -578,6 +772,7 @@ static void net_handle_arp(const uint8_t *packet, uint16_t length)
     }
 
     if (opcode == 1 && ip_equal(target_ip, g_local_ip)) {
+        arp_cache_add(sender_ip, sender_mac);
         /* ARP request for our IP: log requester info then reply */
         char mac_text[18];
         char ip_text[16];
@@ -612,6 +807,13 @@ static void net_handle_ipv4(const uint8_t *packet, uint16_t length)
     if ((ip[0] >> 4) != 4 || (ip[0] & 0x0F) != 5) {
         return;
     }
+    ip_total = ip_get16(ip + 2);
+    if (ip_total < 20 || (uint32_t) ip_total + 14 > length || ip_checksum(ip, 20) != 0) {
+        return;
+    }
+    if ((ip_get16(ip + 6) & 0x3FFFu) != 0) {
+        return;
+    }
     if (!ip_equal(ip + 16, g_local_ip) &&
         !(ip[16] == 255 && ip[17] == 255 && ip[18] == 255 && ip[19] == 255)) {
         return;
@@ -627,15 +829,17 @@ static void net_handle_ipv4(const uint8_t *packet, uint16_t length)
     if (ip[9] != NET_IP_PROTO_ICMP) {
         return;
     }
-    ip_total = ip_get16(ip + 2);
     if (ip_total < 28 || (uint32_t) ip_total + 14 > length) {
         return;
     }
     icmp = ip + 20;
+    if (ip_checksum(icmp, (uint32_t) ip_total - 20u) != 0) {
+        return;
+    }
     ident = ip_get16(icmp + 4);
     sequence = ip_get16(icmp + 6);
 
-    if (icmp[0] == NET_ICMP_ECHO_REPLY && ident == NET_ICMP_ID && g_ping_waiting &&
+    if (icmp[0] == NET_ICMP_ECHO_REPLY && ident == g_ping_ident && g_ping_waiting &&
         sequence == g_ping_seq && ip_equal(ip + 12, g_ping_target_ip)) {
         g_ping_waiting = false;
         g_net_info.ping_replies++;
@@ -727,6 +931,81 @@ bool net_dhcp_request(void)
     return g_net_info.dhcp_configured;
 }
 
+bool net_configure_static(const char *ip, const char *mask, const char *gateway, const char *dns)
+{
+    uint8_t new_ip[4];
+    uint8_t new_mask[4];
+    uint8_t new_gateway[4];
+    uint8_t new_dns[4];
+
+    if (!ip_parse_ipv4(ip, new_ip) ||
+        !ip_parse_ipv4(mask, new_mask) ||
+        !ip_parse_ipv4(gateway, new_gateway) ||
+        !ip_parse_ipv4(dns, new_dns) ||
+        net_ip_is_zero(new_ip) ||
+        net_ip_is_zero(new_mask)) {
+        strcpy(g_net_status, "net: static config invalid");
+        return false;
+    }
+
+    memcpy(g_local_ip, new_ip, 4);
+    memcpy(g_netmask, new_mask, 4);
+    memcpy(g_gateway_ip, new_gateway, 4);
+    memcpy(g_dns_ip, new_dns, 4);
+    g_net_info.dhcp_configured = false;
+    g_ping_waiting = false;
+    g_dhcp_waiting = false;
+    g_arp_pending = false;
+    for (uint32_t i = 0; i < ARP_CACHE_SIZE; i++) {
+        g_arp_valid[i] = false;
+    }
+    g_arp_next_slot = 0;
+    net_refresh_ip_texts();
+    strcpy(g_net_status, "net: static ip ");
+    strcpy(g_net_status + strlen(g_net_status), g_net_info.ip_text);
+    net_log_ipv4_config("net: static set", g_local_ip, g_netmask, g_gateway_ip, g_dns_ip, NULL);
+    return true;
+}
+
+uint32_t net_arp_table(char *buffer, uint32_t buffer_size)
+{
+    uint32_t count = 0;
+
+    if (buffer == NULL || buffer_size == 0) {
+        return 0;
+    }
+    buffer[0] = '\0';
+    for (uint32_t i = 0; i < ARP_CACHE_SIZE; i++) {
+        char ip_text[16];
+
+        if (!g_arp_valid[i]) {
+            continue;
+        }
+        ip_to_text(g_arp_ip[i], ip_text);
+        net_append_text(buffer, buffer_size, ip_text);
+        net_append_text(buffer, buffer_size, " ");
+        net_append_mac(buffer, buffer_size, g_arp_mac[i]);
+        net_append_text(buffer, buffer_size, "\n");
+        count++;
+    }
+    if (count == 0) {
+        net_append_text(buffer, buffer_size, "arp: empty\n");
+    }
+    return count;
+}
+
+void net_route_summary(char *buffer, uint32_t buffer_size)
+{
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    net_append_ip_line(buffer, buffer_size, "local: ", g_local_ip);
+    net_append_ip_line(buffer, buffer_size, "mask: ", g_netmask);
+    net_append_ip_line(buffer, buffer_size, "gateway: ", g_gateway_ip);
+    net_append_ip_line(buffer, buffer_size, "dns: ", g_dns_ip);
+}
+
 bool net_driver_init(void)
 {
     pci_device_info_t info;
@@ -743,6 +1022,18 @@ bool net_driver_init(void)
     g_dhcp_waiting = false;
     g_dhcp_offer_valid = false;
     g_ping_seq = 0;
+    {
+        uint64_t tsc = cpu_read_tsc();
+
+        g_ping_ident = (uint16_t) (tsc ^ (tsc >> 16) ^ (tsc >> 32) ^ ((uint16_t) g_mac[4] << 8) ^ g_mac[5]);
+        if (g_ping_ident == 0) {
+            g_ping_ident = (uint16_t) (tsc >> 48);
+        }
+        if (g_ping_ident == 0) {
+            g_ping_ident = 0x4D4F;
+        }
+    }
+    g_arp_pending = false;
     tcp_init();
     dns_init();
     socket_init();
@@ -804,9 +1095,17 @@ void net_init(void)
     }
     net_start_rx_if_ready();
     if (!net_dhcp_request()) {
-        log_write("net: dhcp fallback static ip");
+        log_write("net: dhcp failed, using 172 local static fallback");
         g_net_info.dhcp_configured = false;
         net_refresh_ip_texts();
+        net_log_ipv4_config("net: static fallback",
+                            g_local_ip,
+                            g_netmask,
+                            g_gateway_ip,
+                            g_dns_ip,
+                            NULL);
+    } else {
+        log_write("net: config source dhcp");
     }
     ip_to_text(g_local_ip, ip_text);
     strcpy(g_net_status, "net: link up ip ");
@@ -906,6 +1205,12 @@ bool net_send_ipv4_packet(const uint8_t dst_ip[4], uint8_t proto, const uint8_t 
         }
         if (!arp_cache_lookup(next_hop_ip, next_hop_mac)) {
             log_write("net: ipv4 arp timeout");
+            net_log_ipv4_config("net: active config",
+                                g_local_ip,
+                                g_netmask,
+                                g_gateway_ip,
+                                g_dns_ip,
+                                NULL);
             return false;
         }
     }
@@ -1034,6 +1339,12 @@ bool net_ping(const char *target)
         if (!arp_cache_lookup(next_hop_ip, next_hop_mac)) {
             strcpy(g_net_status, "net: arp timeout");
             log_write(g_net_status);
+            net_log_ipv4_config("net: active config",
+                                g_local_ip,
+                                g_netmask,
+                                g_gateway_ip,
+                                g_dns_ip,
+                                NULL);
             return false;
         }
     }

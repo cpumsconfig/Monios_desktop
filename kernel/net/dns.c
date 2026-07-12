@@ -1,4 +1,5 @@
 #include "common.h"
+#include "cpu.h"
 #include "dns.h"
 #include "ip.h"
 #include "ipv4.h"
@@ -18,6 +19,7 @@ static bool g_dns_answer_valid;
 static uint16_t g_dns_query_id;
 static char g_dns_query_name[DNS_MAX_NAME];
 static uint8_t g_dns_answer_ip[4];
+static uint8_t g_dns_server_ip[4];
 
 static uint16_t dns_get16(const uint8_t *data)
 {
@@ -126,8 +128,12 @@ void dns_init(void)
 {
     g_dns_waiting = false;
     g_dns_answer_valid = false;
-    g_dns_query_id = 0x4D00;
+    g_dns_query_id = (uint16_t) (cpu_read_tsc() ^ (cpu_read_tsc() >> 17) ^ 0x4D00u);
+    if (g_dns_query_id == 0) {
+        g_dns_query_id = 0x4D00;
+    }
     g_dns_query_name[0] = '\0';
+    memset(g_dns_server_ip, 0, sizeof(g_dns_server_ip));
     strcpy(g_dns_status, "dns: ready");
 }
 
@@ -160,6 +166,7 @@ bool dns_resolve_ipv4(const char *name, uint8_t out[4])
         strcpy(g_dns_status, "dns: no server");
         return false;
     }
+    memcpy(g_dns_server_ip, server_ip, sizeof(g_dns_server_ip));
 
     memset(packet, 0, sizeof(packet));
     g_dns_query_id++;
@@ -213,8 +220,10 @@ void dns_handle_udp(const uint8_t src_ip[4], uint16_t src_port, const uint8_t *p
     uint16_t ancount;
     uint16_t pos;
 
-    (void) src_ip;
-    if (!g_dns_waiting || src_port != DNS_PORT || payload == NULL || length < 12) {
+    if (!g_dns_waiting || src_port != DNS_PORT || src_ip == NULL || payload == NULL || length < 12) {
+        return;
+    }
+    if (!ip_equal(src_ip, g_dns_server_ip)) {
         return;
     }
     if (dns_get16(payload + 0) != g_dns_query_id) {

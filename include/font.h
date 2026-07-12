@@ -14,6 +14,7 @@
 typedef void (*font_plot_fn)(uint16_t x, uint16_t y, uint32_t color);
 
 void font_init(void);
+bool font_init_step(uint32_t budget_bytes);
 bool font_ready(void);
 uint32_t font_text_width(const char *text);
 uint32_t font_utf8_next(const char **cursor);

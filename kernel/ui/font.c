@@ -152,6 +152,11 @@ static font_cached_glyph_t g_font_cache[FONT_GLYPH_CACHE_SIZE];
 static uint32_t g_font_cache_next;
 static bool g_font_ready;
 static bool g_font_has_ascii;
+static bool g_font_load_started;
+static bool g_font_load_failed;
+static const char *g_font_load_path;
+static uint32_t g_font_load_size;
+static uint32_t g_font_load_offset;
 
 static uint32_t font_default_advance(uint32_t codepoint)
 {
@@ -467,41 +472,82 @@ void font_draw_codepoint(uint16_t x, uint16_t y, uint32_t codepoint, uint32_t co
 
 void font_init(void)
 {
-    int32_t size;
+    while (!g_font_ready && !g_font_load_failed) {
+        font_init_step(512u * 1024u);
+    }
+}
+
+bool font_init_step(uint32_t budget_bytes)
+{
     int32_t read_size;
-    const char *path = UI_FONT_PATH;
+    uint32_t chunk;
 
     if (g_font_ready) {
-        return;
+        return true;
     }
-    if (font_init_boot_region()) {
-        return;
+    if (g_font_load_failed) {
+        return false;
     }
-    size = file_size(UI_FONT_PATH);
-    if (size <= 0) {
-        path = UI_FONT_FALLBACK_PATH;
-        size = file_size(path);
+    if (!g_font_load_started) {
+        int32_t size;
+        const char *path = UI_FONT_PATH;
+
+        if (font_init_boot_region()) {
+            return true;
+        }
+        size = file_size(UI_FONT_PATH);
+        if (size <= 0) {
+            path = UI_FONT_FALLBACK_PATH;
+            size = file_size(path);
+        }
+        if (size <= 0) {
+            log_write("font: msyh.ttc not found");
+            g_font_load_failed = true;
+            return false;
+        }
+        g_font_data = (uint8_t *) kmalloc((uint32_t) size);
+        if (g_font_data == NULL) {
+            log_write("font: alloc failed");
+            g_font_load_failed = true;
+            return false;
+        }
+        g_font_load_path = path;
+        g_font_load_size = (uint32_t) size;
+        g_font_load_offset = 0;
+        g_font_load_started = true;
+        font_log_size("font: loading bytes=", g_font_load_size);
     }
-    if (size <= 0) {
-        log_write("font: msyh.ttc not found");
-        return;
+    if (budget_bytes == 0) {
+        budget_bytes = 64u * 1024u;
     }
-    g_font_data = (uint8_t *) kmalloc((uint32_t) size);
-    if (g_font_data == NULL) {
-        log_write("font: alloc failed");
-        return;
+    while (budget_bytes > 0 && g_font_load_offset < g_font_load_size) {
+        chunk = g_font_load_size - g_font_load_offset;
+        if (chunk > budget_bytes) {
+            chunk = budget_bytes;
+        }
+        read_size = file_read_at(g_font_load_path, g_font_load_offset, g_font_data + g_font_load_offset, chunk);
+        if (read_size <= 0) {
+            kfree(g_font_data);
+            g_font_data = NULL;
+            g_font_load_failed = true;
+            log_write("font: read failed");
+            return false;
+        }
+        g_font_load_offset += (uint32_t) read_size;
+        budget_bytes -= (uint32_t) read_size;
+        if ((uint32_t) read_size < chunk) {
+            break;
+        }
     }
-    read_size = file_read(path, g_font_data, (uint32_t) size);
-    if (read_size != size) {
+    if (g_font_load_offset < g_font_load_size) {
+        return false;
+    }
+    if (!font_activate(g_font_data, g_font_load_size, "font: loaded msyh.ttc bytes=")) {
         kfree(g_font_data);
         g_font_data = NULL;
-        log_write("font: read failed");
-        return;
-    }
-    if (!font_activate(g_font_data, (uint32_t) size, "font: loaded msyh.ttc bytes=")) {
-        kfree(g_font_data);
-        g_font_data = NULL;
+        g_font_load_failed = true;
         log_write("font: parse failed");
-        return;
+        return false;
     }
+    return true;
 }

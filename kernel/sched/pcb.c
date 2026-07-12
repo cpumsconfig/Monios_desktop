@@ -146,6 +146,18 @@ void pcb_process_abort(int32_t pid, int32_t exit_code)
     pcb_finish_process(pid, PCB_STATE_ABORTED, exit_code);
 }
 
+void pcb_process_fault(int32_t pid, uint8_t vector, uint64_t error_code, int32_t exit_code)
+{
+    pcb_t *pcb = pcb_find_by_pid(pid);
+
+    if (pcb == NULL) {
+        return;
+    }
+    pcb->fault_vector = vector;
+    pcb->fault_error_code = error_code;
+    pcb_finish_process(pid, PCB_STATE_ABORTED, exit_code);
+}
+
 void pcb_process_stop(int32_t pid)
 {
     pcb_finish_process(pid, PCB_STATE_STOPPED, -1);

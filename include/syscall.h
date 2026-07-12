@@ -32,6 +32,13 @@
 #define SYS_SIGNAL_CALL          26
 #define SYS_REQUEST_R0           27
 #define SYS_REQUEST_R2           28
+#define SYS_REGISTRY_GET         29
+#define SYS_REGISTRY_SET         30
+#define SYS_DEFAULT_APP_GET      31
+#define SYS_DEFAULT_APP_SET      32
+#define SYS_EXEC_DEFER           33
+#define SYS_INSTALLER_CALL       34
+#define SYS_GRAPHICS_DRAW_TEXT   35
 
 void syscall_init(void);
 uint64_t syscall_interrupt_dispatch(void *frame_ptr);

@@ -69,6 +69,7 @@ bool http_parse_response(const uint8_t *data, uint32_t length, http_response_t *
 const char *http_get_header(const http_response_t *response, const char *name);
 int32_t http_get_content_length(const http_response_t *response);
 bool http_is_chunked(const http_response_t *response);
+uint32_t http_decode_chunked_body(const uint8_t *input, uint32_t input_len, uint8_t *output, uint32_t output_size);
 
 /* 客户端 */
 bool http_probe_url(const char *url);

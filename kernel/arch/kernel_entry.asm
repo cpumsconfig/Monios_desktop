@@ -7,7 +7,7 @@
 
 section .bss
 align 16
-StackSpace resb 8192
+StackSpace resb 65536
 StackTop:
 
 section .text
@@ -65,6 +65,7 @@ global irq15_interrupt_handler
 global syscall_interrupt_handler
 global syscall_entry
 global exec_enter_user_mode
+global exec_enter_kernel_mode
 extern syscall_fast_dispatch
 extern g_syscall_kernel_stack
 extern g_syscall_user_rsp
@@ -78,6 +79,7 @@ extern timer_interrupt_dispatch
 extern keyboard_interrupt_dispatch_wrapper
 extern mouse_interrupt_dispatch_wrapper
 extern generic_irq_interrupt_dispatch
+extern exec_complete_from_syscall
 extern exec_process_completed
 extern gdb_stub_handle_exception
 extern ftrace_record_entry
@@ -105,6 +107,7 @@ _start:
     mov al, '3'
     mov dx, 0x3F8
     out dx, al
+    mov rdi, r12
     call kernel_main
 
 .halt:
@@ -484,6 +487,14 @@ syscall_entry:
 
 exec_enter_user_mode:
     cli
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rax, [rel .resume]
+    push rax
     mov [r8], rsp
     mov rsp, rcx
     push qword (GDT_USER_DATA_SELECTOR | 3)
@@ -501,3 +512,45 @@ exec_enter_user_mode:
     mov fs, ax
     mov gs, ax
     iretq
+
+.resume:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+exec_enter_kernel_mode:
+    cli
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rax, [rel .resume]
+    push rax
+    mov [rcx], rsp
+    mov rsp, rdx
+    and rsp, -16
+    mov rax, rdi
+    mov rdi, rsi
+    sti
+    call rax
+    mov rdi, rax
+    call exec_complete_from_syscall
+    call exec_resume_stack_pointer
+    mov rsp, rax
+    sti
+    ret
+
+.resume:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret

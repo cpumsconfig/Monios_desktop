@@ -289,10 +289,21 @@ static ntfs_attr_header_t *ntfs_find_attribute(uint8_t *mft_record, uint32_t att
     uint32_t offset = header->first_attribute_offset;
     uint32_t record_size = header->bytes_in_use;
 
-    while (offset < record_size) {
+    if (mft_record == NULL ||
+        record_size == 0 ||
+        record_size > g_ntfs_info.mft_record_size ||
+        offset < sizeof(ntfs_mft_record_header_t)) {
+        return NULL;
+    }
+
+    while (offset + sizeof(ntfs_attr_header_t) <= record_size) {
         ntfs_attr_header_t *attr = (ntfs_attr_header_t *) (mft_record + offset);
 
         if (attr->type == 0xFFFFFFFF) {
+            break;
+        }
+        if (attr->length < sizeof(ntfs_attr_header_t) ||
+            attr->length > record_size - offset) {
             break;
         }
 
@@ -301,7 +312,9 @@ static ntfs_attr_header_t *ntfs_find_attribute(uint8_t *mft_record, uint32_t att
                 if (attr->name_length == 0) {
                     return attr;
                 }
-            } else if (attr->name_length == name_len) {
+            } else if (attr->name_length == name_len &&
+                       attr->name_offset >= sizeof(ntfs_attr_header_t) &&
+                       attr->name_offset + name_len * 2 <= attr->length) {
                 uint8_t *attr_name = mft_record + offset + attr->name_offset;
                 if (memcmp(attr_name, name, name_len * 2) == 0) {
                     return attr;
@@ -310,7 +323,7 @@ static ntfs_attr_header_t *ntfs_find_attribute(uint8_t *mft_record, uint32_t att
         }
 
         if (attr->length == 0) {
-            break;
+            return NULL;
         }
         offset += attr->length;
     }
@@ -320,14 +333,38 @@ static ntfs_attr_header_t *ntfs_find_attribute(uint8_t *mft_record, uint32_t att
 
 static bool ntfs_get_attribute_data(uint8_t *mft_record, ntfs_attr_header_t *attr, uint64_t vcn, uint8_t **data_out, uint32_t *size_out)
 {
-    if (attr == NULL) {
+    uint32_t attr_offset;
+    uint32_t record_size;
+
+    if (mft_record == NULL || attr == NULL || data_out == NULL || size_out == NULL) {
+        return false;
+    }
+    record_size = g_ntfs_info.mft_record_size;
+    attr_offset = (uint32_t) ((uint8_t *) attr - mft_record);
+    if (record_size == 0 ||
+        record_size > sizeof(g_mft_buffer) ||
+        attr_offset >= record_size ||
+        attr->length < sizeof(ntfs_attr_header_t) ||
+        attr_offset + attr->length > record_size) {
         return false;
     }
 
     if (!attr->non_resident) {
-        uint32_t offset = (uint32_t) ((uint8_t *) attr - mft_record) + attr->data.resident.value_offset;
+        uint32_t value_offset = attr->data.resident.value_offset;
+        uint32_t value_length = attr->data.resident.value_length;
+        uint32_t offset;
+
+        if (value_offset < sizeof(ntfs_attr_header_t) ||
+            value_offset > attr->length ||
+            value_length > attr->length - value_offset) {
+            return false;
+        }
+        offset = attr_offset + value_offset;
+        if (offset + value_length > record_size) {
+            return false;
+        }
         *data_out = mft_record + offset;
-        *size_out = attr->data.resident.value_length;
+        *size_out = value_length;
         return true;
     }
 

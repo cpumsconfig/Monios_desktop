@@ -21,7 +21,9 @@ LABEL_START:
     mov dl, [BootDrive]
     int 13h
 
-    mov word [wSectorNo], SectorNoOfRootDirectory
+    mov eax, [BPB_HiddSec]
+    add eax, SectorNoOfRootDirectory
+    mov dword [wSectorNo], eax
 LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     cmp word [wRootDirSizeForLoop], 0
     jz LABEL_NO_LOADERBIN
@@ -29,8 +31,7 @@ LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     mov ax, BaseOfLoader
     mov es, ax
     mov bx, OffsetOfLoader
-    xor eax, eax
-    mov ax, [wSectorNo]
+    mov eax, [wSectorNo]
     mov cl, 1
     call ReadSector
 
@@ -61,7 +62,7 @@ LABEL_DIFFERENT:
     mov si, LoaderFileName
     jmp LABEL_SEARCH_FOR_LOADERBIN
 LABEL_GOTO_NEXT_SECTOR_IN_ROOT_DIR:
-    add word [wSectorNo], 1
+    add dword [wSectorNo], 1
     jmp LABEL_SEARCH_IN_ROOT_DIR_BEGIN
 LABEL_NO_LOADERBIN:
     mov al, 'N'
@@ -78,12 +79,12 @@ LABEL_FILENAME_FOUND:
     shr eax, 9
     mov [wFileSectors], ax
 
-    mov ax, RootDirSectors
     add di, 01Ah
-    mov cx, word [es:di]
-    add cx, ax
-    add cx, DeltaSectorNo
-    mov [wCurrentLba], cx
+    movzx ecx, word [es:di]
+    add ecx, RootDirSectors + DeltaSectorNo
+    mov eax, [BPB_HiddSec]
+    add eax, ecx
+    mov dword [wCurrentLba], eax
     mov word [wLoadSegment], BaseOfLoader
     mov word [wLoadOffset], OffsetOfLoader
 
@@ -92,13 +93,13 @@ LABEL_GOON_LOADING_FILE:
     jz LABEL_FILE_LOADED
     dec word [wFileSectors]
 
-    mov ax, [wCurrentLba]
+    mov eax, [wCurrentLba]
     mov dx, [wLoadSegment]
     mov es, dx
     mov bx, [wLoadOffset]
     mov cl, 1
     call ReadSector
-    inc word [wCurrentLba]
+    add dword [wCurrentLba], 1
     mov ax, [wLoadOffset]
     add ax, [BPB_BytsPerSec]
     mov [wLoadOffset], ax
@@ -118,9 +119,9 @@ LABEL_FILE_LOADED:
 
 BootDrive           db 0
 wRootDirSizeForLoop dw RootDirSectors
-wSectorNo           dw 0
+wSectorNo           dd 0
 wFileSectors        dw 0
-wCurrentLba         dw 0
+wCurrentLba         dd 0
 wLoadSegment        dw 0
 wLoadOffset         dw 0
 bOdd                db 0
@@ -130,7 +131,6 @@ LoaderFileName      db "LOADER  BIN", 0
 ReadSector:
     push si
     push ds
-    movzx eax, ax
     mov [dap_lba], eax
     mov dword [dap_lba + 4], 0
     mov [dap_count], cl

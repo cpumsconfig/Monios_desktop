@@ -55,6 +55,7 @@
 #include "pool.h"
 #include "power.h"
 #include "prsys.h"
+#include "registry.h"
 #include "rtc.h"
 #include "scheduler.h"
 #include "schedopt.h"
@@ -110,12 +111,14 @@ static uint32_t g_cursor_pos;
 static uint32_t g_last_drawn_len;
 static char g_draft[SHELL_LINE_MAX];
 static char g_shell_cwd[PATH_MAX_LEN];
+static char g_deferred_exec_path[PATH_MAX_LEN];
 static char g_env[SHELL_ENV_MAX][SHELL_ENV_LEN];
 static uint32_t g_env_count;
 static char *g_capture_buffer;
 static uint32_t g_capture_size;
 static uint32_t g_capture_len;
 static const char *g_pipe_input;
+static http_response_t g_shell_http_response;
 
 /* Tab completion state */
 static char g_complete_candidates[SHELL_COMPLETE_MAX][SHELL_COMPLETE_PATH_MAX];
@@ -136,9 +139,12 @@ static bool g_complete_in_progress;
 
 static void shell_print_line(const char *text);
 static void shell_run_command(char *line, bool admin_once);
+static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[SHELL_ARG_MAX], bool admin_once);
 static void shell_redraw_input_line(void);
 static void shell_print_prompt(void);
 static bool shell_request_privilege(const char *program_path, const char *reason, uint32_t privilege_level);
+static void shell_run_deferred_exec(void);
+static bool shell_open_with_default_app(const char *path);
 
 static void shell_capture_append(const char *text)
 {
@@ -232,7 +238,7 @@ static void shell_glob_expand_in_dir(
     if (dir == NULL || dir[0] == '\0') {
         strcpy(search_path, "/");
     } else {
-        strcpy(search_path, dir);
+        strlcpy(search_path, dir, sizeof(search_path));
     }
 
     if (!file_list_dir(search_path, dir_buffer, sizeof(dir_buffer))) {
@@ -449,7 +455,7 @@ static void shell_complete_command(const char *prefix, uint32_t prefix_len)
         "lazyalloc", "bitmap", "buddy", "eevdf", "futex", "ipc",
         "muqss", "pcb", "pool", "prsys", "scheduler", "signal",
         "socket", "udp", "ping", "dev",
-        "wm", "term", "smp", "taskmgr", "setup", "clear", "which", "grep",
+        "wm", "term", "smp", "taskmgr", "setup", "appdev", "clear", "which", "grep",
         "head", "tail", NULL
     };
 
@@ -695,6 +701,61 @@ static void shell_env_unset_key(const char *key)
             g_env_count--;
             return;
         }
+    }
+}
+
+void shell_env_set(const char *name, const char *value)
+{
+    char pair[SHELL_ENV_LEN];
+    uint32_t name_len;
+    uint32_t value_len;
+
+    if (name == NULL || name[0] == '\0' || value == NULL || strchr(name, '=') != NULL) {
+        return;
+    }
+    name_len = (uint32_t) strlen(name);
+    value_len = (uint32_t) strlen(value);
+    if (name_len + value_len + 2U > sizeof(pair)) {
+        return;
+    }
+    strcpy(pair, name);
+    pair[name_len] = '=';
+    pair[name_len + 1U] = '\0';
+    strcpy(pair + name_len + 1U, value);
+    shell_env_set_pair(pair);
+}
+
+const char *shell_env_get(const char *name)
+{
+    uint32_t name_len;
+
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+    name_len = (uint32_t) strlen(name);
+    for (uint32_t i = 0; i < g_env_count; i++) {
+        char *eq = strchr(g_env[i], '=');
+
+        if (eq == NULL) {
+            continue;
+        }
+        if ((uint32_t) (eq - g_env[i]) == name_len &&
+            memcmp(g_env[i], name, name_len) == 0) {
+            return eq + 1;
+        }
+    }
+    return NULL;
+}
+
+void shell_env_unset(const char *name)
+{
+    shell_env_unset_key(name);
+}
+
+void shell_env_list(void)
+{
+    for (uint32_t i = 0; i < g_env_count; i++) {
+        shell_print_line(g_env[i]);
     }
 }
 
@@ -1029,6 +1090,74 @@ static bool shell_has_suffix(const char *text, const char *suffix)
     return strcasecmp(text + text_len - suffix_len, suffix) == 0;
 }
 
+static bool shell_is_rzs_package(const char *path)
+{
+    return shell_has_suffix(path, ".rzs");
+}
+
+static const char *shell_path_basename(const char *path)
+{
+    const char *base = path;
+
+    if (path == NULL) {
+        return "";
+    }
+    while (*path != '\0') {
+        if (*path == '/' || *path == '\\') {
+            base = path + 1;
+        }
+        path++;
+    }
+    return base;
+}
+
+static bool shell_path_is_executable(const char *path)
+{
+    return shell_has_suffix(path, ".elf") ||
+           shell_has_suffix(path, ".exe");
+}
+
+static bool shell_resolve_app_executable_path(const char *path, char output[PATH_MAX_LEN])
+{
+    const char *base;
+    uint32_t base_len;
+
+    if (path == NULL || !shell_path_is_executable(path) || output == NULL) {
+        return false;
+    }
+    base = shell_path_basename(path);
+    base_len = (uint32_t) strlen(base);
+    if (base_len == 0 || base_len + 7 > PATH_MAX_LEN) {
+        return false;
+    }
+    strcpy(output, "/apps/");
+    strcpy(output + 6, base);
+    return file_exists(output) && !file_is_dir(output);
+}
+
+static bool shell_open_with_default_app(const char *path)
+{
+    char resolved[PATH_MAX_LEN];
+    char app_path[PATH_MAX_LEN];
+    char *argv[] = { app_path, resolved };
+
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+    if (!shell_resolve_path(path, resolved) || !file_exists(resolved) || file_is_dir(resolved)) {
+        return false;
+    }
+    if (!registry_default_app_for_path(resolved, app_path, sizeof(app_path))) {
+        return false;
+    }
+    if (!file_exists(app_path) || file_is_dir(app_path)) {
+        shell_print_line("default app not found");
+        return true;
+    }
+    shell_run_exec_program(app_path, 2, argv, false);
+    return true;
+}
+
 static bool shell_rm_option_is_recursive_force(const char *option)
 {
     if (option == NULL || option[0] != '-') {
@@ -1155,6 +1284,9 @@ static void shell_print_exit_code(int32_t code)
 
     buffer[index] = '\0';
     shell_print_line(buffer);
+    if (code <= -0x100) {
+        shell_print_line("process isolated after fault; kernel still running");
+    }
 }
 
 static void shell_change_directory(const char *input)
@@ -1243,6 +1375,7 @@ static void shell_expand_argument(const char *in, char *out, uint32_t out_size)
 static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[SHELL_ARG_MAX], bool admin_once)
 {
     char resolved[PATH_MAX_LEN];
+    char app_resolved[PATH_MAX_LEN];
     char fallback[PATH_MAX_LEN];
     char *program_argv[SHELL_ARG_MAX];
     int32_t exit_code = 0;
@@ -1255,24 +1388,40 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
     }
     if (!file_exists(resolved) || file_is_dir(resolved)) {
         uint32_t len;
+        bool found_program = false;
 
-        len = (uint32_t) strlen(path);
-        if (len + 5 < sizeof(fallback)) {
-            strcpy(fallback, path);
-            strcpy(fallback + len, ".elf");
-            if (shell_resolve_path(fallback, resolved) && file_exists(resolved) && !file_is_dir(resolved)) {
-                path = fallback;
-            } else {
-                shell_print_line("program not found");
-                return;
-            }
+        if (shell_resolve_app_executable_path(path, app_resolved)) {
+            strcpy(resolved, app_resolved);
+            found_program = true;
         } else {
+            len = (uint32_t) strlen(path);
+            if (len + 5 < sizeof(fallback)) {
+                strcpy(fallback, path);
+                strcpy(fallback + len, ".elf");
+                if (shell_resolve_path(fallback, resolved) && file_exists(resolved) && !file_is_dir(resolved)) {
+                    found_program = true;
+                } else if (shell_resolve_app_executable_path(fallback, app_resolved)) {
+                    strcpy(resolved, app_resolved);
+                    found_program = true;
+                }
+            }
+        }
+        if (!found_program) {
             shell_print_line("program not found");
             return;
         }
     }
+    if (shell_resolve_app_executable_path(resolved, app_resolved)) {
+        strcpy(resolved, app_resolved);
+    }
 
     image_flags = exec_image_flags_for_path(resolved);
+    if (admin_once) {
+        run_flags |= EXEC_RUN_FLAG_ADMIN;
+        if (shell_is_rzs_package(resolved)) {
+            run_flags |= EXEC_RUN_FLAG_TRUSTED_R0;
+        }
+    }
     if ((image_flags & EXEC_IMAGE_FLAG_NEEDS_R2) != 0 ||
         (image_flags & EXEC_IMAGE_FLAG_NEEDS_R0) != 0) {
         if (g_shell_privilege != SHELL_PRIV_R0 && g_shell_privilege != SHELL_PRIV_R2 && !admin_once) {
@@ -1308,13 +1457,28 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
     if (exit_code != 0) {
         shell_print_exit_code(exit_code);
     }
+    shell_run_deferred_exec();
+}
+
+static void shell_run_deferred_exec(void)
+{
+    char path[PATH_MAX_LEN];
+    char *argv[] = { path };
+
+    if (g_deferred_exec_path[0] == '\0') {
+        return;
+    }
+    strcpy(path, g_deferred_exec_path);
+    g_deferred_exec_path[0] = '\0';
+    shell_run_exec_program(path, 1, argv, true);
 }
 
 static void shell_run_task_manager(void)
 {
     char *argv[] = { "taskmgr.elf" };
+    const char *taskmgr_path = file_exists("/apps/taskmgr.elf") ? "/apps/taskmgr.elf" : "/taskmgr.elf";
 
-    shell_run_exec_program("/taskmgr.elf", 1, argv, false);
+    shell_run_exec_program(taskmgr_path, 1, argv, false);
 }
 
 static void shell_handle_hash_command(uint32_t argc, char *argv[SHELL_ARG_MAX])
@@ -1682,6 +1846,69 @@ static void shell_print_i32_prefixed(const char *prefix, int32_t value)
     shell_print_u32_prefixed(prefix, magnitude);
 }
 
+static void shell_print_net_ping_summary(const net_info_t *before, const net_info_t *after)
+{
+    uint32_t requests;
+    uint32_t replies;
+    uint32_t lost;
+
+    if (before == NULL || after == NULL) {
+        return;
+    }
+    requests = after->ping_requests - before->ping_requests;
+    replies = after->ping_replies - before->ping_replies;
+    lost = requests > replies ? requests - replies : 0;
+    shell_print_u32_prefixed("requests: ", requests);
+    shell_print_u32_prefixed("replies: ", replies);
+    shell_print_u32_prefixed("lost: ", lost);
+    shell_print_u32_prefixed("total requests: ", after->ping_requests);
+    shell_print_u32_prefixed("total replies: ", after->ping_replies);
+}
+
+static void shell_print_text_preview(const char *text, uint32_t max_lines, uint32_t max_chars)
+{
+    char line[160];
+    uint32_t i = 0;
+    uint32_t line_pos = 0;
+    uint32_t lines = 0;
+    uint32_t chars = 0;
+
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+    while (text[i] != '\0' && lines < max_lines && chars < max_chars) {
+        char ch = text[i++];
+
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            if (line_pos > 0) {
+                line[line_pos] = '\0';
+                shell_print_line(line);
+                line_pos = 0;
+                lines++;
+            }
+            continue;
+        }
+        if (line_pos + 1 >= sizeof(line)) {
+            line[line_pos] = '\0';
+            shell_print_line(line);
+            line_pos = 0;
+            lines++;
+            if (lines >= max_lines) {
+                break;
+            }
+        }
+        line[line_pos++] = ch;
+        chars++;
+    }
+    if (line_pos > 0 && lines < max_lines) {
+        line[line_pos] = '\0';
+        shell_print_line(line);
+    }
+}
+
 static void shell_print_hex_u32_prefixed(const char *prefix, uint32_t value)
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -1987,7 +2214,7 @@ static void shell_run_command(char *line, bool admin_once)
     argc = shell_expand_globs_in_argv(argc, argv);
 
     if (strcmp(argv[0], "help") == 0) {
-        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme cdrom storagex hda aac pcnet lwip xhci usbext hid ntfs iso9660 extfs fscache iic i2c i3c spi tpm mcb md opp od bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr clear which grep head tail ver");
+        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme cdrom storagex hda aac pcnet lwip xhci usbext hid ntfs iso9660 extfs fscache iic i2c i3c spi tpm mcb md opp od bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr appdev assoc reg clear which grep head tail ver");
         return;
     }
 
@@ -2085,6 +2312,54 @@ static void shell_run_command(char *line, bool admin_once)
         } else {
             shell_print_line("not found");
         }
+        return;
+    }
+
+    if (strcmp(argv[0], "reg") == 0) {
+        if (argc < 3) {
+            shell_print_line("usage: reg <get|set|del> <key> [value]");
+            return;
+        }
+        if (strcmp(argv[1], "get") == 0) {
+            const char *value = registry_get(argv[2]);
+
+            shell_print_line(value != NULL ? value : "not found");
+            return;
+        }
+        if (strcmp(argv[1], "set") == 0) {
+            char value[REGISTRY_VALUE_MAX];
+
+            if (argc < 4) {
+                shell_print_line("usage: reg set <key> <value>");
+                return;
+            }
+            if (!shell_join_args(argc, argv, 3, value, sizeof(value))) {
+                shell_print_line("value too long");
+                return;
+            }
+            shell_print_line(registry_set(argv[2], value) ? "reg set ok" : "reg set failed");
+            return;
+        }
+        if (strcmp(argv[1], "del") == 0) {
+            shell_print_line(registry_delete(argv[2]) ? "reg del ok" : "reg del failed");
+            return;
+        }
+        shell_print_line("usage: reg <get|set|del> <key> [value]");
+        return;
+    }
+
+    if (strcmp(argv[0], "assoc") == 0) {
+        char app_path[PATH_MAX_LEN];
+
+        if (argc < 2) {
+            shell_print_line("usage: assoc <.ext> [app]");
+            return;
+        }
+        if (argc == 2) {
+            shell_print_line(registry_default_app_for_extension(argv[1], app_path, sizeof(app_path)) ? app_path : "not associated");
+            return;
+        }
+        shell_print_line(registry_set_default_app(argv[1], argv[2]) ? "assoc ok" : "assoc failed");
         return;
     }
 
@@ -2515,6 +2790,14 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
+    if (strcmp(argv[0], "appdev") == 0) {
+        char *appdev_argv[] = { "appdev.elf" };
+        const char *appdev_path = file_exists("/apps/appdev.elf") ? "/apps/appdev.elf" : "/appdev.elf";
+
+        shell_run_exec_program(appdev_path, 1, appdev_argv, admin_once);
+        return;
+    }
+
     if (strcmp(argv[0], "setup") == 0) {
         char *setup_argv[] = { "setup.elf" };
         const char *setup_path = file_exists("/apps/setup.elf") ? "/apps/setup.elf" : "/setup.elf";
@@ -2537,25 +2820,72 @@ static void shell_run_command(char *line, bool admin_once)
     }
 
     if (strcmp(argv[0], "ping") == 0) {
+        net_info_t before;
+        const net_info_t *after;
+        bool ok;
+
         if (argc < 2) {
             shell_print_line("usage: ping [ip/gateway/host]");
-        } else if (net_ping(argv[1])) {
-            shell_print_line(net_status());
-        } else {
-            shell_print_line(net_status());
+            return;
         }
+        before = *net_info();
+        shell_print_line("ping:");
+        shell_print_line(argv[1]);
+        ok = net_ping(argv[1]);
+        after = net_info();
+        shell_print_line(ok ? "result: reply" : "result: failed");
+        shell_print_line(net_status());
+        if (after->last_target[0] != '\0') {
+            shell_print_line(after->last_target);
+        }
+        shell_print_net_ping_summary(&before, after);
         return;
     }
 
     if (strcmp(argv[0], "net") == 0) {
         const net_info_t *info = net_info();
 
+        if (argc >= 2 && strcmp(argv[1], "set") == 0) {
+            if (argc < 6) {
+                shell_print_line("usage: net set <ip> <mask> <gateway> <dns>");
+                return;
+            }
+            shell_print_line(net_configure_static(argv[2], argv[3], argv[4], argv[5]) ? net_status() : net_status());
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "arp") == 0) {
+            char table[SHELL_STREAM_MAX];
+
+            (void) net_arp_table(table, sizeof(table));
+            shell_print_line(table);
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "route") == 0) {
+            char route[SHELL_STREAM_MAX];
+
+            net_route_summary(route, sizeof(route));
+            shell_print_line(route);
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "dhcp") == 0) {
+            shell_print_line(net_dhcp_request() ? net_status() : net_status());
+            return;
+        }
         shell_print_line(net_status());
         shell_print_line(info->mac_text);
         shell_print_line(info->ip_text);
+        shell_print_line(info->netmask_text);
         shell_print_line(info->gateway_text);
         shell_print_line(info->dns_text);
         shell_print_line(info->dhcp_configured ? "dhcp: ok" : "dhcp: static");
+        shell_print_line(info->dhcp_configured ? "mode: dhcp" : "mode: static-local");
+        shell_print_u32_prefixed("tx: ", info->tx_packets);
+        shell_print_u32_prefixed("rx: ", info->rx_packets);
+        shell_print_u32_prefixed("ping requests: ", info->ping_requests);
+        shell_print_u32_prefixed("ping replies: ", info->ping_replies);
+        if (info->last_target[0] != '\0') {
+            shell_print_line(info->last_target);
+        }
         return;
     }
 
@@ -2672,7 +3002,36 @@ static void shell_run_command(char *line, bool admin_once)
             return;
         }
         if (argc >= 2) {
-            shell_print_line(http_probe_url(argv[1]) ? http_status() : http_status());
+            char response[2048];
+            char url[256];
+            const char *request_url = argv[1];
+            int32_t length;
+
+            if (strcmp(argv[0], "https") == 0 &&
+                strncmp(argv[1], "http://", 7) != 0 &&
+                strncmp(argv[1], "https://", 8) != 0) {
+                strcpy(url, "https://");
+                if (strlen(argv[1]) + strlen(url) + 1 < sizeof(url)) {
+                    strcpy(url + strlen(url), argv[1]);
+                    request_url = url;
+                }
+            }
+            if (request_url == url && strlen(url) > 0 && url[strlen(url) - 1] == '.') {
+                url[strlen(url) - 1] = '\0';
+            }
+            length = http_get_url(request_url, response, sizeof(response));
+            shell_print_line(length > 0 ? http_status() : http_status());
+            shell_print_i32_prefixed("bytes: ", length);
+            if (length > 0) {
+                http_response_t *parsed = &g_shell_http_response;
+                if (http_parse_response((const uint8_t *) response, (uint32_t) length, parsed)) {
+                    shell_print_i32_prefixed("status: ", parsed->status_code);
+                    shell_print_line(parsed->status_text);
+                    shell_print_text_preview((const char *) parsed->body, 6, 900);
+                } else {
+                    shell_print_text_preview(response, 6, 900);
+                }
+            }
             return;
         }
         shell_print_line(http_status());
@@ -2685,11 +3044,30 @@ static void shell_run_command(char *line, bool admin_once)
         const browser_info_t *info = browser_info();
 
         if (argc >= 2) {
-            shell_print_line(browser_open_url(argv[1]) ? browser_status() : browser_status());
+            bool ok = browser_open_url(argv[1]);
+            info = browser_info();
+            shell_print_line(ok ? browser_status() : browser_status());
+            shell_print_line(browser_page_url());
+            shell_print_i32_prefixed("status: ", info->last_status_code);
+            shell_print_u32_prefixed("bytes: ", info->last_body_length);
+            if (info->last_title[0] != '\0') {
+                shell_print_line(info->last_title);
+            }
+            if (info->content_type[0] != '\0') {
+                shell_print_line(info->content_type);
+            }
+            if (ok) {
+                shell_print_text_preview(browser_page_text(), 8, 1200);
+            }
             return;
         }
         shell_print_line(browser_status());
         shell_print_line(info->last_url);
+        if (info->last_title[0] != '\0') {
+            shell_print_line(info->last_title);
+        }
+        shell_print_i32_prefixed("status: ", info->last_status_code);
+        shell_print_u32_prefixed("bytes: ", info->last_body_length);
         shell_print_u32_prefixed("pages: ", info->pages_requested);
         return;
     }
@@ -3558,6 +3936,11 @@ static void shell_run_command(char *line, bool admin_once)
                 shell_print_u32_prefixed("pid: ", pcb.pid);
                 shell_print_line(pcb.name);
                 shell_print_line(pcb_state_name(pcb.state));
+                shell_print_u32_prefixed("exit: ", (uint32_t) pcb.exit_code);
+                if (pcb.fault_vector != 0) {
+                    shell_print_hex_u32_prefixed("fault vector: ", pcb.fault_vector);
+                    shell_print_hex_u64_prefixed("fault error: ", pcb.fault_error_code);
+                }
                 shell_print_u32_prefixed("signals: ", pcb.pending_signals);
             }
         }
@@ -3802,7 +4185,76 @@ static void shell_run_command(char *line, bool admin_once)
             shell_print_line((const char *) payload);
             return;
         }
-        shell_print_line("usage: socket [open [port]|send|recv|close]");
+        if (strcmp(argv[1], "tcp") == 0) {
+            if (argc >= 3 && strcmp(argv[2], "open") == 0) {
+                int32_t handle;
+
+                port = 0;
+                if (argc >= 4 && !shell_parse_u16_arg(argv[3], &port)) {
+                    shell_print_line("bad port");
+                    return;
+                }
+                handle = socket_tcp_open(port);
+                if (handle > 0) {
+                    shell_print_u32_prefixed("socket: ", (uint32_t) handle);
+                } else {
+                    shell_print_line(socket_status());
+                }
+                return;
+            }
+            if (argc >= 6 && strcmp(argv[2], "connect") == 0) {
+                if (!shell_parse_u32_arg(argv[3], &handle_value) ||
+                    !shell_parse_u16_arg(argv[5], &port)) {
+                    shell_print_line("usage: socket tcp connect <handle> <host> <port>");
+                    return;
+                }
+                if (!socket_tcp_connect((int32_t) handle_value, argv[4], port)) {
+                    shell_print_line(socket_status());
+                    return;
+                }
+                for (uint32_t wait = 0; wait < 250000u && !socket_tcp_is_connected((int32_t) handle_value); wait++) {
+                    net_update();
+                    io_wait();
+                }
+                shell_print_line(socket_tcp_is_connected((int32_t) handle_value) ? "socket: tcp connected" : socket_status());
+                return;
+            }
+            if (argc >= 5 && strcmp(argv[2], "send") == 0) {
+                char payload[SHELL_STREAM_MAX];
+
+                if (!shell_parse_u32_arg(argv[3], &handle_value)) {
+                    shell_print_line("usage: socket tcp send <handle> <text>");
+                    return;
+                }
+                if (!shell_join_args(argc, argv, 4, payload, sizeof(payload))) {
+                    shell_print_line("socket payload too long");
+                    return;
+                }
+                (void) socket_tcp_send((int32_t) handle_value, (const uint8_t *) payload, (uint16_t) strlen(payload));
+                shell_print_line(socket_status());
+                return;
+            }
+            if (argc >= 4 && strcmp(argv[2], "recv") == 0) {
+                uint8_t payload[SOCKET_MAX_PAYLOAD + 1];
+                int32_t size;
+
+                if (!shell_parse_u32_arg(argv[3], &handle_value)) {
+                    shell_print_line("usage: socket tcp recv <handle>");
+                    return;
+                }
+                size = socket_tcp_recv((int32_t) handle_value, payload, SOCKET_MAX_PAYLOAD);
+                if (size <= 0) {
+                    shell_print_line(socket_status());
+                    return;
+                }
+                payload[size] = '\0';
+                shell_print_line((const char *) payload);
+                return;
+            }
+            shell_print_line("usage: socket tcp [open [port]|connect|send|recv]");
+            return;
+        }
+        shell_print_line("usage: socket [open [port]|send|recv|close|tcp]");
         return;
     }
 
@@ -4096,6 +4548,10 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
+    if (argc == 1 && shell_open_with_default_app(argv[0])) {
+        return;
+    }
+
     shell_print_line("unknown command");
 }
 
@@ -4139,6 +4595,38 @@ bool shell_exec_path(const char *path)
         return false;
     }
     shell_run_exec_program(path, 1, (char *[]) { (char *) path }, false);
+    return true;
+}
+
+bool shell_exec_path_with_arg(const char *path, const char *arg)
+{
+    if (path == NULL || path[0] == '\0' || arg == NULL || arg[0] == '\0') {
+        return false;
+    }
+    shell_run_exec_program(path, 2, (char *[]) { (char *) path, (char *) arg }, false);
+    return true;
+}
+
+bool shell_exec_path_admin(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+    shell_run_exec_program(path, 1, (char *[]) { (char *) path }, true);
+    return true;
+}
+
+bool shell_defer_exec_path(const char *path)
+{
+    char resolved[PATH_MAX_LEN];
+
+    if (path == NULL || path[0] == '\0') {
+        return false;
+    }
+    if (!shell_resolve_path(path, resolved) || !file_exists(resolved) || file_is_dir(resolved)) {
+        return false;
+    }
+    strcpy(g_deferred_exec_path, resolved);
     return true;
 }
 

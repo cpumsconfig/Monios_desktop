@@ -375,9 +375,13 @@ int32_t x509_parse_spki(x509_cert_t *cert, const uint8_t *data, uint32_t len)
         if (asn1_parse_integer(rsa_content, rsa_len, &mod, &mod_len) != 0) {
             return -1;
         }
+        while (mod_len > 1 && mod[0] == 0) {
+            mod++;
+            mod_len--;
+        }
 
         if (mod_len > sizeof(cert->pubkey_modulus)) {
-            mod_len = sizeof(cert->pubkey_modulus);
+            return -1;
         }
         memcpy(cert->pubkey_modulus, mod, mod_len);
         cert->pubkey_modulus_len = mod_len;

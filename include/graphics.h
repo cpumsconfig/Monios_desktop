@@ -5,15 +5,19 @@
 #include "stdint.h"
 #include "keyboard.h"
 
-#define GRAPHICS_WIDTH  1280
-#define GRAPHICS_HEIGHT 800
+#define GRAPHICS_WIDTH  1024
+#define GRAPHICS_HEIGHT 768
 
 void graphics_init(void);
 bool graphics_active(void);
+void graphics_set_installer_mode(bool enabled);
+void graphics_set_boot_animation_mode(bool enabled);
 void graphics_enter_mode(void);
 void graphics_leave_mode(void);
+void graphics_boot_animation(void);
 void graphics_clear(uint8_t color);
 bool graphics_user_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
+bool graphics_user_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
 void graphics_user_present(void);
 void graphics_draw_bsod(const char *process, const char *code, const char *text, uint32_t progress);
 void graphics_draw_shell(void);
@@ -21,7 +25,6 @@ void graphics_mouse_redraw(uint16_t x, uint16_t y);
 void graphics_refresh_desktop_entries(void);
 void graphics_activate_primary_button(void);
 void graphics_open_task_manager(void);
-void graphics_open_cube3d_window(void);
 void graphics_handle_click(uint16_t x, uint16_t y);
 void graphics_handle_right_click(uint16_t x, uint16_t y);
 void graphics_handle_mouse_move(uint16_t x, uint16_t y, uint8_t buttons);

@@ -193,7 +193,7 @@ uint64_t cpu_exception_dispatch(cpu_exception_frame_t *frame)
         (uint64_t)info.rip, (uint64_t)frame->rsp, 0 /* rbp n/a in frame */,
         (uint64_t)info.rflags);
 
-    if (from_user && exec_active()) {
+    if ((from_user || exec_address_in_active_image(info.rip)) && exec_active()) {
         char msg[64] = "process exception vector=0x";
         static const char hex[] = "0123456789ABCDEF";
 
@@ -267,7 +267,7 @@ void timer_interrupt_dispatch(void)
         tick_count++;
     }
     if (exec_active()) {
-        kernel_run_periodic_work();
+        kernel_run_exec_periodic_work();
     }
 }
 

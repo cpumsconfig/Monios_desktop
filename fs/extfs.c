@@ -53,6 +53,67 @@ static uint32_t g_cache_counter = 0;
 
 static uint32_t g_symlink_count = 0;
 
+static bool extfs_append_path_part(char *path, uint32_t path_size, const char *part)
+{
+    uint32_t len;
+    uint32_t part_len;
+
+    if (path == NULL || path_size == 0 || part == NULL || part[0] == '\0') {
+        return false;
+    }
+    len = (uint32_t) strlen(path);
+    part_len = (uint32_t) strlen(part);
+    if (len == 0) {
+        if (part_len >= path_size) {
+            return false;
+        }
+        memcpy(path, part, part_len + 1);
+        return true;
+    }
+    if (path[len - 1] == '/') {
+        if (len + part_len >= path_size) {
+            return false;
+        }
+        memcpy(path + len, part, part_len + 1);
+        return true;
+    }
+    if (len + 1 + part_len >= path_size) {
+        return false;
+    }
+    path[len] = '/';
+    memcpy(path + len + 1, part, part_len + 1);
+    return true;
+}
+
+static bool extfs_parent_path_for_cursor(const char *path, const char *cursor, char *out, uint32_t out_size)
+{
+    uint32_t prefix_len;
+    int32_t end;
+
+    if (path == NULL || cursor == NULL || out == NULL || out_size < 2 || cursor < path) {
+        return false;
+    }
+    prefix_len = (uint32_t) (cursor - path);
+    while (prefix_len > 0 && path[prefix_len - 1] == '/') {
+        prefix_len--;
+    }
+    end = (int32_t) prefix_len - 1;
+    while (end >= 0 && path[end] != '/') {
+        end--;
+    }
+    if (end <= 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        return true;
+    }
+    if ((uint32_t) end >= out_size) {
+        return false;
+    }
+    memcpy(out, path, (uint32_t) end);
+    out[end] = '\0';
+    return true;
+}
+
 /* 组描述符缓存 */
 static uint8_t g_group_desc[EXTFS_MAX_GROUP_DESC * 32];
 static bool g_group_desc_loaded = false;
@@ -832,6 +893,11 @@ static bool extfs_find_in_dir(uint32_t dir_inode, const char *name,
     ext_inode_t inode;
     uint32_t file_size;
     uint32_t offset = 0;
+    uint32_t name_len;
+
+    if (name == NULL) {
+        return false;
+    }
 
     if (!extfs_read_inode_raw(dir_inode, &inode)) {
         return false;
@@ -841,24 +907,39 @@ static bool extfs_find_in_dir(uint32_t dir_inode, const char *name,
         return false;
     }
 
+    name_len = (uint32_t) strlen(name);
+    if (name_len == 0 || name_len > 255) {
+        return false;
+    }
     file_size = extfs_inode_file_size(&inode);
-    uint32_t name_len = (uint32_t) strlen(name);
 
     while (offset < file_size) {
         uint32_t block_index = offset / g_extfs_info.block_size;
         uint32_t block_offset = offset % g_extfs_info.block_size;
         uint32_t block = extfs_get_block_at(&inode, block_index);
+        ext_dir_entry_t *entry;
+        uint16_t rec_len;
 
         if (block == 0) {
+            return false;
+        }
+        if (block_offset + 8 > g_extfs_info.block_size) {
             return false;
         }
 
         extfs_read_block(block, g_extfs_block);
 
-        ext_dir_entry_t *entry = (ext_dir_entry_t *) (g_extfs_block + block_offset);
+        entry = (ext_dir_entry_t *) (g_extfs_block + block_offset);
+        rec_len = entry->rec_len;
 
-        if (entry->rec_len == 0) {
+        if (rec_len == 0) {
             break;
+        }
+        if (rec_len < 8 ||
+            (rec_len & 3) != 0 ||
+            block_offset + rec_len > g_extfs_info.block_size ||
+            entry->name_len > rec_len - 8) {
+            return false;
         }
 
         if (entry->name_len == name_len &&
@@ -872,7 +953,7 @@ static bool extfs_find_in_dir(uint32_t dir_inode, const char *name,
             return true;
         }
 
-        offset += entry->rec_len;
+        offset += rec_len;
     }
 
     return false;
@@ -960,8 +1041,26 @@ static bool extfs_resolve_path_internal(const char *path, uint32_t *out_inode, b
 
             /* 拼接剩余路径 */
             char full_path[512];
+            char base_path[256];
             uint32_t sym_len = strlen(symlink_target);
             uint32_t rest_len = strlen(rest);
+
+            if (symlink_target[0] != '/') {
+                if (!extfs_parent_path_for_cursor(path, cursor, base_path, sizeof(base_path))) {
+                    g_symlink_count--;
+                    return false;
+                }
+                if (!extfs_append_path_part(base_path, sizeof(base_path), symlink_target)) {
+                    g_symlink_count--;
+                    return false;
+                }
+                sym_len = strlen(base_path);
+                if (sym_len >= sizeof(symlink_target)) {
+                    g_symlink_count--;
+                    return false;
+                }
+                memcpy(symlink_target, base_path, sym_len + 1);
+            }
 
             if (rest[0] != '\0') {
                 if (sym_len + 1 + rest_len >= sizeof(full_path)) {

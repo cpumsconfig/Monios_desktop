@@ -80,6 +80,34 @@ char *strncpy(char *dst_, const char *src_, uint64_t n)
     return ret;
 }
 
+uint64_t strlcpy(char *dst_, const char *src_, uint64_t size)
+{
+    uint64_t src_len = 0;
+
+    if (src_ == NULL) {
+        if (dst_ != NULL && size > 0) {
+            dst_[0] = '\0';
+        }
+        return 0;
+    }
+
+    while (src_[src_len] != '\0') {
+        src_len++;
+    }
+
+    if (dst_ != NULL && size > 0) {
+        uint64_t copy_len = src_len;
+
+        if (copy_len >= size) {
+            copy_len = size - 1;
+        }
+        memcpy(dst_, src_, copy_len);
+        dst_[copy_len] = '\0';
+    }
+
+    return src_len;
+}
+
 char *strrchr(const char *str, int ch)
 {
     const char *last = NULL;

@@ -122,8 +122,10 @@ static void mouse_restore_cursor(void)
 void mouse_redraw_cursor(void)
 {
     if (graphics_active()) {
-        uint16_t gx = (uint16_t) (mouse_state.x_pixels > GRAPHICS_WIDTH - 1 ? GRAPHICS_WIDTH - 1 : mouse_state.x_pixels);
-        uint16_t gy = (uint16_t) (mouse_state.y_pixels > GRAPHICS_HEIGHT - 1 ? GRAPHICS_HEIGHT - 1 : mouse_state.y_pixels);
+        uint32_t width = graphics_framebuffer_width();
+        uint32_t height = graphics_framebuffer_height();
+        uint16_t gx = (uint16_t) (mouse_state.x_pixels > (int32_t) width - 1 ? width - 1 : mouse_state.x_pixels);
+        uint16_t gy = (uint16_t) (mouse_state.y_pixels > (int32_t) height - 1 ? height - 1 : mouse_state.y_pixels);
         graphics_mouse_redraw(gx, gy);
         return;
     }
@@ -161,8 +163,13 @@ static void mouse_apply_movement(int32_t dx, int32_t dy)
     if (mouse_state.x_pixels < 0) mouse_state.x_pixels = 0;
     if (mouse_state.y_pixels < 0) mouse_state.y_pixels = 0;
     if (graphics_active()) {
-        if (mouse_state.x_pixels > GRAPHICS_WIDTH - 1) mouse_state.x_pixels = GRAPHICS_WIDTH - 1;
-        if (mouse_state.y_pixels > GRAPHICS_HEIGHT - 1) mouse_state.y_pixels = GRAPHICS_HEIGHT - 1;
+        int32_t width = (int32_t) graphics_framebuffer_width();
+        int32_t height = (int32_t) graphics_framebuffer_height();
+
+        if (width < 1) width = 1;
+        if (height < 1) height = 1;
+        if (mouse_state.x_pixels > width - 1) mouse_state.x_pixels = width - 1;
+        if (mouse_state.y_pixels > height - 1) mouse_state.y_pixels = height - 1;
     } else {
         if (mouse_state.x_pixels > 639) mouse_state.x_pixels = 639;
         if (mouse_state.y_pixels > 399) mouse_state.y_pixels = 399;

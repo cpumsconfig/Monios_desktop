@@ -4,7 +4,7 @@
 #include "stdbool.h"
 #include "stdint.h"
 
-#define APP_ABI_VERSION      1U
+#define APP_ABI_VERSION      3U
 #define STDIN_FILENO         0U
 #define STDOUT_FILENO        1U
 #define STDERR_FILENO        2U
@@ -20,6 +20,54 @@
 #define APP_PRIV_R0 0U
 #define APP_PRIV_R2 2U
 #define APP_PRIV_R3 3U
+
+#define APP_INSTALLER_CHUNK_MAX (512U * 256U)
+#define APP_INSTALLER_MAX_TARGETS 6U
+#define APP_INSTALLER_TARGET_KIND_DISK 0U
+#define APP_INSTALLER_TARGET_KIND_PART 1U
+#define APP_INSTALLER_TARGET_KIND_UEFI_ESP 2U
+#define APP_INSTALLER_TARGET_WHOLE_DISK 0xFFU
+
+typedef struct {
+    uint8_t kind;
+    uint8_t partition_index;
+    uint8_t active;
+    uint8_t partition_type;
+    uint32_t start_lba;
+    uint32_t sector_count;
+} app_installer_target_info_t;
+
+typedef struct {
+    uint8_t disk_present;
+    uint8_t reserved[3];
+    uint32_t disk_sector_count;
+    char disk_model[41];
+    uint32_t target_count;
+    app_installer_target_info_t targets[APP_INSTALLER_MAX_TARGETS];
+} app_installer_target_list_t;
+
+typedef struct {
+    const char *source_path;
+    uint32_t source_offset;
+    uint32_t disk_lba;
+    uint32_t byte_count;
+    uint32_t bytes_written;
+} app_installer_write_request_t;
+
+typedef struct {
+    const void *data;
+    uint32_t disk_lba;
+    uint32_t byte_count;
+    uint32_t bytes_written;
+} app_installer_buffer_write_request_t;
+
+typedef struct {
+    const char *target_path;
+    const void *data;
+    uint32_t target_lba;
+    uint32_t byte_count;
+    uint32_t bytes_written;
+} app_installer_target_write_request_t;
 
 typedef struct {
     uint32_t abi_version;
@@ -50,6 +98,8 @@ typedef struct {
 
 typedef struct {
     uint32_t task_count;
+    uint32_t process_count;
+    int32_t current_pid;
     bool scheduler_stopping;
     bool shutdown_requested;
     bool reboot_requested;
@@ -89,13 +139,25 @@ typedef struct {
 
 const app_launch_info_t *app_launch_info(void);
 void app_runtime_set_launch_info(const app_launch_info_t *info);
+uint64_t app_ticks(void);
+void app_sleep_ticks(uint32_t ticks);
+void app_log(const char *text);
 int app_getcwd(char *buffer, uint32_t size);
 int app_get_mouse(app_mouse_snapshot_t *snapshot);
 int app_get_system_status(app_system_status_t *status);
+int app_file_read(const char *path, void *buffer, uint32_t size);
+int app_file_write(const char *path, const void *buffer, uint32_t size);
+int app_file_size(const char *path);
+bool app_file_exists(const char *path);
+bool app_file_is_dir(const char *path);
+bool app_file_delete(const char *path);
+bool app_file_mkdir(const char *path);
+bool app_file_rmdir(const char *path);
+int app_file_list_dir(const char *path, char *buffer, uint32_t size);
 void app_enter_graphics_mode(void);
-void app_open_cube3d_window(void);
 int app_audio_play_file(const char *path);
 int app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
+int app_graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
 void app_graphics_present(void);
 int app_socket_udp_open(uint16_t local_port);
 int app_socket_close(int handle);
@@ -112,6 +174,17 @@ uint32_t app_signal_take(int pid);
 void app_signal_clear(int pid);
 bool app_request_r2(const char *reason);
 bool app_request_r0(const char *reason);
+bool app_registry_get(const char *key, char *value, uint32_t value_size);
+bool app_registry_set(const char *key, const char *value);
+bool app_default_app_get(const char *extension, char *app_path, uint32_t app_path_size);
+bool app_default_app_set(const char *extension, const char *app_path);
+bool app_defer_exec(const char *path);
+bool app_installer_boot_media(void);
+int app_installer_list_targets(app_installer_target_list_t *list);
+int app_installer_write_disk(const char *source_path, uint32_t source_offset, uint32_t disk_lba, uint32_t byte_count);
+int app_installer_write_buffer(const void *data, uint32_t disk_lba, uint32_t byte_count);
+int app_installer_write_target_file(const char *target_path, const void *data, uint32_t target_lba, uint32_t byte_count);
+void app_installer_reboot(void);
 void app_exit(int code);
 
 #endif

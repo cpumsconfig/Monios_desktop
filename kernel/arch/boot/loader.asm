@@ -42,7 +42,9 @@ LABEL_START:
     mov sp, BaseOfStack
     mov [BootDrive], dl
 
-    mov word [wSectorNo], SectorNoOfRootDirectory
+    mov eax, [BPB_HiddSec]
+    add eax, SectorNoOfRootDirectory
+    mov dword [wSectorNo], eax
 LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     cmp word [wRootDirSizeForLoop], 0
     jz LABEL_NO_KERNELBIN
@@ -50,8 +52,7 @@ LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     mov ax, BaseOfKernelFile
     mov es, ax
     mov bx, OffsetOfKernelFile
-    xor eax, eax
-    mov ax, [wSectorNo]
+    mov eax, [wSectorNo]
     mov cl, 1
     call ReadSector
 
@@ -82,7 +83,7 @@ LABEL_DIFFERENT:
     mov si, KernelFileName
     jmp LABEL_SEARCH_FOR_KERNELBIN
 LABEL_GOTO_NEXT_SECTOR_IN_ROOT_DIR:
-    add word [wSectorNo], 1
+    add dword [wSectorNo], 1
     jmp LABEL_SEARCH_IN_ROOT_DIR_BEGIN
 LABEL_NO_KERNELBIN:
     mov al, 'K'
@@ -104,6 +105,7 @@ LABEL_FILENAME_FOUND:
     shl eax, 16
     mov ax, word [es:di + 01Ah]
     add eax, RootDirSectors + DeltaSectorNo
+    add eax, [BPB_HiddSec]
     mov dword [dwCurrentLba], eax
     mov dword [dwKernelLoadPhys], BaseOfKernelFilePhyAddr
     mov dword [dwKernelLoadPhys + 4], 0
@@ -152,7 +154,7 @@ dwFileSectors       dd 0
 dwCurrentLba        dd 0
 dwKernelLoadPhys    dq 0
 wRootDirSizeForLoop dw RootDirSectors
-wSectorNo           dw 0
+wSectorNo           dd 0
 bOdd                db 0
 BootDrive           db 0
 
@@ -321,5 +323,6 @@ LongModeEntry:
     mov rsp, StackTop64Phys
     mov rbp, rsp
 
+    xor r12d, r12d
     mov rax, BaseOfKernelFilePhyAddr
     jmp rax

@@ -1,4 +1,5 @@
 #include "common.h"
+#include "file.h"
 #include "fat32.h"
 
 #define ATA_DATA_PORT         0x1F0
@@ -89,7 +90,8 @@ static uint32_t g_data_lba;
 static uint32_t g_volume_lba;
 static uint32_t g_cluster_count;
 static bool g_fat32_ready;
-static const char *g_fat32_read_cache_path;
+static char g_fat32_read_cache_path[256];
+static bool g_fat32_read_cache_valid;
 static uint32_t g_fat32_read_cache_start_cluster;
 static uint32_t g_fat32_read_cache_cluster_index;
 static uint32_t g_fat32_read_cache_cluster;
@@ -102,7 +104,8 @@ static uint32_t fat32_entry_cluster(const fat32_dir_entry_t *entry);
 
 static void fat32_clear_read_cache(void)
 {
-    g_fat32_read_cache_path = NULL;
+    g_fat32_read_cache_path[0] = '\0';
+    g_fat32_read_cache_valid = false;
     g_fat32_read_cache_start_cluster = 0;
     g_fat32_read_cache_cluster_index = 0;
     g_fat32_read_cache_cluster = 0;
@@ -144,7 +147,7 @@ static bool fat32_bpb_is_valid(const fat32_bpb_t *bpb)
 
 static bool fat32_partition_type(uint8_t type)
 {
-    return type == 0x0B || type == 0x0C;
+    return type == 0x0B || type == 0x0C || type == 0xEF;
 }
 
 static bool ata_wait_not_busy(void)
@@ -451,9 +454,10 @@ static bool fat32_find_entry_in_dir(const fat32_dir_ref_t *dir, const char *name
     uint8_t sector[512];
     char target[11];
     uint32_t sector_cluster;
+    uint32_t sector_limit = g_bpb.sectors_per_cluster == 0 ? 1u : g_bpb.sectors_per_cluster * 32u;
 
     fat32_format_component(target, name);
-    for (uint32_t sector_index = 0; ; sector_index++) {
+    for (uint32_t sector_index = 0; sector_index < sector_limit; sector_index++) {
         if (!fat32_read_dir_sector(dir, sector_index, sector, &sector_cluster)) {
             return false;
         }
@@ -475,14 +479,16 @@ static bool fat32_find_entry_in_dir(const fat32_dir_ref_t *dir, const char *name
             }
         }
     }
+    return false;
 }
 
 static bool fat32_find_free_slot(fat32_dir_ref_t *dir, fat32_dir_slot_t *slot_out)
 {
     uint8_t sector[512];
     uint32_t sector_cluster;
+    uint32_t sector_limit = g_bpb.sectors_per_cluster == 0 ? 1u : g_bpb.sectors_per_cluster * 32u;
 
-    for (uint32_t sector_index = 0; ; sector_index++) {
+    for (uint32_t sector_index = 0; sector_index < sector_limit; sector_index++) {
         if (!fat32_read_dir_sector(dir, sector_index, sector, &sector_cluster)) {
             if (fat32_extend_dir(dir)) {
                 continue;
@@ -501,6 +507,7 @@ static bool fat32_find_free_slot(fat32_dir_ref_t *dir, fat32_dir_slot_t *slot_ou
             }
         }
     }
+    return false;
 }
 
 static bool fat32_write_slot(const fat32_dir_ref_t *dir, const fat32_dir_slot_t *slot)
@@ -626,12 +633,22 @@ bool fat32_init(void)
     uint8_t sector[512];
     uint32_t data_sectors;
     uint32_t data_start;
+    int32_t mount_hint = file_mount_partition_hint();
 
-    ata_read_sector(0, sector);
+    if (mount_hint >= 0) {
+        g_volume_lba = (uint32_t) mount_hint;
+        ata_read_sector(g_volume_lba, sector);
+    } else {
+        ata_read_sector(0, sector);
+        g_volume_lba = 0;
+    }
     memcpy(&g_bpb, sector, sizeof(g_bpb));
-    g_volume_lba = 0;
 
     if (!fat32_bpb_is_valid(&g_bpb)) {
+        if (mount_hint >= 0) {
+            g_fat32_ready = false;
+            return false;
+        }
         if (read_le16(sector + 510) != 0xAA55) {
             g_fat32_ready = false;
             return false;
@@ -823,7 +840,8 @@ int32_t fat32_read_file_at(const char *path, uint32_t offset, void *buffer, uint
     target_cluster_index = offset / cluster_bytes;
     offset_in_cluster = offset % cluster_bytes;
 
-    if (g_fat32_read_cache_path == path &&
+    if (g_fat32_read_cache_valid &&
+        strcmp(g_fat32_read_cache_path, path) == 0 &&
         g_fat32_read_cache_start_cluster == first_cluster &&
         g_fat32_read_cache_cluster >= 2 &&
         g_fat32_read_cache_cluster < g_cluster_count + 2 &&
@@ -842,7 +860,8 @@ int32_t fat32_read_file_at(const char *path, uint32_t offset, void *buffer, uint
         }
     }
 
-    g_fat32_read_cache_path = path;
+    strlcpy(g_fat32_read_cache_path, path, sizeof(g_fat32_read_cache_path));
+    g_fat32_read_cache_valid = strlen(path) < sizeof(g_fat32_read_cache_path);
     g_fat32_read_cache_start_cluster = first_cluster;
     g_fat32_read_cache_cluster_index = target_cluster_index;
     g_fat32_read_cache_cluster = cluster;

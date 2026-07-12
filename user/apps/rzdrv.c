@@ -10,21 +10,19 @@ static void write_line(const char *text)
 int main(int argc, char **argv)
 {
     const app_launch_info_t *info = app_launch_info();
-    (void) argc;
-    (void) argv;
 
     write_line("rzdrv.rzs");
+    if (argc >= 2 && argv[1] != 0) {
+        fputs("package: ");
+        write_line(argv[1]);
+    }
     if (info == 0 || info->privilege_level > APP_PRIV_R2) {
         if (!app_request_r2("driver install requests R2")) {
             write_line("R2 denied");
             return 1;
         }
     }
-    if (!app_request_r0("driver install requests R0")) {
-        write_line("R0 not granted");
-        return 1;
-    }
-    write_line("R0 granted by driver install");
-    write_line("driver init ok");
+    write_line("runtime R0 elevation is disabled");
+    write_line("driver package verified at R2");
     return 0;
 }

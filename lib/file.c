@@ -14,6 +14,7 @@
 
 static mount_point_t g_mount_points[MAX_MOUNT_POINTS];
 static int32_t g_mount_count = 0;
+static int32_t g_pending_mount_partition = -1;
 
 /* 当前激活的文件系统（用于全局操作） */
 static fs_type_t g_current_fs = FS_TYPE_NONE;
@@ -162,9 +163,12 @@ static bool switch_to_mount(int32_t mount_idx, const char **relative_path)
     }
 
     /* 切换文件系统（重新初始化） */
+    g_pending_mount_partition = g_mount_points[mount_idx].partition;
     if (!fs_init_by_type(g_mount_points[mount_idx].fs_type)) {
+        g_pending_mount_partition = -1;
         return false;
     }
+    g_pending_mount_partition = -1;
 
     g_current_fs = g_mount_points[mount_idx].fs_type;
     strcpy(g_current_mount_path, g_mount_points[mount_idx].path);
@@ -220,9 +224,12 @@ bool file_mount(const char *mount_path, const char *fs_type, int32_t partition)
 
     /* 尝试初始化文件系统 */
     /* 注意：这里暂时不处理分区号，使用默认的自动探测 */
+    g_pending_mount_partition = partition;
     if (!fs_init_by_type(type)) {
+        g_pending_mount_partition = -1;
         return false;
     }
+    g_pending_mount_partition = -1;
 
     /* 添加到挂载点表 */
     strcpy(g_mount_points[empty_idx].path, mount_path);
@@ -264,7 +271,9 @@ bool file_umount(const char *mount_path)
                     int32_t j;
                     for (j = 0; j < MAX_MOUNT_POINTS; j++) {
                         if (g_mount_points[j].mounted) {
-                            fs_init_by_type(g_mount_points[j].fs_type);
+                            g_pending_mount_partition = g_mount_points[j].partition;
+                            (void) fs_init_by_type(g_mount_points[j].fs_type);
+                            g_pending_mount_partition = -1;
                             g_current_fs = g_mount_points[j].fs_type;
                             strcpy(g_current_mount_path, g_mount_points[j].path);
                             break;
@@ -286,6 +295,21 @@ bool file_umount(const char *mount_path)
 int32_t file_mount_count(void)
 {
     return g_mount_count;
+}
+
+int32_t file_mount_partition_hint(void)
+{
+    int32_t i;
+
+    if (g_pending_mount_partition >= 0) {
+        return g_pending_mount_partition;
+    }
+    for (i = 0; i < MAX_MOUNT_POINTS; i++) {
+        if (g_mount_points[i].mounted && g_mount_points[i].partition >= 0) {
+            return g_mount_points[i].partition;
+        }
+    }
+    return -1;
 }
 
 bool file_get_mount_info(int32_t index, mount_point_t *info)
@@ -553,6 +577,7 @@ bool file_init(void)
         g_mount_points[i].partition = -1;
     }
     g_mount_count = 0;
+    g_pending_mount_partition = -1;
     g_current_fs = FS_TYPE_NONE;
     g_current_mount_path[0] = '\0';
 
@@ -572,6 +597,13 @@ const char *file_backend_name(void)
 bool file_auto_mount(void)
 {
     /* 依次尝试各种文件系统，挂载到根目录 */
+    if (file_mount("/", "iso9660", -1)) {
+        if (file_exists("/INSTALL.FLG")) {
+            return true;
+        }
+        file_umount("/");
+    }
+
     if (file_mount("/", "fat32", -1)) {
         return true;
     }

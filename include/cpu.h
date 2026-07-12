@@ -64,6 +64,7 @@ void cpu_enable_fpu_sse(void);
 bool cpu_fpu_enabled(void);
 const cpu_info_t *cpu_current_info(void);
 void cpu_log_info(void);
+uint64_t cpu_read_tsc(void);
 
 /* MSR 操作 */
 uint64_t cpu_read_msr(uint32_t msr);

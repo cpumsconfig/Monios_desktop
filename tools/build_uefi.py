@@ -173,6 +173,7 @@ _start:
     mov al, 'K'
     call serial_putc
     cli
+    mov r12d, 1
     mov rax, KERNEL_LOAD_PHYS
     jmp rax
 

@@ -195,7 +195,6 @@ def build_esp_image(
     kernel_path: Path,
     setup_path: Path | None,
     font_path: Path | None,
-    password_path: Path | None,
 ) -> bytes:
     if esp_path.exists():
         esp_path.unlink()
@@ -208,13 +207,11 @@ def build_esp_image(
     if font_path is not None and font_path.exists():
         image.add_file(font_path, "/FONTS/MSYH.TTC")
         image.add_file(font_path, "/MSYH.TTC")
-    if password_path is not None and password_path.exists():
-        image.add_file(password_path, "/pwd.txt")
 
     install_txt = staging / "INSTALL.TXT"
     install_txt.write_text(
         "MoniOS UEFI installer media\r\n"
-        "Run SETUP.ELF from MoniOS to install BOOTX64.EFI and KERNEL.BIN.\r\n",
+        "Boot this ISO to install SYSTEM_UEFI.IMG or SYSTEM_MBR.IMG to disk.\r\n",
         encoding="ascii",
     )
     install_flg = staging / "INSTALL.FLG"
@@ -284,13 +281,21 @@ def main() -> None:
     parser.add_argument("--kernel", type=Path, default=PROJECT_DIR / "out" / "kernel.bin")
     parser.add_argument("--setup", type=Path, default=PROJECT_DIR / "out" / "setup.elf")
     parser.add_argument("--font", type=Path, default=PROJECT_DIR / "out" / "msyh.ttc")
-    parser.add_argument("--password", type=Path, default=PROJECT_DIR / "pwd.txt")
+    parser.add_argument("--system-uefi", type=Path, default=PROJECT_DIR / "hd_uefi.img")
+    parser.add_argument("--system-mbr", type=Path, default=PROJECT_DIR / "hd.img")
+    parser.add_argument("--boot-bin", type=Path, default=PROJECT_DIR / "out" / "boot.bin")
     args = parser.parse_args()
 
     if not args.efi.exists():
         raise SystemExit(f"missing UEFI loader: {args.efi}")
     if not args.kernel.exists():
         raise SystemExit(f"missing kernel: {args.kernel}")
+    if not args.system_uefi.exists():
+        raise SystemExit(f"missing UEFI system image: {args.system_uefi}")
+    if not args.system_mbr.exists():
+        raise SystemExit(f"missing MBR system image: {args.system_mbr}")
+    if not args.boot_bin.exists():
+        raise SystemExit(f"missing BIOS boot sector: {args.boot_bin}")
 
     staging = PROJECT_DIR / "out" / "uefi_iso_staging"
     if staging.exists():
@@ -304,7 +309,6 @@ def main() -> None:
         args.kernel,
         args.setup if args.setup.exists() else None,
         args.font if args.font.exists() else None,
-        args.password if args.password.exists() else None,
     )
     install_txt = (staging / "INSTALL.TXT").read_bytes()
     install_flg = (staging / "INSTALL.FLG").read_bytes()
@@ -317,13 +321,14 @@ def main() -> None:
         IsoFile(b"INSTALL.TXT;1", install_txt),
         IsoFile(b"INSTALL.FLG;1", install_flg),
         IsoFile(b"MONIOS.INI;1", monios_ini),
+        IsoFile(b"SYSTEM_UEFI.IMG;1", args.system_uefi.read_bytes()),
+        IsoFile(b"SYSTEM_MBR.IMG;1", args.system_mbr.read_bytes()),
+        IsoFile(b"BOOT.BIN;1", args.boot_bin.read_bytes()),
     ]
     if args.setup.exists():
         root_files.append(IsoFile(b"SETUP.ELF;1", args.setup.read_bytes()))
     if args.font.exists():
         root_files.append(IsoFile(b"MSYH.TTC;1", args.font.read_bytes()))
-    if args.password.exists():
-        root_files.append(IsoFile(b"PWD.TXT;1", args.password.read_bytes()))
 
     build_iso(args.output, esp_data, root_files)
     print(f"UEFI ISO: {args.output} ({args.output.stat().st_size} bytes)")

@@ -7,6 +7,13 @@
 #include "string.h"
 #include "syscall.h"
 
+#define APP_INSTALLER_CALL_BOOT_MEDIA 0U
+#define APP_INSTALLER_CALL_WRITE_DISK 1U
+#define APP_INSTALLER_CALL_REBOOT     2U
+#define APP_INSTALLER_CALL_WRITE_TARGET 3U
+#define APP_INSTALLER_CALL_LIST_TARGETS 4U
+#define APP_INSTALLER_CALL_WRITE_BUFFER 5U
+
 static const app_launch_info_t *g_launch_info;
 
 const app_launch_info_t *app_launch_info(void)
@@ -17,6 +24,25 @@ const app_launch_info_t *app_launch_info(void)
 void app_runtime_set_launch_info(const app_launch_info_t *info)
 {
     g_launch_info = info;
+}
+
+uint64_t app_ticks(void)
+{
+    return syscall0(SYS_GET_TICKS);
+}
+
+void app_sleep_ticks(uint32_t ticks)
+{
+    uint64_t end = app_ticks() + ticks;
+
+    while (app_ticks() < end) {
+        asm volatile ("pause");
+    }
+}
+
+void app_log(const char *text)
+{
+    (void) syscall1(SYS_LOG_STRING, (uint64_t) text);
 }
 
 int app_getcwd(char *buffer, uint32_t size)
@@ -34,14 +60,54 @@ int app_get_system_status(app_system_status_t *status)
     return (int) syscall2(SYS_SYSTEM_STATUS, (uint64_t) status, sizeof(*status));
 }
 
+int app_file_read(const char *path, void *buffer, uint32_t size)
+{
+    return (int) syscall3(SYS_FILE_READ, (uint64_t) path, (uint64_t) buffer, size);
+}
+
+int app_file_write(const char *path, const void *buffer, uint32_t size)
+{
+    return (int) syscall3(SYS_FILE_WRITE, (uint64_t) path, (uint64_t) buffer, size);
+}
+
+int app_file_size(const char *path)
+{
+    return (int) syscall1(SYS_FILE_SIZE, (uint64_t) path);
+}
+
+bool app_file_exists(const char *path)
+{
+    return syscall1(SYS_FILE_EXISTS, (uint64_t) path) != 0;
+}
+
+bool app_file_is_dir(const char *path)
+{
+    return syscall1(SYS_FILE_IS_DIR, (uint64_t) path) != 0;
+}
+
+bool app_file_delete(const char *path)
+{
+    return syscall1(SYS_FILE_DELETE, (uint64_t) path) == 0;
+}
+
+bool app_file_mkdir(const char *path)
+{
+    return syscall1(SYS_FILE_MKDIR, (uint64_t) path) == 0;
+}
+
+bool app_file_rmdir(const char *path)
+{
+    return syscall1(SYS_FILE_RMDIR, (uint64_t) path) == 0;
+}
+
+int app_file_list_dir(const char *path, char *buffer, uint32_t size)
+{
+    return (int) syscall3(SYS_FILE_LIST_DIR, (uint64_t) path, (uint64_t) buffer, size);
+}
+
 void app_enter_graphics_mode(void)
 {
     (void) syscall0(SYS_ENTER_GRAPHICS_MODE);
-}
-
-void app_open_cube3d_window(void)
-{
-    (void) syscall0(SYS_OPEN_CUBE3D_WINDOW);
 }
 
 int app_audio_play_file(const char *path)
@@ -54,6 +120,13 @@ int app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t heig
     uint64_t pos = ((uint64_t) x << 48) | ((uint64_t) y << 32) | ((uint64_t) width << 16) | height;
 
     return (int) syscall2(SYS_GRAPHICS_FILL_RECT, pos, color);
+}
+
+int app_graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color)
+{
+    uint64_t pos = ((uint64_t) x << 48) | ((uint64_t) y << 32);
+
+    return (int) syscall3(SYS_GRAPHICS_DRAW_TEXT, pos, (uint64_t) text, color);
 }
 
 void app_graphics_present(void)
@@ -241,6 +314,96 @@ bool app_request_r2(const char *reason)
 bool app_request_r0(const char *reason)
 {
     return syscall1(SYS_REQUEST_R0, (uint64_t) reason) == 0;
+}
+
+bool app_registry_get(const char *key, char *value, uint32_t value_size)
+{
+    return syscall3(SYS_REGISTRY_GET, (uint64_t) key, (uint64_t) value, value_size) == 0;
+}
+
+bool app_registry_set(const char *key, const char *value)
+{
+    return syscall2(SYS_REGISTRY_SET, (uint64_t) key, (uint64_t) value) == 0;
+}
+
+bool app_default_app_get(const char *extension, char *app_path, uint32_t app_path_size)
+{
+    return syscall3(SYS_DEFAULT_APP_GET, (uint64_t) extension, (uint64_t) app_path, app_path_size) == 0;
+}
+
+bool app_default_app_set(const char *extension, const char *app_path)
+{
+    return syscall2(SYS_DEFAULT_APP_SET, (uint64_t) extension, (uint64_t) app_path) == 0;
+}
+
+bool app_defer_exec(const char *path)
+{
+    return syscall1(SYS_EXEC_DEFER, (uint64_t) path) == 0;
+}
+
+bool app_installer_boot_media(void)
+{
+    return syscall3(SYS_INSTALLER_CALL, APP_INSTALLER_CALL_BOOT_MEDIA, 0, 0) != 0;
+}
+
+int app_installer_list_targets(app_installer_target_list_t *list)
+{
+    if (list == NULL) {
+        return -1;
+    }
+    return (int) syscall3(SYS_INSTALLER_CALL,
+                          APP_INSTALLER_CALL_LIST_TARGETS,
+                          (uint64_t) list,
+                          sizeof(*list));
+}
+
+int app_installer_write_disk(const char *source_path, uint32_t source_offset, uint32_t disk_lba, uint32_t byte_count)
+{
+    app_installer_write_request_t request;
+
+    request.source_path = source_path;
+    request.source_offset = source_offset;
+    request.disk_lba = disk_lba;
+    request.byte_count = byte_count;
+    request.bytes_written = 0;
+    return (int) syscall3(SYS_INSTALLER_CALL,
+                          APP_INSTALLER_CALL_WRITE_DISK,
+                          (uint64_t) &request,
+                          sizeof(request));
+}
+
+int app_installer_write_buffer(const void *data, uint32_t disk_lba, uint32_t byte_count)
+{
+    app_installer_buffer_write_request_t request;
+
+    request.data = data;
+    request.disk_lba = disk_lba;
+    request.byte_count = byte_count;
+    request.bytes_written = 0;
+    return (int) syscall3(SYS_INSTALLER_CALL,
+                          APP_INSTALLER_CALL_WRITE_BUFFER,
+                          (uint64_t) &request,
+                          sizeof(request));
+}
+
+int app_installer_write_target_file(const char *target_path, const void *data, uint32_t target_lba, uint32_t byte_count)
+{
+    app_installer_target_write_request_t request;
+
+    request.target_path = target_path;
+    request.data = data;
+    request.target_lba = target_lba;
+    request.byte_count = byte_count;
+    request.bytes_written = 0;
+    return (int) syscall3(SYS_INSTALLER_CALL,
+                          APP_INSTALLER_CALL_WRITE_TARGET,
+                          (uint64_t) &request,
+                          sizeof(request));
+}
+
+void app_installer_reboot(void)
+{
+    (void) syscall3(SYS_INSTALLER_CALL, APP_INSTALLER_CALL_REBOOT, 0, 0);
 }
 
 void app_exit(int code)

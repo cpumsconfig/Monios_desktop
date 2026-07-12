@@ -33,6 +33,7 @@ bool file_mount(const char *mount_path, const char *fs_type, int32_t partition);
 bool file_umount(const char *mount_path);
 int32_t file_mount_count(void);
 bool file_get_mount_info(int32_t index, mount_point_t *info);
+int32_t file_mount_partition_hint(void);
 bool file_auto_mount(void);  /* 自动探测并挂载到 / */
 
 /* 文件操作 */

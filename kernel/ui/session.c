@@ -9,16 +9,17 @@
 #define SESSION_AUTH_FILE_MAX 160
 #define SESSION_HASH_OUTPUT_MAX 96
 #define SESSION_COMBINED_SECRET_MAX 96
-#define SESSION_DEFAULT_PASSWORD "123456"
-#define SESSION_ROOT_RESCUE_PASSWORD "root"
 #define SESSION_DEFAULT_SALT "monios"
 #define SESSION_DEFAULT_HASH "2u07D1xwCZ0h9oLnVxzk7cZwMDDp4oBvm4+JfXFk48Y="
+#define SESSION_MAX_FAILED_ATTEMPTS 5U
 
 static session_user_t g_users[SESSION_USER_MAX];
 static uint32_t g_user_count;
 static uint32_t g_current_user_index;
 static char g_default_desktop_app[32];
 static char g_default_logon_app[32];
+static uint32_t g_auth_failed_attempts;
+static bool g_auth_locked;
 
 static void session_add_user(const char *name, const char *home)
 {
@@ -82,13 +83,6 @@ static void session_trim_in_place(char *text)
     text[end] = '\0';
 }
 
-static bool session_is_default_password(const char *password)
-{
-    return password != NULL &&
-           (strcmp(password, SESSION_DEFAULT_PASSWORD) == 0 ||
-            strcmp(password, SESSION_ROOT_RESCUE_PASSWORD) == 0);
-}
-
 static bool session_compute_salted_password_hash(const char *salt, const char *password, char *output, uint32_t output_size)
 {
     char combined[SESSION_COMBINED_SECRET_MAX];
@@ -111,6 +105,8 @@ static void session_init_defaults(void)
 {
     g_user_count = 0;
     g_current_user_index = 0;
+    g_auth_failed_attempts = 0;
+    g_auth_locked = false;
     strcpy(g_default_desktop_app, "/apps/explorar.exe");
     strcpy(g_default_logon_app, "/apps/monilog.exe");
     session_add_user("root", "/home/root");
@@ -210,13 +206,13 @@ bool session_verify_password(const char *password)
     if (password == NULL) {
         return false;
     }
+    if (g_auth_locked) {
+        log_write("auth: locked after repeated failures");
+        return false;
+    }
 
     size = file_read(SESSION_AUTH_PATH, entry, sizeof(entry) - 1);
     if (size <= 0) {
-        if (session_is_default_password(password)) {
-            log_write("auth: pwd.txt missing, default password accepted");
-            return true;
-        }
         log_write("auth: pwd.txt missing");
         return false;
     }
@@ -224,10 +220,6 @@ bool session_verify_password(const char *password)
     entry[size] = '\0';
     session_trim_in_place(entry);
     if (entry[0] == '\0') {
-        if (session_is_default_password(password)) {
-            log_write("auth: pwd.txt empty, default password accepted");
-            return true;
-        }
         log_write("auth: pwd.txt empty");
         return false;
     }
@@ -249,36 +241,26 @@ bool session_verify_password(const char *password)
     session_trim_in_place(salt);
     session_trim_in_place(expected_hash);
     if (expected_hash[0] == '\0') {
-        if (session_is_default_password(password)) {
-            log_write("auth: pwd.txt hash empty, default password accepted");
-            return true;
-        }
         log_write("auth: pwd.txt hash empty");
         return false;
     }
-    if (delimiter == NULL && strcmp(expected_hash, password) == 0) {
-        return true;
+    if (delimiter == NULL) {
+        log_write("auth: pwd.txt format invalid");
+        return false;
     }
     if (!session_compute_salted_password_hash(salt, password, computed, sizeof(computed))) {
-        if (session_is_default_password(password) &&
-            strcmp(salt, SESSION_DEFAULT_SALT) == 0 &&
-            strcmp(expected_hash, SESSION_DEFAULT_HASH) == 0) {
-            log_write("auth: default password accepted");
-            return true;
-        }
         log_write("auth: hash compute failed");
         return false;
     }
     if (strcmp(expected_hash, computed) != 0) {
-        if (session_is_default_password(password) &&
-            strcmp(salt, SESSION_DEFAULT_SALT) == 0 &&
-            strcmp(expected_hash, SESSION_DEFAULT_HASH) == 0) {
-            log_write("auth: default password accepted");
-            return true;
+        if (++g_auth_failed_attempts >= SESSION_MAX_FAILED_ATTEMPTS) {
+            g_auth_locked = true;
+            log_write("auth: locked");
         }
         log_write("auth: password rejected");
         return false;
     }
+    g_auth_failed_attempts = 0;
     return true;
 }
 

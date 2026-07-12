@@ -12,6 +12,7 @@
 #include "memory.h"
 #include "mouse.h"
 #include "net.h"
+#include "registry.h"
 #include "session.h"
 #include "shell.h"
 #include "task.h"
@@ -47,35 +48,59 @@
 #define SVGA_ID_2              0x90000002
 #define SVGA_ENABLE_ENABLE     0x00000001
 
-#define FB_WIDTH  GRAPHICS_WIDTH
-#define FB_HEIGHT GRAPHICS_HEIGHT
-#define TASKBAR_HEIGHT 48
-#define BUTTON_WIDTH 120
-#define BUTTON_HEIGHT 30
-#define BUTTON_GAP 12
-#define BUTTON_Y (FB_HEIGHT - TASKBAR_HEIGHT + 9)
-#define DESKTOP_LABEL_MAX 8
-#define START_BUTTON_WIDTH 96
+#define GRAPHICS_MAX_WIDTH  1440
+#define GRAPHICS_MAX_HEIGHT 900
+#define FB_WIDTH  g_graphics_width
+#define FB_HEIGHT g_graphics_height
+#define TASKBAR_HEIGHT 54
+#define BUTTON_WIDTH 44
+#define BUTTON_HEIGHT 34
+#define BUTTON_GAP 8
+#define BUTTON_Y (FB_HEIGHT - TASKBAR_HEIGHT + 10)
+#define DESKTOP_LABEL_MAX 24
+#define START_BUTTON_WIDTH 44
 #define DESKTOP_ICON_W 74
 #define DESKTOP_ICON_H 82
 #define DESKTOP_ICON_GAP_Y 14
 #define DESKTOP_ICON_GAP_X 18
 #define DESKTOP_ICON_START_X 22
 #define DESKTOP_ICON_START_Y 22
-#define UI_WINDOW_MAX 8
+#define DESKTOP_ICON_COLS 3
+#define CONTEXT_MENU_W 170
+#define CONTEXT_MENU_DESKTOP_H 104
+#define CONTEXT_MENU_FILES_H 128
+#define UI_WINDOW_MAX 10
 #define MONIOS_VERSION "1.0"
 #define UI_MENU_ITEM_H 24
+#define START_MENU_HEADER_H 36
 #define UI_DESKTOP_POLL_TICKS 30
-#define UI_TITLEBAR_H 24
-#define UI_TASK_BUTTON_W 108
-#define FB_PIXELS (FB_WIDTH * FB_HEIGHT)
+#define UI_TITLEBAR_H 28
+#define UI_TASK_BUTTON_W 44
+#define START_MENU_W 528
+#define START_MENU_H 272
+#define START_MENU_LEFT_W 144
+#define START_MENU_MID_W 176
+#define START_MENU_RIGHT_W 176
+#define START_MENU_PAD 8
+#define START_MENU_X 12
+#define FB_PIXELS (GRAPHICS_MAX_WIDTH * GRAPHICS_MAX_HEIGHT)
 #define GRAPHICS_LOGIN_USERNAME_MAX 16
 #define GRAPHICS_LOGIN_PASSWORD_MAX 64
-#define GRAPHICS_FILE_NAME_MAX 16
+#define GRAPHICS_FILE_NAME_MAX 32
 #define GRAPHICS_FILE_PATH_MAX 64
 #define GRAPHICS_CLIPBOARD_PATH_MAX 256
 #define GRAPHICS_NOTEPAD_TEXT_MAX 2048
 #define GRAPHICS_UAC_TEXT_MAX 96
+#define GRAPHICS_CURSOR_CONFIG_PATH "/cursor.cfg"
+#define UI_COLOR_WINDOW_BG 0x00F8FAFE
+#define UI_COLOR_WINDOW_EDGE 0x00CED7E4
+#define UI_COLOR_TITLE_BG 0x00F4F7FC
+#define UI_COLOR_TITLE_TEXT 0x001C2430
+#define UI_COLOR_ACCENT 0x003C6FEA
+#define UI_COLOR_ACCENT_DARK 0x002B52B8
+#define UI_COLOR_WARN 0x00D94C5A
+#define UI_COLOR_TASKBAR 0x00EFF5FC
+#define UI_COLOR_TASKBAR_EDGE 0x00D4E0ED
 
 typedef struct {
     const char *label;
@@ -96,7 +121,8 @@ typedef enum {
     UI_WINDOW_CUBE3D,
     UI_WINDOW_CONTEXT,
     UI_WINDOW_POWER,
-    UI_WINDOW_UAC
+    UI_WINDOW_UAC,
+    UI_WINDOW_CONTROL_PANEL
 } ui_window_kind_t;
 
 typedef enum {
@@ -116,13 +142,43 @@ typedef enum {
     UI_CONTEXT_MENU_FILES
 } ui_context_menu_mode_t;
 
+typedef enum {
+    UI_START_MENU_ROOT = 0,
+    UI_START_MENU_APPS,
+    UI_START_MENU_SETTINGS,
+    UI_START_MENU_DISPLAY,
+    UI_START_MENU_CURSOR,
+    UI_START_MENU_NETWORK,
+    UI_START_MENU_POWER
+} ui_start_menu_view_t;
+
+typedef enum {
+    GRAPHICS_ICON_FILE = 0,
+    GRAPHICS_ICON_FOLDER,
+    GRAPHICS_ICON_APP,
+    GRAPHICS_ICON_AUDIO,
+    GRAPHICS_ICON_PACKAGE,
+    GRAPHICS_ICON_DLL,
+    GRAPHICS_ICON_SHORTCUT,
+    GRAPHICS_ICON_TERMINAL,
+    GRAPHICS_ICON_SETTINGS,
+    GRAPHICS_ICON_INFO,
+    GRAPHICS_ICON_WINDOW
+} graphics_icon_kind_t;
+
 typedef struct {
     bool visible;
+    bool minimized;
+    bool maximized;
     ui_window_kind_t kind;
     uint16_t x;
     uint16_t y;
     uint16_t width;
     uint16_t height;
+    uint16_t restore_x;
+    uint16_t restore_y;
+    uint16_t restore_width;
+    uint16_t restore_height;
     char title[24];
 } ui_window_t;
 
@@ -131,16 +187,39 @@ typedef struct {
     bool is_dir;
 } graphics_file_item_t;
 
+typedef struct {
+    uint16_t width;
+    uint16_t height;
+    const char *label;
+} graphics_mode_t;
+
+typedef struct {
+    const char *label;
+    const uint16_t *shape;
+    const uint16_t *fill;
+    uint32_t fill_color;
+    uint32_t outline_color;
+} graphics_cursor_style_t;
+
 static const graphics_button_t g_taskbar_buttons[] = {
     { "\u6587\u4ef6", 0x002F7FD3 },
     { "\u7ec8\u7aef", 0x004A8A44 },
+    { "\u8bbe\u7f6e", 0x006A67CE },
     { "\u5173\u4e8e", 0x00C06C2B }
 };
 
-static char g_desktop_entries[DESKTOP_LABEL_MAX][16];
+static const graphics_mode_t g_graphics_modes[] = {
+    { 1024, 768, "1024x768" },
+    { 1280, 800, "1280x800" },
+    { 1366, 768, "1366x768" },
+    { 1440, 900, "1440x900" }
+};
+
+static graphics_file_item_t g_desktop_entries[DESKTOP_LABEL_MAX];
 static uint32_t g_desktop_entry_count;
 static uint32_t g_active_button_index;
 static bool g_start_menu_open;
+static ui_start_menu_view_t g_start_menu_view;
 static bool g_context_menu_open;
 static bool g_power_menu_open;
 static uint16_t g_power_menu_x;
@@ -157,6 +236,9 @@ static uint64_t g_last_status_tick;
 static uint64_t g_last_click_tick;
 static uint32_t g_last_click_index;
 static ui_click_source_t g_last_click_source;
+static bool g_rainbow_cat_open;
+static uint64_t g_rainbow_cat_last_click_tick;
+static uint8_t g_rainbow_cat_click_count;
 static ui_window_t g_windows[UI_WINDOW_MAX];
 static char g_run_input[64];
 static uint32_t g_run_input_len;
@@ -204,23 +286,66 @@ static float g_cube3d_angle_y;
 static float g_cube3d_angle_z;
 static uint64_t g_cube3d_last_tick;
 
-static const uint16_t g_cursor_shape[16] = {
+static const uint16_t g_cursor_arrow_shape[16] = {
     0x8000, 0xC000, 0xE000, 0xF000,
     0xF800, 0xFC00, 0xFE00, 0xFF00,
     0xFFE0, 0xFC00, 0xCC00, 0x8C00,
     0x0600, 0x0600, 0x0300, 0x0000
 };
 
-static const uint16_t g_cursor_fill[16] = {
+static const uint16_t g_cursor_arrow_fill[16] = {
     0x0000, 0x4000, 0x6000, 0x7000,
     0x7800, 0x7C00, 0x7E00, 0x7F00,
     0x7FE0, 0x6C00, 0x4C00, 0x0C00,
     0x0400, 0x0000, 0x0000, 0x0000
 };
 
+static const uint16_t g_cursor_dot_shape[16] = {
+    0x0000, 0x0000, 0x0780, 0x1FE0,
+    0x3FF0, 0x7FF8, 0x7FF8, 0x7FF8,
+    0x7FF8, 0x7FF8, 0x3FF0, 0x1FE0,
+    0x0780, 0x0000, 0x0000, 0x0000
+};
+
+static const uint16_t g_cursor_dot_fill[16] = {
+    0x0000, 0x0000, 0x0000, 0x0780,
+    0x1FE0, 0x3FF0, 0x3FF0, 0x3FF0,
+    0x3FF0, 0x3FF0, 0x1FE0, 0x0780,
+    0x0000, 0x0000, 0x0000, 0x0000
+};
+
+static const uint16_t g_cursor_cross_shape[16] = {
+    0x0180, 0x0180, 0x0180, 0x0180,
+    0x0180, 0x0180, 0x7FFE, 0x7FFE,
+    0x7FFE, 0x0180, 0x0180, 0x0180,
+    0x0180, 0x0180, 0x0180, 0x0000
+};
+
+static const uint16_t g_cursor_cross_fill[16] = {
+    0x0000, 0x0180, 0x0180, 0x0180,
+    0x0180, 0x0000, 0x0180, 0x3FFC,
+    0x0180, 0x0000, 0x0180, 0x0180,
+    0x0180, 0x0180, 0x0000, 0x0000
+};
+
+static const graphics_cursor_style_t g_cursor_styles[] = {
+    { "\u7ecf\u5178", g_cursor_arrow_shape, g_cursor_arrow_fill, 0x00FFFFFF, 0x00000000 },
+    { "\u84dd\u8272", g_cursor_arrow_shape, g_cursor_arrow_fill, 0x008FD3FF, 0x001B4F7A },
+    { "\u91d1\u8272", g_cursor_arrow_shape, g_cursor_arrow_fill, 0x00FFE08A, 0x006B4E00 },
+    { "\u5706\u70b9", g_cursor_dot_shape, g_cursor_dot_fill, 0x00FFFFFF, 0x00256EC8 },
+    { "\u5341\u5b57", g_cursor_cross_shape, g_cursor_cross_fill, 0x00FFFFFF, 0x00B13434 }
+};
+
 static bool g_graphics_active;
+static bool g_installer_mode;
 static bool g_graphics_vmware_backend;
 static uint32_t g_graphics_framebuffer_addr;
+static uint16_t g_graphics_width = GRAPHICS_WIDTH;
+static uint16_t g_graphics_height = GRAPHICS_HEIGHT;
+static uint8_t g_graphics_mode_index = 0;
+static uint8_t g_cursor_style_index = 0;
+static bool g_graphics_fast_mode_switch;
+static bool g_graphics_boot_animation_mode;
 static bool g_session_logged_in;
 static bool g_double_buffer_enabled = true;
 static bool g_vsync_enabled = false;
@@ -251,15 +376,43 @@ typedef struct {
 
 static void graphics_open_window(ui_window_kind_t kind);
 static void graphics_close_window(uint32_t index);
+static void graphics_minimize_window(uint32_t index);
+static void graphics_toggle_maximize_window(uint32_t index);
+static void graphics_open_start_menu_view(ui_start_menu_view_t view);
+static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y);
 static void graphics_open_path(const char *path);
 static void graphics_run_command_text(const char *command);
+static bool graphics_launch_user_program(const char *path);
+static bool graphics_launch_user_program_with_arg(const char *path, const char *arg);
+static bool graphics_launch_named_user_program(const char *name);
 static int32_t graphics_find_window(ui_window_kind_t kind);
 static void graphics_bring_window_to_front(uint32_t index);
+static int32_t graphics_find_mode_index(uint16_t width, uint16_t height);
+static uint16_t graphics_power_menu_top(void);
+static void graphics_reflow_windows(void);
+static bool graphics_set_resolution(uint16_t width, uint16_t height);
 static bool graphics_path_has_suffix(const char *path, const char *suffix);
+static bool graphics_path_is_executable(const char *path);
+static bool graphics_path_is_package(const char *path);
+static bool graphics_resolve_shortcut(const char *path, char *target, uint32_t target_size);
+static bool graphics_create_desktop_shortcut(const char *target_path);
+static uint32_t graphics_lerp_color(uint32_t from, uint32_t to, uint32_t num, uint32_t den);
+static void graphics_plot(uint16_t x, uint16_t y, uint32_t color);
+static void graphics_draw_rect_outline(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
 static void graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
+static void graphics_draw_text_aligned(uint16_t x, uint16_t y, uint16_t width, const char *text, uint32_t color);
 static void graphics_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint32_t color);
 static void graphics_draw_cube3d_window(const ui_window_t *window);
 static void graphics_draw_taskbar_status(void);
+static void graphics_draw_control_panel_window(const ui_window_t *window);
+static void graphics_draw_logon_window(const ui_window_t *window);
+static uint16_t graphics_taskbar_pinned_start_x(void);
+static uint16_t graphics_taskbar_running_start_x(void);
+static void graphics_restore_cursor(void);
+static void graphics_draw_rainbow_cat(void);
+static void graphics_reset_start_menu(void);
+static bool graphics_point_in_rect(uint16_t px, uint16_t py, uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+static void graphics_fill(uint32_t color);
 static void graphics_append_path_component(char *path, uint32_t path_size, const char *component);
 static void graphics_fill_player_browser(void);
 static void graphics_player_open_browser(void);
@@ -294,9 +447,156 @@ static void graphics_u32_to_hex8(uint32_t value, char out[9])
     out[8] = '\0';
 }
 
+static void graphics_u32_to_dec(char *out, uint32_t value)
+{
+    char temp[11];
+    uint32_t index = 0;
+    uint32_t out_index = 0;
+
+    if (value == 0) {
+        out[0] = '0';
+        out[1] = '\0';
+        return;
+    }
+    while (value > 0 && index < sizeof(temp)) {
+        temp[index++] = (char) ('0' + (value % 10u));
+        value /= 10u;
+    }
+    while (index > 0) {
+        out[out_index++] = temp[--index];
+    }
+    out[out_index] = '\0';
+}
+
+static void graphics_make_resolution_label(char *out, uint32_t out_size, uint16_t width, uint16_t height)
+{
+    char number[11];
+    uint32_t pos = 0;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    graphics_u32_to_dec(number, width);
+    for (uint32_t i = 0; number[i] != '\0' && pos + 1 < out_size; i++) {
+        out[pos++] = number[i];
+    }
+    if (pos + 1 < out_size) {
+        out[pos++] = 'x';
+    }
+    graphics_u32_to_dec(number, height);
+    for (uint32_t i = 0; number[i] != '\0' && pos + 1 < out_size; i++) {
+        out[pos++] = number[i];
+    }
+    out[pos] = '\0';
+}
+
+static int32_t graphics_find_mode_index(uint16_t width, uint16_t height)
+{
+    for (uint32_t i = 0; i < sizeof(g_graphics_modes) / sizeof(g_graphics_modes[0]); i++) {
+        if (g_graphics_modes[i].width == width && g_graphics_modes[i].height == height) {
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t graphics_cursor_style_count(void)
+{
+    return (uint32_t) (sizeof(g_cursor_styles) / sizeof(g_cursor_styles[0]));
+}
+
+static void graphics_save_cursor_style(void)
+{
+    char data[4];
+
+    graphics_u32_to_dec(data, g_cursor_style_index);
+    strcpy(data + strlen(data), "\n");
+    file_write(GRAPHICS_CURSOR_CONFIG_PATH, data, (uint32_t) strlen(data));
+}
+
+static void graphics_load_cursor_style(void)
+{
+    char data[8];
+    int32_t read;
+    uint32_t value = 0;
+
+    read = file_read(GRAPHICS_CURSOR_CONFIG_PATH, data, sizeof(data) - 1);
+    if (read <= 0) {
+        return;
+    }
+    data[read] = '\0';
+    for (uint32_t i = 0; data[i] >= '0' && data[i] <= '9'; i++) {
+        value = value * 10u + (uint32_t) (data[i] - '0');
+    }
+    if (value < graphics_cursor_style_count()) {
+        g_cursor_style_index = (uint8_t) value;
+    }
+}
+
+static void graphics_set_cursor_style(uint8_t index)
+{
+    if (index >= graphics_cursor_style_count()) {
+        return;
+    }
+    if (g_cursor_style_index == index) {
+        return;
+    }
+    graphics_restore_cursor();
+    g_cursor_style_index = index;
+    graphics_save_cursor_style();
+    graphics_draw_shell();
+}
+
+static void graphics_draw_cursor_bitmap(uint16_t x, uint16_t y, const graphics_cursor_style_t *style)
+{
+    if (style == NULL) {
+        return;
+    }
+    for (uint16_t row = 0; row < 16; row++) {
+        for (uint16_t col = 0; col < 16; col++) {
+            uint16_t mask = (uint16_t) (0x8000 >> col);
+
+            if ((style->shape[row] & mask) == 0) {
+                continue;
+            }
+            graphics_plot((uint16_t) (x + col), (uint16_t) (y + row),
+                          (style->fill[row] & mask) != 0 ? style->fill_color : style->outline_color);
+        }
+    }
+}
+
+static uint16_t graphics_power_menu_top(void)
+{
+    uint16_t top = 12;
+
+    if (FB_HEIGHT > TASKBAR_HEIGHT + 116) {
+        top = (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 116);
+    }
+    return top;
+}
+
 static bool graphics_is_separator(char ch)
 {
     return ch == '/' || ch == '\\';
+}
+
+static uint16_t graphics_clamp_window_x(uint16_t width)
+{
+    if (FB_WIDTH <= width + 16) {
+        return 8;
+    }
+    return (uint16_t) ((FB_WIDTH - width) / 2u);
+}
+
+static uint16_t graphics_clamp_window_y(uint16_t height)
+{
+    uint16_t top = 24;
+    uint16_t bottom = TASKBAR_HEIGHT + 16;
+
+    if (FB_HEIGHT <= height + top + bottom) {
+        return top;
+    }
+    return (uint16_t) ((FB_HEIGHT - height - bottom) / 2u);
 }
 
 static void graphics_reset_login(void)
@@ -556,10 +856,10 @@ static void graphics_reset_uac_request(const char *program_path, const char *rea
     g_uac_last_buttons = 0;
     g_uac_privilege_level = privilege_level;
     if (program_path != NULL) {
-        strncpy(g_uac_program, program_path, sizeof(g_uac_program) - 1);
+        strlcpy(g_uac_program, program_path, sizeof(g_uac_program));
     }
     if (reason != NULL) {
-        strncpy(g_uac_reason, reason, sizeof(g_uac_reason) - 1);
+        strlcpy(g_uac_reason, reason, sizeof(g_uac_reason));
     }
 }
 
@@ -683,7 +983,6 @@ bool graphics_request_uac_elevation(const char *program_path, const char *reason
 static void graphics_file_browser_enter_selected(void)
 {
     char path[GRAPHICS_FILE_PATH_MAX];
-    uint32_t path_len;
 
     if (g_file_selected_index >= g_file_item_count) {
         return;
@@ -696,12 +995,7 @@ static void graphics_file_browser_enter_selected(void)
         graphics_fill_file_browser();
         return;
     }
-    path_len = (uint32_t) strlen(path);
-    if ((path_len >= 4 && strcasecmp(path + path_len - 4, ".elf") == 0) ||
-        (path_len >= 4 && strcasecmp(path + path_len - 4, ".exe") == 0) ||
-        (path_len >= 4 && strcasecmp(path + path_len - 4, ".rzs") == 0)) {
-        graphics_open_path(path);
-    }
+    graphics_open_path(path);
 }
 
 static void graphics_file_browser_go_up(void)
@@ -757,7 +1051,7 @@ static void graphics_build_desktop_entry_path(uint32_t index, char out_path[GRAP
 
     graphics_current_desktop_path(desktop_path);
     strcpy(out_path, desktop_path);
-    graphics_append_path_component(out_path, GRAPHICS_CLIPBOARD_PATH_MAX, g_desktop_entries[index]);
+    graphics_append_path_component(out_path, GRAPHICS_CLIPBOARD_PATH_MAX, g_desktop_entries[index].name);
 }
 
 static void graphics_build_file_entry_path(uint32_t index, char out_path[GRAPHICS_CLIPBOARD_PATH_MAX])
@@ -795,42 +1089,412 @@ static const char *graphics_path_basename(const char *path)
     return last;
 }
 
+static void graphics_trim_shortcut_target(char *text)
+{
+    uint32_t start = 0;
+    uint32_t end;
+
+    if (text == NULL) {
+        return;
+    }
+    while (text[start] == ' ' || text[start] == '\t' || text[start] == '\r' || text[start] == '\n') {
+        start++;
+    }
+    end = (uint32_t) strlen(text + start);
+    while (end > 0) {
+        char ch = text[start + end - 1];
+
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+            break;
+        }
+        end--;
+    }
+    if (start > 0 && end > 0) {
+        memmove(text, text + start, end);
+    }
+    text[end] = '\0';
+}
+
+static bool graphics_resolve_shortcut(const char *path, char *target, uint32_t target_size)
+{
+    int32_t read;
+
+    if (path == NULL || target == NULL || target_size == 0 || file_is_dir(path)) {
+        return false;
+    }
+    if (!graphics_path_has_suffix(path, ".lnk") && !graphics_path_has_suffix(path, ".LNK")) {
+        return false;
+    }
+    read = file_read(path, target, target_size - 1);
+    if (read <= 0) {
+        return false;
+    }
+    target[read] = '\0';
+    graphics_trim_shortcut_target(target);
+    return target[0] != '\0';
+}
+
+static bool graphics_shortcut_char_allowed(char ch)
+{
+    return (ch >= '0' && ch <= '9') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= 'a' && ch <= 'z');
+}
+
+static char graphics_shortcut_char_normalize(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') {
+        return (char) (ch - 'A' + 'a');
+    }
+    if (graphics_shortcut_char_allowed(ch)) {
+        return ch;
+    }
+    return '_';
+}
+
+static void graphics_make_shortcut_filename(const char *target_path, uint32_t attempt, char *out, uint32_t out_size)
+{
+    const char *base = graphics_path_basename(target_path);
+    uint32_t out_index = 0;
+    uint32_t max_base = attempt == 0 ? 8u : 7u;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (target_path == NULL || target_path[0] == '\0' || out_size < 5) {
+        return;
+    }
+    while (base[out_index] != '\0' && base[out_index] != '.' && out_index < max_base && out_index + 5 < out_size) {
+        out[out_index] = graphics_shortcut_char_normalize(base[out_index]);
+        out_index++;
+    }
+    if (out_index == 0) {
+        out[out_index++] = 'l';
+        out[out_index++] = 'i';
+        out[out_index++] = 'n';
+        out[out_index++] = 'k';
+    }
+    if (attempt > 0 && out_index + 5 < out_size) {
+        out[out_index++] = (char) ('0' + (attempt % 10u));
+    }
+    strcpy(out + out_index, ".lnk");
+}
+
+static bool graphics_create_desktop_shortcut(const char *target_path)
+{
+    char desktop_path[GRAPHICS_FILE_PATH_MAX];
+    char link_name[16];
+    char link_path[GRAPHICS_CLIPBOARD_PATH_MAX];
+    char body[GRAPHICS_CLIPBOARD_PATH_MAX + 2];
+
+    if (target_path == NULL || target_path[0] == '\0') {
+        return false;
+    }
+    graphics_current_desktop_path(desktop_path);
+    if (!file_exists(desktop_path)) {
+        file_mkdir(desktop_path);
+    }
+    for (uint32_t attempt = 0; attempt < 10; attempt++) {
+        graphics_make_shortcut_filename(target_path, attempt, link_name, sizeof(link_name));
+        if (link_name[0] == '\0') {
+            return false;
+        }
+        strcpy(link_path, desktop_path);
+        graphics_append_path_component(link_path, sizeof(link_path), link_name);
+        if (file_exists(link_path)) {
+            continue;
+        }
+        strcpy(body, target_path);
+        strcpy(body + strlen(body), "\n");
+        return file_write(link_path, body, (uint32_t) strlen(body)) >= 0;
+    }
+    return false;
+}
+
+static bool graphics_launch_user_program(const char *path)
+{
+    if (path == NULL || path[0] == '\0' || !file_exists(path) || file_is_dir(path)) {
+        return false;
+    }
+
+    if (g_graphics_active && g_session_logged_in && graphics_find_window(UI_WINDOW_TERMINAL) < 0) {
+        graphics_open_window(UI_WINDOW_TERMINAL);
+    }
+    shell_exec_path(path);
+    return true;
+}
+
+static bool graphics_launch_user_program_with_arg(const char *path, const char *arg)
+{
+    if (path == NULL || path[0] == '\0' || arg == NULL || arg[0] == '\0' ||
+        !file_exists(path) || file_is_dir(path)) {
+        return false;
+    }
+
+    if (g_graphics_active && g_session_logged_in && graphics_find_window(UI_WINDOW_TERMINAL) < 0) {
+        graphics_open_window(UI_WINDOW_TERMINAL);
+    }
+    shell_exec_path_with_arg(path, arg);
+    return true;
+}
+
+static bool graphics_resolve_app_executable_path(const char *path, char *resolved, uint32_t resolved_size)
+{
+    const char *base;
+    uint32_t base_len;
+
+    if (path == NULL || resolved == NULL || resolved_size == 0 || !graphics_path_is_executable(path)) {
+        return false;
+    }
+    base = graphics_path_basename(path);
+    if (base == NULL || base[0] == '\0') {
+        return false;
+    }
+    base_len = (uint32_t) strlen(base);
+    if (base_len == 0 || base_len + 7 > resolved_size) {
+        return false;
+    }
+
+    strcpy(resolved, "/apps");
+    graphics_append_path_component(resolved, resolved_size, base);
+    return file_exists(resolved) && !file_is_dir(resolved);
+}
+
+static bool graphics_launch_named_user_program(const char *name)
+{
+    typedef struct {
+        const char *name;
+        const char *path;
+    } app_alias_t;
+    static const app_alias_t apps[] = {
+        { "explorar", "/apps/explorar.exe" },
+        { "explorar.exe", "/apps/explorar.exe" },
+        { "monilog", "/apps/monilog.exe" },
+        { "monilog.exe", "/apps/monilog.exe" },
+        { "demo", "/apps/demo.elf" },
+        { "demo.elf", "/apps/demo.elf" },
+        { "player", "/apps/player.elf" },
+        { "player.elf", "/apps/player.elf" },
+        { "notepad", "/apps/notepad.elf" },
+        { "notepad.elf", "/apps/notepad.elf" },
+        { "taskmgr", "/apps/taskmgr.elf" },
+        { "taskmgr.elf", "/apps/taskmgr.elf" },
+        { "square", "/apps/square.elf" },
+        { "square.elf", "/apps/square.elf" },
+        { "cube3d", "/apps/cube3d.elf" },
+        { "cube3d.elf", "/apps/cube3d.elf" },
+        { "setup", "/apps/setup.elf" },
+        { "setup.elf", "/apps/setup.elf" },
+        { "appdev", "/apps/appdev.elf" },
+        { "appdev.elf", "/apps/appdev.elf" },
+        { "rzdrv", "/apps/rzdrv.rzs" },
+        { "rzdrv.rzs", "/apps/rzdrv.rzs" },
+    };
+
+    if (name == NULL || name[0] == '\0') {
+        return false;
+    }
+    for (uint32_t i = 0; i < sizeof(apps) / sizeof(apps[0]); i++) {
+        if (strcasecmp(name, apps[i].name) == 0) {
+            return graphics_launch_user_program(apps[i].path);
+        }
+    }
+    return false;
+}
+
 static void graphics_context_open(uint16_t x, uint16_t y, ui_context_menu_mode_t mode)
 {
+    uint16_t menu_h = mode == UI_CONTEXT_MENU_FILES ? CONTEXT_MENU_FILES_H : CONTEXT_MENU_DESKTOP_H;
+
     g_start_menu_open = false;
     g_context_menu_open = true;
     g_context_menu_mode = mode;
-    g_context_menu_x = x > FB_WIDTH - 170 ? (uint16_t) (FB_WIDTH - 170) : x;
-    g_context_menu_y = y > FB_HEIGHT - TASKBAR_HEIGHT - 90 ? (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 90) : y;
+    g_context_menu_x = x > FB_WIDTH - CONTEXT_MENU_W ? (uint16_t) (FB_WIDTH - CONTEXT_MENU_W) : x;
+    g_context_menu_y = y > FB_HEIGHT - TASKBAR_HEIGHT - menu_h ? (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - menu_h) : y;
+}
+
+static void graphics_open_start_menu_view(ui_start_menu_view_t view)
+{
+    g_start_menu_open = true;
+    g_start_menu_view = view;
+    g_context_menu_open = false;
+    g_power_menu_open = false;
+}
+
+static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y)
+{
+    uint16_t menu_x = START_MENU_X;
+    uint16_t menu_y = (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - START_MENU_H - 12);
+    uint16_t root_top = (uint16_t) (menu_y + START_MENU_HEADER_H + 8);
+
+    if (!g_start_menu_open) {
+        return false;
+    }
+    if (!graphics_point_in_rect(x, y, menu_x, menu_y, START_MENU_W, START_MENU_H)) {
+        g_start_menu_open = false;
+        g_power_menu_open = false;
+        g_context_menu_open = false;
+        return false;
+    }
+
+    switch (g_start_menu_view) {
+    case UI_START_MENU_ROOT:
+        if (graphics_point_in_rect(x, y, menu_x + 8, root_top + 0 * UI_MENU_ITEM_H, START_MENU_LEFT_W - 16, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_APPS;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, menu_x + 8, root_top + 1 * UI_MENU_ITEM_H, START_MENU_LEFT_W - 16, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_SETTINGS;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, menu_x + 8, root_top + 2 * UI_MENU_ITEM_H, START_MENU_LEFT_W - 16, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_NETWORK;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, menu_x + 8, root_top + 3 * UI_MENU_ITEM_H, START_MENU_LEFT_W - 16, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_POWER;
+            return true;
+        }
+        break;
+    case UI_START_MENU_APPS:
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            graphics_launch_user_program("/apps/explorar.exe");
+            g_start_menu_open = false;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 1 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            graphics_open_window(UI_WINDOW_TERMINAL);
+            g_start_menu_open = false;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 2 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            graphics_launch_user_program("/apps/player.elf");
+            g_start_menu_open = false;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 3 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            graphics_launch_user_program("/apps/notepad.elf");
+            g_start_menu_open = false;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 4 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            graphics_launch_user_program("/apps/taskmgr.elf");
+            g_start_menu_open = false;
+            return true;
+        }
+        break;
+    case UI_START_MENU_SETTINGS:
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_DISPLAY;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 1 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_CURSOR;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 2 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_view = UI_START_MENU_NETWORK;
+            return true;
+        }
+        break;
+    case UI_START_MENU_DISPLAY:
+        for (uint32_t mode = 0; mode < sizeof(g_graphics_modes) / sizeof(g_graphics_modes[0]); mode++) {
+            uint16_t row_y = (uint16_t) (root_top + mode * UI_MENU_ITEM_H);
+            if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + START_MENU_MID_W + 16), row_y, START_MENU_RIGHT_W - 24, UI_MENU_ITEM_H - 2)) {
+                graphics_set_resolution(g_graphics_modes[mode].width, g_graphics_modes[mode].height);
+                g_start_menu_open = false;
+                return true;
+            }
+        }
+        break;
+    case UI_START_MENU_CURSOR:
+        for (uint32_t style = 0; style < graphics_cursor_style_count(); style++) {
+            uint16_t col = (uint16_t) (style & 1u);
+            uint16_t row = (uint16_t) (style >> 1);
+            uint16_t button_x = (uint16_t) (menu_x + START_MENU_LEFT_W + START_MENU_MID_W + 16 + col * 78);
+            uint16_t button_y = (uint16_t) (root_top + row * 28);
+
+            if (graphics_point_in_rect(x, y, button_x, button_y, 68, 22)) {
+                graphics_set_cursor_style((uint8_t) style);
+                g_start_menu_open = false;
+                return true;
+            }
+        }
+        break;
+    case UI_START_MENU_NETWORK:
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            if (net_connected()) {
+                net_ping("172.16.58.1");
+            }
+            g_start_menu_open = false;
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 1 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            g_start_menu_open = false;
+            graphics_open_window(UI_WINDOW_CONTROL_PANEL);
+            return true;
+        }
+        break;
+    case UI_START_MENU_POWER:
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            kernel_request_shutdown();
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 1 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            kernel_request_reboot();
+            return true;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 2 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
+            g_sleeping = true;
+            g_start_menu_open = false;
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+    g_start_menu_open = false;
+    g_start_menu_view = UI_START_MENU_ROOT;
+    return false;
 }
 
 static void graphics_open_path(const char *path)
 {
-    uint32_t image_flags;
+    char app_path[GRAPHICS_CLIPBOARD_PATH_MAX];
+    char exec_path[GRAPHICS_CLIPBOARD_PATH_MAX];
+    char shortcut_target[GRAPHICS_CLIPBOARD_PATH_MAX];
+    const char *open_path = path;
 
     if (path == NULL || path[0] == '\0') {
         return;
     }
-    image_flags = exec_image_flags_for_path(path);
-    if (graphics_path_has_suffix(path, ".elf") || graphics_path_has_suffix(path, ".ELF") ||
-        graphics_path_has_suffix(path, ".exe") || graphics_path_has_suffix(path, ".EXE") ||
-        graphics_path_has_suffix(path, ".rzs") || graphics_path_has_suffix(path, ".RZS")) {
-        if (strcasecmp(graphics_path_basename(path), "player.elf") == 0) {
-            graphics_open_window(UI_WINDOW_PLAYER);
-        } else if (strcasecmp(graphics_path_basename(path), "notepad.elf") == 0) {
-            graphics_open_window(UI_WINDOW_NOTEPAD);
-        } else if (strcasecmp(graphics_path_basename(path), "taskmgr.elf") == 0) {
-            graphics_open_window(UI_WINDOW_TASKMGR);
-        } else if (strcasecmp(graphics_path_basename(path), "cube3d.elf") == 0) {
-            graphics_open_cube3d_window();
-        } else if ((image_flags & EXEC_IMAGE_FLAG_GUI) != 0) {
-            shell_exec_path(path);
+    if (graphics_resolve_shortcut(path, shortcut_target, sizeof(shortcut_target))) {
+        open_path = shortcut_target;
+    }
+    if (file_is_dir(open_path)) {
+        strcpy(g_file_current_path, open_path);
+        g_file_selected_index = 0;
+        graphics_fill_file_browser();
+        graphics_open_window(UI_WINDOW_FILES);
+        return;
+    }
+    if (graphics_path_is_executable(open_path)) {
+        if (graphics_resolve_app_executable_path(open_path, exec_path, sizeof(exec_path))) {
+            graphics_launch_user_program(exec_path);
         } else {
-            if (graphics_find_window(UI_WINDOW_TERMINAL) < 0) {
-                graphics_open_window(UI_WINDOW_TERMINAL);
-            }
-            shell_exec_path(path);
+            graphics_launch_user_program(open_path);
         }
+        return;
+    }
+    if (!file_is_dir(open_path) &&
+        registry_default_app_for_path(open_path, app_path, sizeof(app_path)) &&
+        file_exists(app_path) && !file_is_dir(app_path)) {
+        graphics_launch_user_program_with_arg(app_path, open_path);
+        return;
+    }
+    if (graphics_path_is_package(open_path)) {
+        graphics_launch_user_program(open_path);
     }
 }
 
@@ -841,16 +1505,8 @@ static void graphics_run_command_text(const char *command)
     }
     if (strcasecmp(command, "command") == 0 || strcasecmp(command, "cmd") == 0 || strcasecmp(command, "terminal") == 0) {
         graphics_open_window(UI_WINDOW_TERMINAL);
-    } else if (strcasecmp(command, "explorar") == 0 || strcasecmp(command, "explorar.exe") == 0) {
-        graphics_open_window(UI_WINDOW_FILES);
-    } else if (strcasecmp(command, "player") == 0 || strcasecmp(command, "player.elf") == 0) {
-        graphics_open_window(UI_WINDOW_PLAYER);
-    } else if (strcasecmp(command, "notepad") == 0 || strcasecmp(command, "notepad.elf") == 0) {
-        graphics_open_window(UI_WINDOW_NOTEPAD);
-    } else if (strcasecmp(command, "taskmgr") == 0 || strcasecmp(command, "taskmgr.elf") == 0) {
-        graphics_open_window(UI_WINDOW_TASKMGR);
-    } else if (strcasecmp(command, "cube3d") == 0 || strcasecmp(command, "cube3d.elf") == 0) {
-        graphics_open_cube3d_window();
+    } else if (graphics_launch_named_user_program(command)) {
+        return;
     } else if (strcasecmp(command, "about") == 0) {
         graphics_open_window(UI_WINDOW_ABOUT);
     } else {
@@ -1105,6 +1761,87 @@ static void graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t 
     }
 }
 
+static void graphics_fill_rect_gradient(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t top_color, uint32_t bottom_color)
+{
+    uint16_t den = height > 1 ? (uint16_t) (height - 1) : 1;
+
+    for (uint16_t row = 0; row < height; row++) {
+        uint32_t color = graphics_lerp_color(top_color, bottom_color, row, den);
+
+        for (uint16_t col = 0; col < width; col++) {
+            graphics_plot((uint16_t) (x + col), (uint16_t) (y + row), color);
+        }
+    }
+}
+
+static void graphics_fill_soft_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
+{
+    if (width < 6 || height < 6) {
+        graphics_fill_rect(x, y, width, height, color);
+        return;
+    }
+    graphics_fill_rect((uint16_t) (x + 2), y, (uint16_t) (width - 4), height, color);
+    graphics_fill_rect(x, (uint16_t) (y + 2), width, (uint16_t) (height - 4), color);
+    graphics_plot((uint16_t) (x + 1), (uint16_t) (y + 1), color);
+    graphics_plot((uint16_t) (x + width - 2), (uint16_t) (y + 1), color);
+    graphics_plot((uint16_t) (x + 1), (uint16_t) (y + height - 2), color);
+    graphics_plot((uint16_t) (x + width - 2), (uint16_t) (y + height - 2), color);
+}
+
+static void graphics_draw_soft_rect_outline(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
+{
+    if (width < 6 || height < 6) {
+        graphics_draw_rect_outline(x, y, width, height, color);
+        return;
+    }
+    for (uint16_t col = 2; col + 2 < width; col++) {
+        graphics_plot((uint16_t) (x + col), y, color);
+        graphics_plot((uint16_t) (x + col), (uint16_t) (y + height - 1), color);
+    }
+    for (uint16_t row = 2; row + 2 < height; row++) {
+        graphics_plot(x, (uint16_t) (y + row), color);
+        graphics_plot((uint16_t) (x + width - 1), (uint16_t) (y + row), color);
+    }
+    graphics_plot((uint16_t) (x + 1), (uint16_t) (y + 1), color);
+    graphics_plot((uint16_t) (x + width - 2), (uint16_t) (y + 1), color);
+    graphics_plot((uint16_t) (x + 1), (uint16_t) (y + height - 2), color);
+    graphics_plot((uint16_t) (x + width - 2), (uint16_t) (y + height - 2), color);
+}
+
+static void graphics_draw_shadow(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+    graphics_fill_soft_rect((uint16_t) (x + 7), (uint16_t) (y + 8), width, height, 0x00364664);
+    graphics_draw_soft_rect_outline((uint16_t) (x + 3), (uint16_t) (y + 4), width, height, 0x008FA7C0);
+}
+
+static void graphics_reset_start_menu(void)
+{
+    g_start_menu_open = false;
+    g_start_menu_view = UI_START_MENU_ROOT;
+}
+
+static void graphics_draw_rainbow_cat(void)
+{
+    static const uint32_t stripes[6] = {
+        0x00FF5F5F, 0x00FFB45F, 0x00FFF45F, 0x0069E08A, 0x005FB7FF, 0x00B16BFF
+    };
+    uint16_t cat_x = (uint16_t) (FB_WIDTH / 2 - 84);
+    uint16_t cat_y = (uint16_t) (FB_HEIGHT / 2 - 42);
+
+    graphics_fill(0x00000000);
+    for (uint16_t row = 0; row < 84; row++) {
+        graphics_fill_rect(0, (uint16_t) (cat_y + row), FB_WIDTH, 1, stripes[(row / 14) % 6]);
+    }
+    graphics_fill_soft_rect(cat_x, cat_y, 168, 84, 0x00FFFDF8);
+    graphics_draw_soft_rect_outline(cat_x, cat_y, 168, 84, 0x002E3440);
+    graphics_fill_soft_rect((uint16_t) (cat_x + 14), (uint16_t) (cat_y + 16), 40, 40, 0x00FFF2E4);
+    graphics_fill_soft_rect((uint16_t) (cat_x + 114), (uint16_t) (cat_y + 16), 40, 40, 0x00FFF2E4);
+    graphics_fill_rect((uint16_t) (cat_x + 52), (uint16_t) (cat_y + 22), 64, 40, 0x00FFF8EA);
+    graphics_fill_rect((uint16_t) (cat_x + 64), (uint16_t) (cat_y + 34), 16, 8, 0x00243B5B);
+    graphics_fill_rect((uint16_t) (cat_x + 88), (uint16_t) (cat_y + 34), 16, 8, 0x00243B5B);
+    graphics_draw_text((uint16_t) (cat_x + 58), (uint16_t) (cat_y + 56), "Nyan", 0x00243B5B);
+}
+
 bool graphics_user_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
 {
     if (!g_graphics_active || x >= FB_WIDTH || y >= FB_HEIGHT || width == 0 || height == 0) {
@@ -1117,6 +1854,15 @@ bool graphics_user_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t he
         height = (uint16_t) (FB_HEIGHT - y);
     }
     graphics_fill_rect(x, y, width, height, color);
+    return true;
+}
+
+bool graphics_user_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color)
+{
+    if (!g_graphics_active || text == NULL || x >= FB_WIDTH || y >= FB_HEIGHT) {
+        return false;
+    }
+    graphics_draw_text(x, y, text, color);
     return true;
 }
 
@@ -1230,6 +1976,194 @@ static void graphics_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, u
     }
 }
 
+static bool graphics_path_is_executable(const char *path)
+{
+    return graphics_path_has_suffix(path, ".elf") || graphics_path_has_suffix(path, ".ELF") ||
+           graphics_path_has_suffix(path, ".exe") || graphics_path_has_suffix(path, ".EXE");
+}
+
+static bool graphics_path_is_package(const char *path)
+{
+    return graphics_path_has_suffix(path, ".rzs") || graphics_path_has_suffix(path, ".RZS");
+}
+
+static graphics_icon_kind_t graphics_icon_kind_for_path(const char *path, bool is_dir)
+{
+    if (is_dir) {
+        return GRAPHICS_ICON_FOLDER;
+    }
+    if (path == NULL) {
+        return GRAPHICS_ICON_FILE;
+    }
+    if (graphics_path_has_suffix(path, ".lnk") || graphics_path_has_suffix(path, ".LNK")) {
+        return GRAPHICS_ICON_SHORTCUT;
+    }
+    if (graphics_path_is_executable(path)) {
+        return GRAPHICS_ICON_APP;
+    }
+    if (graphics_path_is_package(path)) {
+        return GRAPHICS_ICON_PACKAGE;
+    }
+    if (graphics_path_has_suffix(path, ".dll") || graphics_path_has_suffix(path, ".DLL")) {
+        return GRAPHICS_ICON_DLL;
+    }
+    if (graphics_player_path_is_audio(path)) {
+        return GRAPHICS_ICON_AUDIO;
+    }
+    return GRAPHICS_ICON_FILE;
+}
+
+static graphics_icon_kind_t graphics_icon_kind_for_window(ui_window_kind_t kind)
+{
+    switch (kind) {
+    case UI_WINDOW_FILES:
+        return GRAPHICS_ICON_FOLDER;
+    case UI_WINDOW_TERMINAL:
+    case UI_WINDOW_SHELL:
+    case UI_WINDOW_RUN:
+        return GRAPHICS_ICON_TERMINAL;
+    case UI_WINDOW_CONTROL_PANEL:
+        return GRAPHICS_ICON_SETTINGS;
+    case UI_WINDOW_ABOUT:
+        return GRAPHICS_ICON_INFO;
+    case UI_WINDOW_PLAYER:
+        return GRAPHICS_ICON_AUDIO;
+    case UI_WINDOW_UAC:
+        return GRAPHICS_ICON_PACKAGE;
+    case UI_WINDOW_NOTEPAD:
+        return GRAPHICS_ICON_FILE;
+    case UI_WINDOW_TASKMGR:
+    case UI_WINDOW_CUBE3D:
+    default:
+        return GRAPHICS_ICON_WINDOW;
+    }
+}
+
+static void graphics_make_display_label(const char *name, char *out, uint32_t out_size)
+{
+    uint32_t len;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (name == NULL) {
+        return;
+    }
+    len = (uint32_t) strlen(name);
+    if (graphics_path_has_suffix(name, ".lnk") || graphics_path_has_suffix(name, ".LNK")) {
+        if (len >= 4) {
+            len -= 4;
+        }
+    }
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, name, len);
+    out[len] = '\0';
+}
+
+static void graphics_draw_shortcut_badge(uint16_t x, uint16_t y, bool small)
+{
+    uint16_t size = small ? 8 : 14;
+
+    graphics_fill_soft_rect(x, y, size, size, 0x00FFFFFF);
+    graphics_draw_soft_rect_outline(x, y, size, size, 0x003C6FEA);
+    graphics_draw_line((int16_t) (x + size - 3), (int16_t) (y + 2), (int16_t) (x + 3), (int16_t) (y + size - 4), 0x003C6FEA);
+    graphics_draw_line((int16_t) (x + size - 4), (int16_t) (y + 2), (int16_t) (x + size - 3), (int16_t) (y + 6), 0x003C6FEA);
+    graphics_draw_line((int16_t) (x + size - 4), (int16_t) (y + 2), (int16_t) (x + size - 8), (int16_t) (y + 3), 0x003C6FEA);
+}
+
+static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind, bool small)
+{
+    uint16_t w = small ? 18 : 48;
+    uint16_t h = small ? 18 : 48;
+    uint16_t ix = x;
+    uint16_t iy = y;
+
+    switch (kind) {
+    case GRAPHICS_ICON_FOLDER:
+        graphics_fill_soft_rect((uint16_t) (ix + 2), (uint16_t) (iy + (small ? 4 : 10)), (uint16_t) (w - 4), (uint16_t) (h - (small ? 6 : 14)), 0x00F4C84E);
+        graphics_fill_soft_rect((uint16_t) (ix + 4), (uint16_t) (iy + (small ? 2 : 6)), (uint16_t) (small ? 8 : 18), (uint16_t) (small ? 5 : 10), 0x00FFD96A);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 2), (uint16_t) (iy + (small ? 4 : 10)), (uint16_t) (w - 4), (uint16_t) (h - (small ? 6 : 14)), 0x00B68018);
+        break;
+    case GRAPHICS_ICON_APP:
+        graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x002C78D4);
+        graphics_fill_rect_gradient((uint16_t) (ix + 7), (uint16_t) (iy + 7), (uint16_t) (w - 14), (uint16_t) (h - 14), 0x005FC9FF, 0x003C6FEA);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x00B7D8FF);
+        if (!small) {
+            graphics_fill_rect((uint16_t) (ix + 18), (uint16_t) (iy + 17), 6, 6, 0x00FFFFFF);
+            graphics_fill_rect((uint16_t) (ix + 26), (uint16_t) (iy + 17), 6, 6, 0x00FFFFFF);
+            graphics_fill_rect((uint16_t) (ix + 18), (uint16_t) (iy + 25), 6, 6, 0x00FFFFFF);
+            graphics_fill_rect((uint16_t) (ix + 26), (uint16_t) (iy + 25), 6, 6, 0x00FFFFFF);
+        }
+        break;
+    case GRAPHICS_ICON_AUDIO:
+        graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x00FFF8F2);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x00D6A76B);
+        graphics_draw_line((int16_t) (ix + w / 2), (int16_t) (iy + 7), (int16_t) (ix + w / 2), (int16_t) (iy + h - 8), 0x00D86D31);
+        graphics_draw_line((int16_t) (ix + w / 2), (int16_t) (iy + 7), (int16_t) (ix + w - 7), (int16_t) (iy + 10), 0x00D86D31);
+        graphics_fill_soft_rect((uint16_t) (ix + 7), (uint16_t) (iy + h - 12), (uint16_t) (small ? 7 : 14), (uint16_t) (small ? 6 : 10), 0x00D86D31);
+        break;
+    case GRAPHICS_ICON_PACKAGE:
+        graphics_fill_soft_rect((uint16_t) (ix + 4), (uint16_t) (iy + 5), (uint16_t) (w - 8), (uint16_t) (h - 8), 0x00FCE7EE);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 4), (uint16_t) (iy + 5), (uint16_t) (w - 8), (uint16_t) (h - 8), 0x00D94C5A);
+        graphics_fill_rect_gradient((uint16_t) (ix + 9), (uint16_t) (iy + 10), (uint16_t) (w - 18), (uint16_t) (h - 18), 0x00FF8BA0, 0x00D94C5A);
+        break;
+    case GRAPHICS_ICON_DLL:
+        graphics_fill_soft_rect((uint16_t) (ix + 5), (uint16_t) (iy + 4), (uint16_t) (w - 10), (uint16_t) (h - 8), 0x00E7FBF1);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 5), (uint16_t) (iy + 4), (uint16_t) (w - 10), (uint16_t) (h - 8), 0x0030A46C);
+        for (uint16_t pin = 0; pin < 4; pin++) {
+            uint16_t py = (uint16_t) (iy + 8 + pin * (small ? 3 : 8));
+            graphics_fill_rect((uint16_t) (ix + 2), py, 4, 2, 0x0030A46C);
+            graphics_fill_rect((uint16_t) (ix + w - 6), py, 4, 2, 0x0030A46C);
+        }
+        if (!small) {
+            graphics_draw_text((uint16_t) (ix + 17), (uint16_t) (iy + 20), "DLL", 0x0030A46C);
+        }
+        break;
+    case GRAPHICS_ICON_SHORTCUT:
+        graphics_draw_icon(ix, iy, GRAPHICS_ICON_APP, small);
+        graphics_draw_shortcut_badge((uint16_t) (ix + (small ? 0 : 2)), (uint16_t) (iy + h - (small ? 9 : 16)), small);
+        break;
+    case GRAPHICS_ICON_TERMINAL:
+        graphics_fill_soft_rect((uint16_t) (ix + 2), (uint16_t) (iy + 3), (uint16_t) (w - 4), (uint16_t) (h - 6), 0x0017202C);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 2), (uint16_t) (iy + 3), (uint16_t) (w - 4), (uint16_t) (h - 6), 0x004A6278);
+        graphics_draw_line((int16_t) (ix + 7), (int16_t) (iy + 9), (int16_t) (ix + 12), (int16_t) (iy + 12), 0x00B8F7C8);
+        graphics_draw_line((int16_t) (ix + 7), (int16_t) (iy + 15), (int16_t) (ix + 12), (int16_t) (iy + 12), 0x00B8F7C8);
+        graphics_fill_rect((uint16_t) (ix + 14), (uint16_t) (iy + 15), (uint16_t) (small ? 5 : 14), 2, 0x00B8F7C8);
+        break;
+    case GRAPHICS_ICON_SETTINGS:
+        graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 3), (uint16_t) (w - 6), (uint16_t) (h - 6), 0x00EEF2FF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 3), (uint16_t) (iy + 3), (uint16_t) (w - 6), (uint16_t) (h - 6), 0x006A67CE);
+        graphics_draw_line((int16_t) (ix + w / 2), (int16_t) (iy + 7), (int16_t) (ix + w / 2), (int16_t) (iy + h - 7), 0x006A67CE);
+        graphics_draw_line((int16_t) (ix + 7), (int16_t) (iy + h / 2), (int16_t) (ix + w - 7), (int16_t) (iy + h / 2), 0x006A67CE);
+        graphics_fill_soft_rect((uint16_t) (ix + w / 2 - 5), (uint16_t) (iy + h / 2 - 5), 10, 10, 0x006A67CE);
+        break;
+    case GRAPHICS_ICON_INFO:
+        graphics_fill_soft_rect((uint16_t) (ix + 4), (uint16_t) (iy + 3), (uint16_t) (w - 8), (uint16_t) (h - 6), 0x00FFF7EB);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 4), (uint16_t) (iy + 3), (uint16_t) (w - 8), (uint16_t) (h - 6), 0x00C06C2B);
+        graphics_fill_soft_rect((uint16_t) (ix + w / 2 - 2), (uint16_t) (iy + 8), 4, 4, 0x00C06C2B);
+        graphics_fill_rect((uint16_t) (ix + w / 2 - 1), (uint16_t) (iy + 15), 2, (uint16_t) (h - 24), 0x00C06C2B);
+        break;
+    case GRAPHICS_ICON_WINDOW:
+        graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 4), (uint16_t) (w - 6), (uint16_t) (h - 8), 0x00F7FBFF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 3), (uint16_t) (iy + 4), (uint16_t) (w - 6), (uint16_t) (h - 8), 0x008AA1B8);
+        graphics_fill_rect((uint16_t) (ix + 5), (uint16_t) (iy + 6), (uint16_t) (w - 10), 4, 0x003C6FEA);
+        break;
+    case GRAPHICS_ICON_FILE:
+    default:
+        graphics_fill_soft_rect((uint16_t) (ix + 8), (uint16_t) (iy + 3), (uint16_t) (w - 14), (uint16_t) (h - 6), 0x00FFFFFF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 8), (uint16_t) (iy + 3), (uint16_t) (w - 14), (uint16_t) (h - 6), 0x00A7BBD1);
+        graphics_draw_line((int16_t) (ix + w - 12), (int16_t) (iy + 3), (int16_t) (ix + w - 5), (int16_t) (iy + 10), 0x00A7BBD1);
+        if (!small) {
+            graphics_fill_rect((uint16_t) (ix + 16), (uint16_t) (iy + 21), 20, 2, 0x00CAD8E8);
+            graphics_fill_rect((uint16_t) (ix + 16), (uint16_t) (iy + 27), 16, 2, 0x00CAD8E8);
+        }
+        break;
+    }
+}
+
 typedef struct {
     float x;
     float y;
@@ -1330,16 +2264,72 @@ static bool graphics_point_in_rect(uint16_t px, uint16_t py, uint16_t x, uint16_
     return px >= x && px < (uint16_t) (x + width) && py >= y && py < (uint16_t) (y + height);
 }
 
+static void graphics_window_keep_on_screen(ui_window_t *window)
+{
+    int32_t max_x;
+    int32_t max_y;
+
+    if (window == NULL || !window->visible) {
+        return;
+    }
+    if (window->width > FB_WIDTH - 16) {
+        window->width = (uint16_t) (FB_WIDTH > 32 ? FB_WIDTH - 16 : FB_WIDTH);
+    }
+    if (window->height > FB_HEIGHT - TASKBAR_HEIGHT - 16) {
+        window->height = (uint16_t) (FB_HEIGHT > TASKBAR_HEIGHT + 32 ? FB_HEIGHT - TASKBAR_HEIGHT - 16 : FB_HEIGHT);
+    }
+    max_x = (int32_t) FB_WIDTH - (int32_t) window->width - 8;
+    max_y = (int32_t) FB_HEIGHT - TASKBAR_HEIGHT - (int32_t) window->height - 8;
+    if (max_x < 8) {
+        max_x = 8;
+    }
+    if (max_y < 8) {
+        max_y = 8;
+    }
+    if (window->x < 8) {
+        window->x = 8;
+    }
+    if (window->y < 8) {
+        window->y = 8;
+    }
+    if ((int32_t) window->x > max_x) {
+        window->x = (uint16_t) max_x;
+    }
+    if ((int32_t) window->y > max_y) {
+        window->y = (uint16_t) max_y;
+    }
+}
+
 static void graphics_window_set(ui_window_t *window, ui_window_kind_t kind, uint16_t x, uint16_t y, uint16_t width, uint16_t height, const char *title)
 {
     window->visible = true;
+    window->minimized = false;
+    window->maximized = false;
     window->kind = kind;
     window->x = x;
     window->y = y;
     window->width = width;
     window->height = height;
+    window->restore_x = x;
+    window->restore_y = y;
+    window->restore_width = width;
+    window->restore_height = height;
     memset(window->title, 0, sizeof(window->title));
     strcpy(window->title, title);
+    graphics_window_keep_on_screen(window);
+}
+
+static void graphics_reflow_windows(void)
+{
+    for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
+        graphics_window_keep_on_screen(&g_windows[i]);
+    }
+    if (g_cursor_x > FB_WIDTH - 16) {
+        g_cursor_x = (uint16_t) (FB_WIDTH - 16);
+    }
+    if (g_cursor_y > FB_HEIGHT - 16) {
+        g_cursor_y = (uint16_t) (FB_HEIGHT - 16);
+    }
 }
 
 static void graphics_bring_window_to_front(uint32_t index)
@@ -1355,6 +2345,46 @@ static void graphics_bring_window_to_front(uint32_t index)
         g_windows[i] = g_windows[i + 1];
     }
     g_windows[UI_WINDOW_MAX - 1] = saved;
+    g_windows[UI_WINDOW_MAX - 1].minimized = false;
+}
+
+static void graphics_minimize_window(uint32_t index)
+{
+    if (index >= UI_WINDOW_MAX || !g_windows[index].visible) {
+        return;
+    }
+    g_windows[index].minimized = true;
+    g_windows[index].maximized = false;
+}
+
+static void graphics_toggle_maximize_window(uint32_t index)
+{
+    ui_window_t *window;
+
+    if (index >= UI_WINDOW_MAX || !g_windows[index].visible) {
+        return;
+    }
+    window = &g_windows[index];
+    if (!window->maximized) {
+        window->restore_x = window->x;
+        window->restore_y = window->y;
+        window->restore_width = window->width;
+        window->restore_height = window->height;
+        window->x = 8;
+        window->y = 8;
+        window->width = FB_WIDTH > 16 ? (uint16_t) (FB_WIDTH - 16) : FB_WIDTH;
+        window->height = FB_HEIGHT > TASKBAR_HEIGHT + 16 ? (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 16) : FB_HEIGHT;
+        window->maximized = true;
+        window->minimized = false;
+    } else {
+        window->x = window->restore_x;
+        window->y = window->restore_y;
+        window->width = window->restore_width;
+        window->height = window->restore_height;
+        window->maximized = false;
+        window->minimized = false;
+    }
+    graphics_window_keep_on_screen(window);
 }
 
 static int32_t graphics_find_window(ui_window_kind_t kind)
@@ -1388,6 +2418,12 @@ static void graphics_open_window(ui_window_kind_t kind)
     }
 
     if (window->visible) {
+        if (window->minimized) {
+            window->minimized = false;
+            graphics_bring_window_to_front(window_index);
+            graphics_draw_shell();
+            return;
+        }
         graphics_bring_window_to_front(window_index);
         graphics_draw_shell();
         return;
@@ -1395,31 +2431,31 @@ static void graphics_open_window(ui_window_kind_t kind)
 
     switch (kind) {
     case UI_WINDOW_LOGON:
-        graphics_window_set(window, kind, 320, 150, 380, 260, "\u767b\u5f55");
+        graphics_window_set(window, kind, graphics_clamp_window_x(380), graphics_clamp_window_y(300), 380, 300, "MONIOS");
         graphics_reset_login();
         break;
     case UI_WINDOW_FILES:
-        graphics_window_set(window, kind, 260, 120, 360, 250, "\u6587\u4ef6");
+        graphics_window_set(window, kind, graphics_clamp_window_x(390), 82, 390, 270, "\u6587\u4ef6");
         graphics_fill_file_browser();
         break;
     case UI_WINDOW_TERMINAL:
-        graphics_window_set(window, kind, 300, 150, 420, 260, "\u7ec8\u7aef");
+        graphics_window_set(window, kind, graphics_clamp_window_x(500), 128, 500, 286, "\u7ec8\u7aef");
         graphics_set_terminal_focus(true);
         break;
     case UI_WINDOW_RUN:
-        graphics_window_set(window, kind, 350, 240, 320, 120, "\u8fd0\u884c");
+        graphics_window_set(window, kind, graphics_clamp_window_x(320), graphics_clamp_window_y(120), 320, 120, "\u8fd0\u884c");
         g_run_input_len = 0;
         g_run_input[0] = '\0';
         g_run_input_focus = true;
         break;
     case UI_WINDOW_SHELL:
-        graphics_window_set(window, kind, 280, 120, 460, 280, "\u547d\u4ee4");
+        graphics_window_set(window, kind, graphics_clamp_window_x(460), 120, 460, 280, "\u547d\u4ee4");
         break;
     case UI_WINDOW_ABOUT:
-        graphics_window_set(window, kind, 340, 180, 300, 180, "\u5173\u4e8e");
+        graphics_window_set(window, kind, graphics_clamp_window_x(320), graphics_clamp_window_y(190), 320, 190, "\u5173\u4e8e");
         break;
     case UI_WINDOW_PLAYER:
-        graphics_window_set(window, kind, 330, 140, 360, 320, "\u64ad\u653e\u5668");
+        graphics_window_set(window, kind, graphics_clamp_window_x(370), 118, 370, 320, "\u64ad\u653e\u5668");
         if (g_player_current_path[0] == '\0') {
             strcpy(g_player_current_path, "/");
         }
@@ -1428,7 +2464,7 @@ static void graphics_open_window(ui_window_kind_t kind)
         }
         break;
     case UI_WINDOW_NOTEPAD:
-        graphics_window_set(window, kind, 220, 90, 520, 340, "\u8bb0\u4e8b\u672c");
+        graphics_window_set(window, kind, graphics_clamp_window_x(540), 78, 540, 360, "\u8bb0\u4e8b\u672c");
         g_notepad_focus = true;
         if (g_notepad_path[0] == '\0') {
             strcpy(g_notepad_path, "/home/root/desktop/note.txt");
@@ -1437,10 +2473,10 @@ static void graphics_open_window(ui_window_kind_t kind)
         }
         break;
     case UI_WINDOW_TASKMGR:
-        graphics_window_set(window, kind, 300, 130, 380, 260, "\u4efb\u52a1\u7ba1\u7406\u5668");
+        graphics_window_set(window, kind, graphics_clamp_window_x(390), 120, 390, 272, "\u4efb\u52a1\u7ba1\u7406\u5668");
         break;
     case UI_WINDOW_CUBE3D:
-        graphics_window_set(window, kind, 280, 110, 480, 360, "Cube3D");
+        graphics_window_set(window, kind, graphics_clamp_window_x(500), 96, 500, 370, "Cube3D");
         g_cube3d_open = true;
         if (g_cube3d_last_tick == 0) {
             g_cube3d_angle_x = 0.45f;
@@ -1449,11 +2485,14 @@ static void graphics_open_window(ui_window_kind_t kind)
         }
         break;
     case UI_WINDOW_POWER:
-        graphics_window_set(window, kind, 380, 210, 220, 140, "\u7535\u6e90");
+        graphics_window_set(window, kind, graphics_clamp_window_x(220), graphics_clamp_window_y(140), 220, 140, "\u7535\u6e90");
         break;
     case UI_WINDOW_UAC:
-        graphics_window_set(window, kind, 312, 206, 400, 210, "UAC");
+        graphics_window_set(window, kind, graphics_clamp_window_x(400), graphics_clamp_window_y(210), 400, 210, "UAC");
         g_uac_input_focus = true;
+        break;
+    case UI_WINDOW_CONTROL_PANEL:
+        graphics_window_set(window, kind, graphics_clamp_window_x(430), 88, 430, 354, "\u63a7\u5236\u9762\u677f");
         break;
     default:
         break;
@@ -1473,6 +2512,8 @@ static void graphics_close_window(uint32_t index)
     }
     kind = g_windows[index].kind;
     g_windows[index].visible = false;
+    g_windows[index].minimized = false;
+    g_windows[index].maximized = false;
     if (g_dragging_window && g_drag_window_index == index) {
         g_dragging_window = false;
     }
@@ -1507,7 +2548,9 @@ static void graphics_close_window(uint32_t index)
 
 static void graphics_fill(uint32_t color)
 {
-    for (uint32_t i = 0; i < FB_PIXELS; i++) {
+    uint32_t pixels = (uint32_t) FB_WIDTH * (uint32_t) FB_HEIGHT;
+
+    for (uint32_t i = 0; i < pixels; i++) {
         g_backbuffer[i] = color;
     }
 }
@@ -1587,86 +2630,86 @@ static void graphics_wait_ticks(uint64_t wait_ticks)
     }
 }
 
-static void graphics_draw_boot_frame(uint32_t progress, bool show_text)
+static void graphics_draw_boot_frame(uint32_t progress, uint32_t phase)
 {
-    const uint16_t bar_w = 264;
-    const uint16_t bar_h = 16;
+    const uint16_t bar_w = 320;
+    const uint16_t bar_h = 14;
     const uint16_t bar_x = (FB_WIDTH - bar_w) / 2;
-    const uint16_t bar_y = FB_HEIGHT - 94;
-    const uint16_t block_w = 42;
-    const uint16_t block_gap = 16;
-    uint32_t phase;
+    const uint16_t bar_y = FB_HEIGHT - 80;
+    uint16_t filled_w;
 
-    (void) show_text;
     if (progress > 100) {
         progress = 100;
     }
 
-    graphics_fill(0x00000000);
-    graphics_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x00111111);
-    graphics_draw_rect_outline(bar_x, bar_y, bar_w, bar_h, 0x00686868);
-    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + 1), (uint16_t) (bar_w - 2), 1, 0x00FFFFFF);
+    graphics_fill_vertical_gradient(0x00000000, 0x000A1628);
+    graphics_draw_text_aligned(0, (uint16_t) (FB_HEIGHT / 2 - 56), FB_WIDTH, "MoniOS", 0x00FFFFFF);
+    graphics_draw_text_aligned(0, (uint16_t) (FB_HEIGHT / 2 - 26), FB_WIDTH, "Starting up", 0x0085B7E8);
+
+    graphics_fill_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, 0x004A4A4A);
+    graphics_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x001A1A1A);
+
+    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + 1), (uint16_t) (bar_w - 2), 1, 0x00606060);
     graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + bar_h - 2), (uint16_t) (bar_w - 2), 1, 0x00303030);
+    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + 1), 1, (uint16_t) (bar_h - 2), 0x00606060);
+    graphics_fill_rect((uint16_t) (bar_x + bar_w - 2), (uint16_t) (bar_y + 1), 1, (uint16_t) (bar_h - 2), 0x00303030);
 
-    phase = (progress * 5u) % (bar_w + block_w + block_gap);
-    for (uint16_t i = 0; i < 3; i++) {
-        int32_t left = (int32_t) bar_x + 2 + (int32_t) ((phase + i * (block_w + block_gap)) % (bar_w + block_w + block_gap)) - block_w;
-        int32_t right = left + block_w;
-        uint16_t draw_x;
-        uint16_t draw_w;
+    filled_w = (uint16_t) ((progress * (bar_w - 4)) / 100);
 
-        if (right <= (int32_t) bar_x + 2 || left >= (int32_t) bar_x + bar_w - 2) {
-            continue;
+    if (filled_w > 0) {
+        uint16_t inner_y = (uint16_t) (bar_y + 2);
+        uint16_t inner_h = (uint16_t) (bar_h - 4);
+
+        for (uint16_t y = 0; y < inner_h; y++) {
+            uint32_t color = graphics_lerp_color(0x000058C8, 0x004CC8FF, y, inner_h > 1 ? inner_h - 1 : 1);
+            graphics_fill_rect((uint16_t) (bar_x + 2), (uint16_t) (inner_y + y), filled_w, 1, color);
         }
-        if (left < (int32_t) bar_x + 2) {
-            left = (int32_t) bar_x + 2;
+        for (uint16_t x = 0; x < filled_w; x++) {
+            uint32_t wave = (x + phase) % 64u;
+            if (wave < 20u) {
+                uint32_t color = graphics_lerp_color(0x0040C0FF, 0x00B8E8FF, wave, 19u);
+                graphics_fill_rect((uint16_t) (bar_x + 2 + x), inner_y, 1, inner_h, color);
+            } else if (wave < 36u) {
+                uint32_t color = graphics_lerp_color(0x00B8E8FF, 0x0040C0FF, wave - 20u, 15u);
+                graphics_fill_rect((uint16_t) (bar_x + 2 + x), inner_y, 1, inner_h, color);
+            }
         }
-        if (right > (int32_t) bar_x + bar_w - 2) {
-            right = (int32_t) bar_x + bar_w - 2;
-        }
-        draw_x = (uint16_t) left;
-        draw_w = (uint16_t) (right - left);
-        graphics_fill_rect(draw_x, (uint16_t) (bar_y + 3), draw_w, 10, 0x001B4FBA);
-        if (draw_w > 4) {
-            graphics_fill_rect(draw_x, (uint16_t) (bar_y + 3), draw_w, 2, 0x004FA3FF);
-            graphics_fill_rect(draw_x, (uint16_t) (bar_y + 11), draw_w, 2, 0x000E2F80);
-        }
+        graphics_fill_rect((uint16_t) (bar_x + 2), inner_y, filled_w, 2, 0x0080D0FF);
+        graphics_fill_rect((uint16_t) (bar_x + 2), (uint16_t) (inner_y + inner_h - 2), filled_w, 1, 0x000060CC);
     }
 }
 
 static void graphics_show_boot_loading_screen(void)
 {
-    graphics_draw_boot_frame(8, false);
+    graphics_draw_boot_frame(8, 0);
     graphics_present();
 }
 
-static void graphics_play_boot_animation(void)
+void graphics_boot_animation(void)
 {
-    uint32_t hz = timer_hz();
-    uint64_t duration = hz == 0 ? 84u : (uint64_t) ((hz * 7u) / 6u);
-    uint64_t frame_ticks = hz == 0 ? 3u : (uint64_t) (hz / 36u == 0 ? 1u : hz / 36u);
-    uint64_t start = timer_ticks();
-    uint64_t next_tick = start;
+    const uint32_t frames = 72u;
 
-    if (duration == 0) {
-        duration = 84;
+    if (!g_graphics_active) {
+        return;
     }
 
-    while (1) {
-        uint64_t now = timer_ticks();
-        uint64_t elapsed = now - start;
-        uint32_t progress = (uint32_t) (8u + (elapsed >= duration ? 92u : (elapsed * 92u) / duration));
+    asm volatile ("cli");
+    for (uint32_t frame = 0; frame <= frames; frame++) {
+        uint32_t progress = 8u + (frame * 92u) / frames;
+        uint32_t phase = (frame * 7u) % 64u;
 
-        graphics_draw_boot_frame(progress, true);
+        if (progress > 100u) {
+            progress = 100u;
+        }
+        graphics_draw_boot_frame(progress, phase);
         graphics_present();
-        if (elapsed >= duration) {
-            break;
-        }
-        next_tick += frame_ticks;
-        while (timer_ticks() < next_tick) {
+        for (volatile uint32_t delay = 0; delay < 24000u; delay++) {
+            asm volatile ("pause");
         }
     }
-    graphics_wait_ticks(hz == 0 ? 10u : hz / 10u);
+    for (volatile uint32_t delay = 0; delay < 300000u; delay++) {
+        asm volatile ("pause");
+    }
 }
 
 void graphics_draw_bsod(const char *process, const char *code, const char *text, uint32_t progress)
@@ -1714,22 +2757,42 @@ void graphics_draw_bsod(const char *process, const char *code, const char *text,
 
 static void graphics_draw_desktop(void)
 {
-    graphics_fill(0x001A3A6E);
-    for (uint16_t y = FB_HEIGHT - TASKBAR_HEIGHT; y < FB_HEIGHT; y++) {
-        for (uint16_t x = 0; x < FB_WIDTH; x++) {
-            graphics_plot(x, y, 0x004A4A4A);
+    uint16_t usable_h = (uint16_t) (FB_HEIGHT > TASKBAR_HEIGHT ? FB_HEIGHT - TASKBAR_HEIGHT : FB_HEIGHT);
+    uint16_t center_x = (uint16_t) (FB_WIDTH / 2);
+    uint16_t fold_w = (uint16_t) (FB_WIDTH / 3);
+    uint16_t fold_h = (uint16_t) (usable_h / 2);
+
+    graphics_fill_vertical_gradient(0x000B1024, 0x00244CA8);
+    for (uint16_t y = 0; y < usable_h; y++) {
+        uint16_t left_w = (uint16_t) ((y * fold_w) / (usable_h == 0 ? 1 : usable_h));
+        uint16_t right_w = (uint16_t) (((usable_h - y) * fold_w) / (usable_h == 0 ? 1 : usable_h));
+        uint16_t glow_y = (uint16_t) (usable_h / 5 + y / 4);
+
+        if (center_x > left_w) {
+            graphics_fill_rect_gradient((uint16_t) (center_x - left_w), y, left_w, 1, 0x001B68D8, 0x006CB6FF);
+        }
+        if (center_x + right_w < FB_WIDTH) {
+            graphics_fill_rect_gradient(center_x, y, right_w, 1, 0x006A52D8, 0x0020B9FF);
+        }
+        if (y < fold_h && glow_y < usable_h) {
+            uint16_t glow_w = (uint16_t) (fold_w / 2 + y / 2);
+            uint16_t glow_x = center_x > glow_w ? (uint16_t) (center_x - glow_w) : 0;
+            graphics_fill_rect_gradient(glow_x, glow_y, (uint16_t) (glow_w * 2), 1, 0x001C8FE8, 0x0049D4FF);
         }
     }
+    graphics_fill_rect_gradient(0, 0, FB_WIDTH, 72, 0x00142846, 0x000B1024);
+    graphics_fill_rect_gradient(0, (uint16_t) (usable_h > 90 ? usable_h - 90 : 0), FB_WIDTH, 90, 0x00254DA8, 0x000B1024);
+    graphics_fill_rect_gradient(0, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT), FB_WIDTH, TASKBAR_HEIGHT, 0x00F7FBFF, UI_COLOR_TASKBAR);
     for (uint16_t x = 0; x < FB_WIDTH; x++) {
-        graphics_plot(x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT), 0x008AA1B8);
+        graphics_plot(x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT), UI_COLOR_TASKBAR_EDGE);
+        graphics_plot(x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 1), 0x00FFFFFF);
     }
 }
 
 static void graphics_load_desktop_entries(void)
 {
-    char buffer[256];
+    char buffer[768];
     char desktop_path[GRAPHICS_FILE_PATH_MAX];
-    uint32_t start = 0;
     uint32_t index = 0;
 
     g_desktop_entry_count = 0;
@@ -1741,21 +2804,40 @@ static void graphics_load_desktop_entries(void)
         return;
     }
 
-    for (uint32_t i = 0; buffer[i] != '\0' && index < DESKTOP_LABEL_MAX; i++) {
+    for (uint32_t i = 0; buffer[i] != '\0' && index < DESKTOP_LABEL_MAX;) {
+        uint32_t line_start = i;
         uint32_t length = 0;
-        if (buffer[i] != '\n') {
-            continue;
+
+        while (buffer[i] != '\0' && buffer[i] != '\n') {
+            i++;
         }
-        while (start + length < i && length < sizeof(g_desktop_entries[index]) - 1) {
-            g_desktop_entries[index][length] = buffer[start + length];
+        while (line_start + length < i && length < sizeof(g_desktop_entries[index].name) - 1) {
+            g_desktop_entries[index].name[length] = buffer[line_start + length];
             length++;
         }
-        g_desktop_entries[index][length] = '\0';
-        if (length > 0) {
-            g_desktop_entry_count++;
-            index++;
+        if (length == 0) {
+            continue;
         }
-        start = i + 1;
+        g_desktop_entries[index].name[length] = '\0';
+        g_desktop_entries[index].is_dir = graphics_is_separator(g_desktop_entries[index].name[length - 1]);
+        if (g_desktop_entries[index].is_dir) {
+            g_desktop_entries[index].name[length - 1] = '\0';
+        }
+        g_desktop_entry_count++;
+        index++;
+        if (buffer[i] == '\n') {
+            i++;
+        }
+    }
+}
+
+static void graphics_desktop_icon_position(uint32_t index, uint16_t *out_x, uint16_t *out_y)
+{
+    if (out_x != NULL) {
+        *out_x = (uint16_t) (DESKTOP_ICON_START_X + (index % DESKTOP_ICON_COLS) * (DESKTOP_ICON_W + DESKTOP_ICON_GAP_X));
+    }
+    if (out_y != NULL) {
+        *out_y = (uint16_t) (DESKTOP_ICON_START_Y + (index / DESKTOP_ICON_COLS) * (DESKTOP_ICON_H + DESKTOP_ICON_GAP_Y));
     }
 }
 
@@ -1765,14 +2847,38 @@ static void graphics_draw_desktop_icons(void)
         return;
     }
     for (uint32_t i = 0; i < g_desktop_entry_count; i++) {
-        uint16_t x = (uint16_t) (DESKTOP_ICON_START_X + (i % 2) * (DESKTOP_ICON_W + DESKTOP_ICON_GAP_X));
-        uint16_t y = (uint16_t) (DESKTOP_ICON_START_Y + (i / 2) * (DESKTOP_ICON_H + DESKTOP_ICON_GAP_Y));
+        char path[GRAPHICS_CLIPBOARD_PATH_MAX];
+        char label[GRAPHICS_FILE_NAME_MAX];
+        uint16_t x;
+        uint16_t y;
+        graphics_icon_kind_t icon_kind;
+        bool selected = g_last_click_source == UI_CLICK_SOURCE_DESKTOP && g_last_click_index == i;
+        uint32_t tile_fill = selected ? 0x002D5D9F : 0x001C2B49;
+        uint32_t tile_border = selected ? 0x008BC5FF : 0x004A7AC0;
+        uint32_t label_fill = selected ? 0x003C6FEA : 0x0015263F;
 
-        graphics_fill_rect(x + 17, y, 36, 36, 0x00D5E5F6);
-        graphics_draw_rect_outline(x + 17, y, 36, 36, 0x00203B5A);
-        graphics_fill_rect(x + 24, y + 8, 22, 16, 0x0098BADB);
-        graphics_draw_text(x + 4, (uint16_t) (y + 50), g_desktop_entries[i], 0x00F7F7F7);
+        graphics_desktop_icon_position(i, &x, &y);
+        graphics_build_desktop_entry_path(i, path);
+        icon_kind = graphics_icon_kind_for_path(path, g_desktop_entries[i].is_dir);
+        graphics_make_display_label(g_desktop_entries[i].name, label, sizeof(label));
+        graphics_fill_soft_rect((uint16_t) (x + 6), y, 62, 74, tile_fill);
+        graphics_draw_soft_rect_outline((uint16_t) (x + 6), y, 62, 74, tile_border);
+        graphics_draw_icon((uint16_t) (x + 13), (uint16_t) (y + 5), icon_kind, false);
+        graphics_fill_soft_rect((uint16_t) (x + 2), (uint16_t) (y + 56), (uint16_t) (DESKTOP_ICON_W - 4), 18, label_fill);
+        graphics_draw_text_aligned(x, (uint16_t) (y + 61), DESKTOP_ICON_W, label, 0x00FFFFFF);
     }
+}
+
+static uint16_t graphics_taskbar_pinned_start_x(void)
+{
+    return 12;
+}
+
+static uint16_t graphics_taskbar_running_start_x(void)
+{
+    uint32_t pinned_count = (uint32_t) (sizeof(g_taskbar_buttons) / sizeof(g_taskbar_buttons[0]));
+    return (uint16_t) (graphics_taskbar_pinned_start_x() + START_BUTTON_WIDTH + 10u +
+                       pinned_count * (BUTTON_WIDTH + BUTTON_GAP) + 10u);
 }
 
 static void graphics_draw_taskbar(void)
@@ -1780,26 +2886,45 @@ static void graphics_draw_taskbar(void)
     if (!g_session_logged_in) {
         return;
     }
+    uint16_t start_x = graphics_taskbar_pinned_start_x();
     uint16_t task_x;
-    uint32_t start_fill = g_start_menu_open ? 0x00E2C35A : 0x00256EC8;
-    uint32_t start_border = g_start_menu_open ? 0x00FFF4BE : 0x00CDE4FF;
+    uint16_t start_icon_x;
+    uint16_t start_icon_y;
+    uint32_t start_fill = g_start_menu_open ? 0x00E8F0FF : 0x00FFFFFF;
+    uint32_t start_border = g_start_menu_open ? UI_COLOR_ACCENT : 0x00D7E2EF;
 
-    graphics_fill_rect(12, BUTTON_Y, START_BUTTON_WIDTH, BUTTON_HEIGHT, start_fill);
-    graphics_draw_rect_outline(12, BUTTON_Y, START_BUTTON_WIDTH, BUTTON_HEIGHT, start_border);
-    graphics_draw_text(36, (uint16_t) (BUTTON_Y + 11), "开始", 0x000C1622);
+    graphics_fill_soft_rect(start_x, BUTTON_Y, START_BUTTON_WIDTH, BUTTON_HEIGHT, start_fill);
+    graphics_draw_soft_rect_outline(start_x, BUTTON_Y, START_BUTTON_WIDTH, BUTTON_HEIGHT, start_border);
+    start_icon_x = (uint16_t) (start_x + 16);
+    start_icon_y = (uint16_t) (BUTTON_Y + 9);
+    graphics_fill_rect(start_icon_x, start_icon_y, 7, 7, 0x003C6FEA);
+    graphics_fill_rect((uint16_t) (start_icon_x + 9), start_icon_y, 7, 7, 0x004DB5FF);
+    graphics_fill_rect(start_icon_x, (uint16_t) (start_icon_y + 9), 7, 7, 0x004DB5FF);
+    graphics_fill_rect((uint16_t) (start_icon_x + 9), (uint16_t) (start_icon_y + 9), 7, 7, 0x003C6FEA);
 
-    task_x = (uint16_t) (28 + START_BUTTON_WIDTH);
+    task_x = (uint16_t) (start_x + START_BUTTON_WIDTH + 10);
     for (uint32_t i = 0; i < sizeof(g_taskbar_buttons) / sizeof(g_taskbar_buttons[0]); i++) {
         uint16_t x = (uint16_t) (task_x + i * (BUTTON_WIDTH + BUTTON_GAP));
-        uint32_t fill = i == g_active_button_index ? 0x00F0D36A : g_taskbar_buttons[i].color;
-        uint32_t border = i == g_active_button_index ? 0x00FFF7D1 : 0x00D8E6F2;
+        uint32_t fill = i == g_active_button_index ? 0x00FFFFFF : 0x00F6FAFF;
+        uint32_t border = i == g_active_button_index ? UI_COLOR_ACCENT : 0x00D7E2EF;
+        graphics_icon_kind_t icon_kind = GRAPHICS_ICON_FOLDER;
 
-        graphics_fill_rect(x, BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, fill);
-        graphics_draw_rect_outline(x, BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, border);
-        graphics_draw_text((uint16_t) (x + 14), (uint16_t) (BUTTON_Y + 11), g_taskbar_buttons[i].label, 0x000F1620);
+        graphics_fill_soft_rect(x, BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, fill);
+        graphics_draw_soft_rect_outline(x, BUTTON_Y, BUTTON_WIDTH, BUTTON_HEIGHT, border);
+        if (i == g_active_button_index) {
+            graphics_fill_rect((uint16_t) (x + 14), (uint16_t) (BUTTON_Y + BUTTON_HEIGHT - 3), (uint16_t) (BUTTON_WIDTH - 28), 2, UI_COLOR_ACCENT);
+        }
+        if (i == 1) {
+            icon_kind = GRAPHICS_ICON_TERMINAL;
+        } else if (i == 2) {
+            icon_kind = GRAPHICS_ICON_SETTINGS;
+        } else if (i == 3) {
+            icon_kind = GRAPHICS_ICON_INFO;
+        }
+        graphics_draw_icon((uint16_t) (x + 13), (uint16_t) (BUTTON_Y + 8), icon_kind, true);
     }
 
-    task_x = (uint16_t) (task_x + sizeof(g_taskbar_buttons) / sizeof(g_taskbar_buttons[0]) * (BUTTON_WIDTH + BUTTON_GAP) + 12);
+    task_x = graphics_taskbar_running_start_x();
     for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
         if (!g_windows[i].visible || g_windows[i].kind == UI_WINDOW_LOGON || g_windows[i].kind == UI_WINDOW_POWER) {
             continue;
@@ -1807,9 +2932,9 @@ static void graphics_draw_taskbar(void)
         if (task_x + UI_TASK_BUTTON_W >= FB_WIDTH - 184) {
             break;
         }
-        graphics_fill_rect(task_x, BUTTON_Y, UI_TASK_BUTTON_W, BUTTON_HEIGHT, 0x00394A5E);
-        graphics_draw_rect_outline(task_x, BUTTON_Y, UI_TASK_BUTTON_W, BUTTON_HEIGHT, 0x00AFC9E4);
-        graphics_draw_text((uint16_t) (task_x + 10), (uint16_t) (BUTTON_Y + 11), g_windows[i].title, 0x00F3F7FB);
+        graphics_fill_soft_rect(task_x, BUTTON_Y, UI_TASK_BUTTON_W, BUTTON_HEIGHT, 0x00FFFFFF);
+        graphics_draw_soft_rect_outline(task_x, BUTTON_Y, UI_TASK_BUTTON_W, BUTTON_HEIGHT, 0x00CAD8E8);
+        graphics_draw_icon((uint16_t) (task_x + 13), (uint16_t) (BUTTON_Y + 8), graphics_icon_kind_for_window(g_windows[i].kind), true);
         task_x = (uint16_t) (task_x + UI_TASK_BUTTON_W + 8);
     }
     graphics_draw_taskbar_status();
@@ -1822,7 +2947,7 @@ static bool graphics_taskbar_window_at(uint16_t x, uint16_t y, uint32_t *out_ind
     if (y < BUTTON_Y || y >= BUTTON_Y + BUTTON_HEIGHT) {
         return false;
     }
-    task_x = (uint16_t) (28 + START_BUTTON_WIDTH + sizeof(g_taskbar_buttons) / sizeof(g_taskbar_buttons[0]) * (BUTTON_WIDTH + BUTTON_GAP) + 12);
+    task_x = graphics_taskbar_running_start_x();
     for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
         if (!g_windows[i].visible || g_windows[i].kind == UI_WINDOW_LOGON || g_windows[i].kind == UI_WINDOW_POWER) {
             continue;
@@ -1860,10 +2985,10 @@ static void graphics_draw_taskbar_status(void)
     uint16_t panel_x = FB_WIDTH - 174;
 
     cmos_read_time(&now);
-    graphics_fill_rect(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 5), 162, 38, 0x00303B48);
-    graphics_draw_rect_outline(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 5), 162, 38, 0x006C7F92);
+    graphics_fill_soft_rect(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 7), 162, 38, 0x00FFFFFF);
+    graphics_draw_soft_rect_outline(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 7), 162, 38, 0x00D7E2EF);
 
-    graphics_draw_text((uint16_t) (panel_x + 10), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 12), net_connected() ? "OK" : "/", net_connected() ? 0x0084F0A2 : 0x00F0D36A);
+    graphics_draw_text((uint16_t) (panel_x + 10), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 15), net_connected() ? "OK" : "/", net_connected() ? 0x002E8B57 : 0x00B7791F);
 
     graphics_two_digits(&time_text[0], now.hour);
     time_text[2] = ':';
@@ -1879,8 +3004,8 @@ static void graphics_draw_taskbar_status(void)
     graphics_two_digits(&date_text[8], now.day);
     date_text[10] = '\0';
 
-    graphics_draw_text((uint16_t) (panel_x + 48), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 9), time_text, 0x00F3F7FB);
-    graphics_draw_text((uint16_t) (panel_x + 48), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 25), date_text, 0x00D7E1EA);
+    graphics_draw_text((uint16_t) (panel_x + 48), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 11), time_text, 0x001F2937);
+    graphics_draw_text((uint16_t) (panel_x + 48), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 27), date_text, 0x00566A80);
 }
 
 static void graphics_draw_start_menu(void)
@@ -1889,32 +3014,110 @@ static void graphics_draw_start_menu(void)
         return;
     }
 
-    graphics_fill_rect(12, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 188), 220, 176, 0x0014202C);
-    graphics_draw_rect_outline(12, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 188), 220, 176, 0x009BC2F3);
-    graphics_draw_text(28, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 168), "MONIOS", 0x00FFFFFF);
-    graphics_draw_text(28, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 138), "\u6587\u4ef6", 0x00CDE4FF);
-    graphics_draw_text(28, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 112), "\u7ec8\u7aef", 0x00CDE4FF);
-    graphics_draw_text(28, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 86), "\u8fd0\u884c", 0x00CDE4FF);
-    graphics_draw_text(28, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 60), "\u7535\u6e90", 0x00CDE4FF);
+    static const char *root_items[] = { "\u5e94\u7528", "\u8bbe\u7f6e", "\u7f51\u7edc", "\u7535\u6e90" };
+    static const char *apps_items[] = { "\u6587\u4ef6", "\u7ec8\u7aef", "\u64ad\u653e\u5668", "\u8bb0\u4e8b\u672c", "\u4efb\u52a1\u7ba1\u7406\u5668" };
+    static const char *settings_items[] = { "\u663e\u793a", "\u6307\u9488", "\u7f51\u7edc" };
+    static const char *power_items[] = { "\u5173\u673a", "\u91cd\u542f", "\u4f11\u7720" };
+    uint16_t menu_y = (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - START_MENU_H - 12);
+    uint16_t root_top = (uint16_t) (menu_y + START_MENU_HEADER_H + 8);
+    uint16_t left_x = (uint16_t) (START_MENU_X + 8);
+    uint16_t mid_x = (uint16_t) (START_MENU_X + START_MENU_LEFT_W + 12);
+    uint16_t right_x = (uint16_t) (START_MENU_X + START_MENU_LEFT_W + START_MENU_MID_W + 16);
+
+    graphics_draw_shadow(START_MENU_X, menu_y, START_MENU_W, START_MENU_H);
+    graphics_fill_soft_rect(START_MENU_X, menu_y, START_MENU_W, START_MENU_H, 0x00F7FAFE);
+    graphics_draw_soft_rect_outline(START_MENU_X, menu_y, START_MENU_W, START_MENU_H, 0x00CFDAE8);
+    graphics_fill_rect_gradient((uint16_t) (START_MENU_X + 2), (uint16_t) (menu_y + 2), (uint16_t) (START_MENU_W - 4), START_MENU_HEADER_H - 2, 0x00FFFFFF, 0x00EEF4FB);
+    graphics_draw_text((uint16_t) (START_MENU_X + 16), (uint16_t) (menu_y + 19), "MONIOS", 0x001F2937);
+    graphics_draw_text((uint16_t) (START_MENU_X + 92), (uint16_t) (menu_y + 19), "launcher", 0x00566A80);
+
+    for (uint32_t i = 0; i < 4; i++) {
+        uint16_t row_y = (uint16_t) (root_top + i * UI_MENU_ITEM_H);
+        bool root_selected = (g_start_menu_view == UI_START_MENU_APPS && i == 0) ||
+                             (g_start_menu_view == UI_START_MENU_SETTINGS && i == 1) ||
+                             (g_start_menu_view == UI_START_MENU_NETWORK && i == 2) ||
+                             (g_start_menu_view == UI_START_MENU_POWER && i == 3);
+        uint32_t fill = root_selected ? 0x00E7F0FF : 0x00FFFFFF;
+
+        graphics_fill_soft_rect(left_x, row_y, START_MENU_LEFT_W - 16, UI_MENU_ITEM_H - 2, fill);
+        if (root_selected) {
+            graphics_fill_rect(left_x, (uint16_t) (row_y + 4), 3, (uint16_t) (UI_MENU_ITEM_H - 10), UI_COLOR_ACCENT);
+        }
+        graphics_draw_text((uint16_t) (left_x + 10), (uint16_t) (row_y + 6), root_items[i], 0x001F2937);
+    }
+
+    if (g_start_menu_view == UI_START_MENU_APPS || g_start_menu_view == UI_START_MENU_SETTINGS ||
+        g_start_menu_view == UI_START_MENU_DISPLAY || g_start_menu_view == UI_START_MENU_CURSOR ||
+        g_start_menu_view == UI_START_MENU_NETWORK || g_start_menu_view == UI_START_MENU_POWER) {
+        graphics_fill_soft_rect(mid_x, root_top, START_MENU_MID_W - 12, 5 * UI_MENU_ITEM_H - 2, 0x00FFFFFF);
+        graphics_draw_soft_rect_outline(mid_x, root_top, START_MENU_MID_W - 12, 5 * UI_MENU_ITEM_H - 2, 0x00D7E2EF);
+    }
+
+    if (g_start_menu_view == UI_START_MENU_APPS) {
+        for (uint32_t i = 0; i < sizeof(apps_items) / sizeof(apps_items[0]); i++) {
+            uint16_t row_y = (uint16_t) (root_top + i * UI_MENU_ITEM_H);
+            graphics_fill_soft_rect(mid_x + 2, row_y, START_MENU_MID_W - 16, UI_MENU_ITEM_H - 2, 0x00F6FAFF);
+            graphics_draw_text((uint16_t) (mid_x + 14), (uint16_t) (row_y + 6), apps_items[i], 0x001F2937);
+        }
+    } else if (g_start_menu_view == UI_START_MENU_SETTINGS) {
+        for (uint32_t i = 0; i < sizeof(settings_items) / sizeof(settings_items[0]); i++) {
+            uint16_t row_y = (uint16_t) (root_top + i * UI_MENU_ITEM_H);
+            graphics_fill_soft_rect(mid_x + 2, row_y, START_MENU_MID_W - 16, UI_MENU_ITEM_H - 2, 0x00F6FAFF);
+            graphics_draw_text((uint16_t) (mid_x + 14), (uint16_t) (row_y + 6), settings_items[i], 0x001F2937);
+        }
+    } else if (g_start_menu_view == UI_START_MENU_DISPLAY) {
+        for (uint32_t i = 0; i < sizeof(g_graphics_modes) / sizeof(g_graphics_modes[0]); i++) {
+            uint16_t row_y = (uint16_t) (root_top + i * UI_MENU_ITEM_H);
+            uint32_t fill = i == g_graphics_mode_index ? UI_COLOR_ACCENT : 0x00F6FAFF;
+            graphics_fill_soft_rect(right_x, row_y, START_MENU_RIGHT_W - 20, UI_MENU_ITEM_H - 2, fill);
+            graphics_draw_text((uint16_t) (right_x + 12), (uint16_t) (row_y + 6), g_graphics_modes[i].label, i == g_graphics_mode_index ? 0x00FFFFFF : 0x001F2937);
+        }
+    } else if (g_start_menu_view == UI_START_MENU_CURSOR) {
+        for (uint32_t i = 0; i < graphics_cursor_style_count(); i++) {
+            uint16_t col = (uint16_t) (i & 1u);
+            uint16_t row = (uint16_t) (i >> 1);
+            uint16_t button_x = (uint16_t) (right_x + 12 + col * 82);
+            uint16_t button_y = (uint16_t) (root_top + row * 28);
+            uint32_t fill = i == g_cursor_style_index ? UI_COLOR_ACCENT : 0x00F6FAFF;
+
+            graphics_fill_soft_rect(button_x, button_y, 70, 22, fill);
+            graphics_draw_text_aligned(button_x, (uint16_t) (button_y + 6), 70, g_cursor_styles[i].label, i == g_cursor_style_index ? 0x00FFFFFF : 0x001F2937);
+        }
+    } else if (g_start_menu_view == UI_START_MENU_NETWORK) {
+        graphics_fill_soft_rect(right_x, root_top, START_MENU_RIGHT_W - 20, 5 * UI_MENU_ITEM_H - 2, 0x00FFFFFF);
+        graphics_draw_text((uint16_t) (right_x + 12), (uint16_t) (root_top + 6), "ping 172.16.58.1", 0x001F2937);
+        graphics_draw_text((uint16_t) (right_x + 12), (uint16_t) (root_top + 30), "control panel", 0x001F2937);
+    } else if (g_start_menu_view == UI_START_MENU_POWER) {
+        for (uint32_t i = 0; i < sizeof(power_items) / sizeof(power_items[0]); i++) {
+            uint16_t row_y = (uint16_t) (root_top + i * UI_MENU_ITEM_H);
+            graphics_fill_soft_rect(mid_x + 2, row_y, START_MENU_MID_W - 16, UI_MENU_ITEM_H - 2, 0x00FFF5F6);
+            graphics_draw_text((uint16_t) (mid_x + 14), (uint16_t) (row_y + 6), power_items[i], 0x007A1E2B);
+        }
+    }
 }
 
 static void graphics_draw_context_menu(void)
 {
+    uint16_t menu_h;
+
     if (!g_session_logged_in || !g_context_menu_open) {
         return;
     }
 
-    graphics_fill_rect(g_context_menu_x, g_context_menu_y, 170, 104, 0x0018222E);
-    graphics_draw_rect_outline(g_context_menu_x, g_context_menu_y, 170, 104, 0x009BC2F3);
+    menu_h = g_context_menu_mode == UI_CONTEXT_MENU_FILES ? CONTEXT_MENU_FILES_H : CONTEXT_MENU_DESKTOP_H;
+    graphics_draw_shadow(g_context_menu_x, g_context_menu_y, CONTEXT_MENU_W, menu_h);
+    graphics_fill_soft_rect(g_context_menu_x, g_context_menu_y, CONTEXT_MENU_W, menu_h, 0x001D2832);
+    graphics_draw_soft_rect_outline(g_context_menu_x, g_context_menu_y, CONTEXT_MENU_W, menu_h, 0x006D8798);
     if (g_context_menu_mode == UI_CONTEXT_MENU_FILES) {
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 14), "\u590d\u5236", 0x00FFFFFF);
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 38), "\u526a\u5207", 0x00FFFFFF);
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 62), g_clipboard_mode != UI_CLIPBOARD_NONE ? "\u7c98\u8d34" : "-", 0x00FFFFFF);
-        graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 86), "\u6253\u5f00", 0x00FFFFFF);
+        graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 86), "\u521b\u5efa\u5feb\u6377\u65b9\u5f0f", 0x00FFFFFF);
+        graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 110), "\u6253\u5f00", 0x00FFFFFF);
     } else {
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 14), "\u5237\u65b0", 0x00FFFFFF);
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 38), "\u8fd0\u884c", 0x00FFFFFF);
-        graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 62), "\u7535\u6e90", 0x00FFFFFF);
+        graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 62), "\u8bbe\u7f6e", 0x00FFFFFF);
         graphics_draw_text((uint16_t) (g_context_menu_x + 14), (uint16_t) (g_context_menu_y + 86), "\u6ce8\u9500", 0x00FFFFFF);
     }
 }
@@ -1925,12 +3128,133 @@ static void graphics_draw_power_menu(void)
         return;
     }
 
-    graphics_fill_rect(g_power_menu_x, g_power_menu_y, 170, 104, 0x0018222E);
-    graphics_draw_rect_outline(g_power_menu_x, g_power_menu_y, 170, 104, 0x009BC2F3);
+    graphics_draw_shadow(g_power_menu_x, g_power_menu_y, 170, 104);
+    graphics_fill_soft_rect(g_power_menu_x, g_power_menu_y, 170, 104, 0x001D2832);
+    graphics_draw_soft_rect_outline(g_power_menu_x, g_power_menu_y, 170, 104, 0x006D8798);
     graphics_draw_text((uint16_t) (g_power_menu_x + 14), (uint16_t) (g_power_menu_y + 14), "\u5173\u673a", 0x00FFFFFF);
     graphics_draw_text((uint16_t) (g_power_menu_x + 14), (uint16_t) (g_power_menu_y + 38), "\u91cd\u542f", 0x00FFFFFF);
     graphics_draw_text((uint16_t) (g_power_menu_x + 14), (uint16_t) (g_power_menu_y + 62), "\u4f11\u7720", 0x00FFFFFF);
     graphics_draw_text((uint16_t) (g_power_menu_x + 14), (uint16_t) (g_power_menu_y + 86), "\u6ce8\u9500", 0x00FFFFFF);
+}
+
+static void graphics_draw_control_panel_window(const ui_window_t *window)
+{
+    const net_info_t *info = net_info();
+    char mode_text[32];
+    char line[96];
+    uint32_t mode_count = (uint32_t) (sizeof(g_graphics_modes) / sizeof(g_graphics_modes[0]));
+    uint32_t cursor_count = graphics_cursor_style_count();
+
+    if (window == NULL) {
+        return;
+    }
+
+    graphics_make_resolution_label(mode_text, sizeof(mode_text), FB_WIDTH, FB_HEIGHT);
+    graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42), "\u663e\u793a", 0x0017232E);
+    strcpy(line, "\u5f53\u524d ");
+    strcpy(line + strlen(line), mode_text);
+    graphics_draw_text((uint16_t) (window->x + 76), (uint16_t) (window->y + 42), line, 0x004A6278);
+
+    for (uint32_t i = 0; i < mode_count; i++) {
+        uint16_t row = (uint16_t) (window->y + 70 + i * 32);
+        uint32_t fill = i == g_graphics_mode_index ? 0x00256EC8 : 0x00F7FBFE;
+        uint32_t border = i == g_graphics_mode_index ? 0x00CDE4FF : 0x00A7BBD1;
+        uint32_t text = i == g_graphics_mode_index ? 0x00FFFFFF : 0x0017232E;
+
+        graphics_fill_rect((uint16_t) (window->x + 18), row, 128, 24, fill);
+        graphics_draw_rect_outline((uint16_t) (window->x + 18), row, 128, 24, border);
+        graphics_draw_text_aligned((uint16_t) (window->x + 18), (uint16_t) (row + 7), 128, g_graphics_modes[i].label, text);
+        if (i == 0) {
+            graphics_draw_text((uint16_t) (window->x + 158), (uint16_t) (row + 7), "\u9ed8\u8ba4", 0x004A6278);
+        }
+    }
+
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 42), "\u684c\u9762", 0x0017232E);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 66), "\u7a97\u53e3\u4f1a\u81ea\u52a8\u56de\u5230\u53ef\u89c1\u533a", 0x004A6278);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 90), "\u4efb\u52a1\u680f\u548c\u9f20\u6807\u8ddf\u968f\u5207\u6362", 0x004A6278);
+
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 118), "\u6307\u9488", 0x0017232E);
+    strcpy(line, "\u5f53\u524d ");
+    strcpy(line + strlen(line), g_cursor_styles[g_cursor_style_index].label);
+    graphics_draw_text((uint16_t) (window->x + 286), (uint16_t) (window->y + 118), line, 0x004A6278);
+    graphics_fill_rect((uint16_t) (window->x + 238), (uint16_t) (window->y + 142), 38, 38, 0x00FFFFFF);
+    graphics_draw_rect_outline((uint16_t) (window->x + 238), (uint16_t) (window->y + 142), 38, 38, 0x00A7BBD1);
+    graphics_draw_cursor_bitmap((uint16_t) (window->x + 249), (uint16_t) (window->y + 153), &g_cursor_styles[g_cursor_style_index]);
+    for (uint32_t i = 0; i < cursor_count; i++) {
+        uint16_t col = (uint16_t) (i & 1u);
+        uint16_t row = (uint16_t) (i >> 1);
+        uint16_t button_x = (uint16_t) (window->x + 286 + col * 64);
+        uint16_t button_y = (uint16_t) (window->y + 142 + row * 28);
+        uint32_t fill = i == g_cursor_style_index ? 0x00256EC8 : 0x00F7FBFE;
+        uint32_t border = i == g_cursor_style_index ? 0x00CDE4FF : 0x00A7BBD1;
+        uint32_t text = i == g_cursor_style_index ? 0x00FFFFFF : 0x0017232E;
+
+        graphics_fill_rect(button_x, button_y, 58, 22, fill);
+        graphics_draw_rect_outline(button_x, button_y, 58, 22, border);
+        graphics_draw_text_aligned(button_x, (uint16_t) (button_y + 6), 58, g_cursor_styles[i].label, text);
+    }
+
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 230), "\u7f51\u7edc", 0x0017232E);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 252), info->present ? info->driver : "offline", info->connected ? 0x002E7D32 : 0x00A0442F);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 272), info->ip_text, 0x004A6278);
+    strcpy(line, "ping tx ");
+    graphics_u32_to_dec(line + strlen(line), info->ping_requests);
+    strcpy(line + strlen(line), " rx ");
+    graphics_u32_to_dec(line + strlen(line), info->ping_replies);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 292), line, 0x004A6278);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 312), net_status(), 0x004A6278);
+}
+
+static void graphics_draw_logon_window(const ui_window_t *window)
+{
+    uint16_t card_x;
+    uint16_t card_y;
+    uint16_t input_x;
+    uint16_t user_x;
+    uint16_t button_x;
+
+    if (window == NULL) {
+        return;
+    }
+    card_x = window->x;
+    card_y = window->y;
+    input_x = (uint16_t) (card_x + 62);
+    user_x = (uint16_t) (card_x + 98);
+    button_x = (uint16_t) (card_x + (window->width - 128) / 2);
+
+    graphics_draw_shadow(card_x, card_y, window->width, window->height);
+    graphics_fill_soft_rect(card_x, card_y, window->width, window->height, 0x00F7FBFF);
+    graphics_draw_soft_rect_outline(card_x, card_y, window->width, window->height, 0x00DBE7F4);
+
+    graphics_fill_soft_rect((uint16_t) (card_x + 152), (uint16_t) (card_y + 30), 76, 76, 0x00DCEBFF);
+    graphics_draw_soft_rect_outline((uint16_t) (card_x + 152), (uint16_t) (card_y + 30), 76, 76, 0x00B7D4FF);
+    graphics_fill_soft_rect((uint16_t) (card_x + 177), (uint16_t) (card_y + 47), 26, 24, 0x003C6FEA);
+    graphics_fill_soft_rect((uint16_t) (card_x + 165), (uint16_t) (card_y + 72), 50, 24, 0x003C6FEA);
+
+    graphics_draw_text_aligned(card_x, (uint16_t) (card_y + 118), window->width, "MONIOS", 0x001C2430);
+    graphics_fill_soft_rect(user_x, (uint16_t) (card_y + 142), (uint16_t) (window->width - 196), 26,
+                            g_login_field == 0 ? 0x00FFFFFF : 0x00F2F6FB);
+    graphics_draw_soft_rect_outline(user_x, (uint16_t) (card_y + 142), (uint16_t) (window->width - 196), 26,
+                                    g_login_field == 0 ? UI_COLOR_ACCENT : 0x00D3DFEC);
+    graphics_draw_text_aligned(user_x, (uint16_t) (card_y + 149), (uint16_t) (window->width - 196), g_login_username, 0x002E3A48);
+
+    graphics_fill_soft_rect(input_x, (uint16_t) (card_y + 178), (uint16_t) (window->width - 124), 30, 0x00FFFFFF);
+    graphics_draw_soft_rect_outline(input_x, (uint16_t) (card_y + 178), (uint16_t) (window->width - 124), 30,
+                                    g_login_field == 1 ? UI_COLOR_ACCENT : 0x00BFCEDF);
+    if (g_login_password[0] == '\0') {
+        graphics_draw_text((uint16_t) (input_x + 12), (uint16_t) (card_y + 187), "Password", 0x008296A8);
+    } else {
+        for (uint32_t i = 0; g_login_password[i] != '\0' && i < 24; i++) {
+            graphics_fill_soft_rect((uint16_t) (input_x + 12 + i * 10), (uint16_t) (card_y + 190), 5, 5, 0x002E3A48);
+        }
+    }
+
+    graphics_fill_soft_rect(button_x, (uint16_t) (card_y + 222), 128, 30, UI_COLOR_ACCENT);
+    graphics_draw_soft_rect_outline(button_x, (uint16_t) (card_y + 222), 128, 30, 0x00B7D8FF);
+    graphics_draw_text_aligned(button_x, (uint16_t) (card_y + 231), 128, "Sign in", 0x00FFFFFF);
+    if (g_login_error) {
+        graphics_draw_text_aligned(card_x, (uint16_t) (card_y + 262), window->width, "Invalid password", 0x00C0392B);
+    }
 }
 
 static void graphics_draw_window_content(const ui_window_t *window)
@@ -1965,9 +3289,14 @@ static void graphics_draw_window_content(const ui_window_t *window)
         for (uint32_t i = 0; i < g_file_item_count; i++) {
             uint16_t row_y = (uint16_t) (window->y + 66 + i * 22);
             uint32_t fill = i == g_file_selected_index ? 0x00D8E9FA : 0x00F7FBFE;
+            char path[GRAPHICS_CLIPBOARD_PATH_MAX];
+
             graphics_fill_rect((uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20, fill);
             graphics_draw_rect_outline((uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20, 0x00A7BBD1);
-            graphics_draw_text((uint16_t) (window->x + 46), (uint16_t) (row_y + 5), g_file_items[i].name, 0x0017232E);
+            graphics_build_file_entry_path(i, path);
+            graphics_draw_icon((uint16_t) (window->x + 42), (uint16_t) (row_y + 1),
+                               graphics_icon_kind_for_path(path, g_file_items[i].is_dir), true);
+            graphics_draw_text((uint16_t) (window->x + 66), (uint16_t) (row_y + 5), g_file_items[i].name, 0x0017232E);
             if (g_file_items[i].is_dir) {
                 graphics_draw_text_aligned((uint16_t) (window->x + window->width - 64), (uint16_t) (row_y + 5), 40, "\u6587\u4ef6\u5939", 0x002A6CC8);
             }
@@ -2092,9 +3421,15 @@ static void graphics_draw_window_content(const ui_window_t *window)
                 uint16_t row_x = (uint16_t) (window->x + 44);
                 uint16_t row_w = (uint16_t) (window->width - 58);
                 uint32_t row_fill = i == g_player_selected_index ? 0x00D8E9FA : 0x00F7FBFE;
+                char path[GRAPHICS_CLIPBOARD_PATH_MAX];
+
+                strcpy(path, g_player_current_path);
+                graphics_append_path_component(path, sizeof(path), g_player_items[i].name);
                 graphics_fill_rect(row_x, row_y, row_w, 20, row_fill);
                 graphics_draw_rect_outline(row_x, row_y, row_w, 20, 0x00A7BBD1);
-                graphics_draw_text((uint16_t) (row_x + 8), (uint16_t) (row_y + 5), g_player_items[i].name, 0x0017232E);
+                graphics_draw_icon((uint16_t) (row_x + 4), (uint16_t) (row_y + 1),
+                                   graphics_icon_kind_for_path(path, g_player_items[i].is_dir), true);
+                graphics_draw_text((uint16_t) (row_x + 28), (uint16_t) (row_y + 5), g_player_items[i].name, 0x0017232E);
                 if (g_player_items[i].is_dir) {
                     graphics_draw_text_aligned((uint16_t) (window->x + window->width - 76), (uint16_t) (row_y + 5), 54, "\u6587\u4ef6\u5939", 0x002A6CC8);
                 }
@@ -2167,6 +3502,10 @@ static void graphics_draw_window_content(const ui_window_t *window)
         graphics_draw_text_aligned((uint16_t) (window->x + 282), (uint16_t) (window->y + 157), 72, "\u53d6\u6d88", 0x00FFFFFF);
         return;
     }
+    if (window->kind == UI_WINDOW_CONTROL_PANEL) {
+        graphics_draw_control_panel_window(window);
+        return;
+    }
     if (window->kind == UI_WINDOW_POWER) {
         graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42), "关机", 0x0017232E);
         graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 68), "重启", 0x0017232E);
@@ -2175,16 +3514,29 @@ static void graphics_draw_window_content(const ui_window_t *window)
 
 static void graphics_draw_window(const ui_window_t *window)
 {
-    if (!window->visible) {
+    if (!window->visible || window->minimized) {
         return;
     }
 
-    graphics_fill_rect(window->x, window->y, window->width, window->height, 0x00E8EEF5);
-    graphics_draw_rect_outline(window->x, window->y, window->width, window->height, 0x001E2A36);
-    graphics_fill_rect(window->x, window->y, window->width, UI_TITLEBAR_H, 0x002A6CC8);
-    graphics_draw_text((uint16_t) (window->x + 12), (uint16_t) (window->y + 3), window->title, 0x00FFFFFF);
-    graphics_fill_rect((uint16_t) (window->x + window->width - 29), (uint16_t) (window->y + 3), 16, 14, 0x00D96464);
-    graphics_draw_text((uint16_t) (window->x + window->width - 27), (uint16_t) (window->y + 1), "X", 0x00FFFFFF);
+    if (window->kind == UI_WINDOW_LOGON) {
+        graphics_draw_logon_window(window);
+        return;
+    }
+
+    graphics_draw_shadow(window->x, window->y, window->width, window->height);
+    graphics_fill_soft_rect(window->x, window->y, window->width, window->height, UI_COLOR_WINDOW_BG);
+    graphics_draw_soft_rect_outline(window->x, window->y, window->width, window->height, UI_COLOR_WINDOW_EDGE);
+    graphics_fill_rect_gradient((uint16_t) (window->x + 2), (uint16_t) (window->y + 2), (uint16_t) (window->width - 4), (uint16_t) (UI_TITLEBAR_H - 2), 0x00FFFFFF, UI_COLOR_TITLE_BG);
+    graphics_fill_rect((uint16_t) (window->x + 2), (uint16_t) (window->y + UI_TITLEBAR_H), (uint16_t) (window->width - 4), 1, 0x00DFE7F0);
+    graphics_fill_soft_rect((uint16_t) (window->x + 10), (uint16_t) (window->y + 8), 10, 10, UI_COLOR_ACCENT);
+    graphics_fill_rect((uint16_t) (window->x + 15), (uint16_t) (window->y + 8), 5, 10, 0x004DB5FF);
+    graphics_draw_text((uint16_t) (window->x + 28), (uint16_t) (window->y + 7), window->title, UI_COLOR_TITLE_TEXT);
+    graphics_fill_soft_rect((uint16_t) (window->x + window->width - 66), (uint16_t) (window->y + 5), 16, 18, 0x00F5F8FC);
+    graphics_draw_text((uint16_t) (window->x + window->width - 62), (uint16_t) (window->y + 6), "-", 0x004B5C70);
+    graphics_fill_soft_rect((uint16_t) (window->x + window->width - 46), (uint16_t) (window->y + 5), 16, 18, window->maximized ? 0x00E7F0FF : 0x00F5F8FC);
+    graphics_draw_text((uint16_t) (window->x + window->width - 43), (uint16_t) (window->y + 6), "[]", 0x004B5C70);
+    graphics_fill_soft_rect((uint16_t) (window->x + window->width - 26), (uint16_t) (window->y + 5), 18, 18, 0x00FFF5F6);
+    graphics_draw_text((uint16_t) (window->x + window->width - 22), (uint16_t) (window->y + 6), "X", 0x00A82636);
     graphics_draw_window_content(window);
 }
 
@@ -2209,17 +3561,23 @@ void graphics_draw_shell(void)
         return;
     }
 
+    if (!g_session_logged_in && !g_installer_mode && graphics_find_window(UI_WINDOW_LOGON) < 0) {
+        graphics_open_window(UI_WINDOW_LOGON);
+    }
     graphics_draw_desktop();
     graphics_load_desktop_entries();
     graphics_draw_desktop_icons();
     graphics_draw_taskbar();
-    graphics_draw_start_menu();
     for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
         graphics_draw_window(&g_windows[i]);
     }
+    graphics_draw_start_menu();
     graphics_draw_context_menu();
     graphics_draw_power_menu();
     graphics_draw_power_overlay();
+    if (g_rainbow_cat_open) {
+        graphics_draw_rainbow_cat();
+    }
     graphics_present();
     g_cursor_drawn = false;
     graphics_mouse_redraw(g_cursor_x, g_cursor_y);
@@ -2235,9 +3593,49 @@ static bool graphics_should_refresh_desktop(void)
     return false;
 }
 
+static bool graphics_set_resolution(uint16_t width, uint16_t height)
+{
+    int32_t mode_index = graphics_find_mode_index(width, height);
+    uint16_t prev_width = g_graphics_width;
+    uint16_t prev_height = g_graphics_height;
+    uint8_t prev_mode_index = g_graphics_mode_index;
+
+    if (mode_index < 0) {
+        return false;
+    }
+    if (g_graphics_width == width && g_graphics_height == height) {
+        return true;
+    }
+    g_graphics_width = width;
+    g_graphics_height = height;
+    g_graphics_mode_index = (uint8_t) mode_index;
+    if (g_graphics_active) {
+        g_graphics_fast_mode_switch = true;
+        graphics_leave_mode();
+        graphics_enter_mode();
+        g_graphics_fast_mode_switch = false;
+        if (!g_graphics_active) {
+            g_graphics_width = prev_width;
+            g_graphics_height = prev_height;
+            g_graphics_mode_index = prev_mode_index;
+            g_graphics_fast_mode_switch = true;
+            graphics_enter_mode();
+            g_graphics_fast_mode_switch = false;
+            return false;
+        }
+        graphics_reflow_windows();
+        graphics_draw_shell();
+    }
+    return true;
+}
+
 void graphics_activate_primary_button(void)
 {
-    g_start_menu_open = !g_start_menu_open;
+    if (g_start_menu_open) {
+        graphics_reset_start_menu();
+    } else {
+        graphics_open_start_menu_view(UI_START_MENU_ROOT);
+    }
     graphics_draw_shell();
 }
 
@@ -2271,6 +3669,11 @@ void graphics_handle_click(uint16_t x, uint16_t y)
         return;
     }
 
+    if (g_rainbow_cat_open) {
+        graphics_draw_shell();
+        return;
+    }
+
     if (!g_graphics_active) {
         return;
     }
@@ -2285,19 +3688,19 @@ void graphics_handle_click(uint16_t x, uint16_t y)
             if (!window->visible || window->kind != UI_WINDOW_LOGON) {
                 continue;
             }
-            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 16), (uint16_t) (window->y + 56), (uint16_t) (window->width - 32), 24)) {
+            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 98), (uint16_t) (window->y + 142), (uint16_t) (window->width - 196), 26)) {
                 g_login_field = 0;
                 g_login_error = false;
                 graphics_draw_shell();
                 return;
             }
-            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 16), (uint16_t) (window->y + 110), (uint16_t) (window->width - 32), 24)) {
+            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 62), (uint16_t) (window->y + 178), (uint16_t) (window->width - 124), 30)) {
                 g_login_field = 1;
                 g_login_error = false;
                 graphics_draw_shell();
                 return;
             }
-            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 16), (uint16_t) (window->y + window->height - 42), 92, 22)) {
+            if (graphics_point_in_rect(x, y, (uint16_t) (window->x + (window->width - 128) / 2), (uint16_t) (window->y + 222), 128, 30)) {
                 if (graphics_attempt_login()) {
                     graphics_draw_shell();
                     return;
@@ -2310,22 +3713,28 @@ void graphics_handle_click(uint16_t x, uint16_t y)
     }
     if (y >= BUTTON_Y && y < BUTTON_Y + BUTTON_HEIGHT) {
         uint32_t window_index;
-        if (x >= 12 && x < 12 + START_BUTTON_WIDTH) {
-            g_context_menu_open = false;
-            g_start_menu_open = !g_start_menu_open;
+        uint16_t start_x = graphics_taskbar_pinned_start_x();
+        if (x >= start_x && x < start_x + START_BUTTON_WIDTH) {
+            if (g_start_menu_open) {
+                graphics_reset_start_menu();
+            } else {
+                graphics_open_start_menu_view(UI_START_MENU_ROOT);
+            }
             graphics_draw_shell();
             return;
         }
 
         for (uint32_t i = 0; i < sizeof(g_taskbar_buttons) / sizeof(g_taskbar_buttons[0]); i++) {
-            uint16_t button_x = (uint16_t) (28 + START_BUTTON_WIDTH + i * (BUTTON_WIDTH + BUTTON_GAP));
-                if (x >= button_x && x < button_x + BUTTON_WIDTH) {
-                    g_active_button_index = i;
-                    g_start_menu_open = false;
-                    g_context_menu_open = false;
-                    if (i == 0) graphics_open_window(UI_WINDOW_FILES);
-                    if (i == 1) graphics_open_window(UI_WINDOW_TERMINAL);
-                if (i == 2) graphics_open_window(UI_WINDOW_ABOUT);
+            uint16_t button_x = (uint16_t) (start_x + START_BUTTON_WIDTH + 10 + i * (BUTTON_WIDTH + BUTTON_GAP));
+            if (x >= button_x && x < button_x + BUTTON_WIDTH) {
+                g_active_button_index = i;
+                g_start_menu_open = false;
+                g_start_menu_view = UI_START_MENU_ROOT;
+                g_context_menu_open = false;
+                if (i == 0) graphics_open_window(UI_WINDOW_FILES);
+                if (i == 1) graphics_open_window(UI_WINDOW_TERMINAL);
+                if (i == 2) graphics_open_window(UI_WINDOW_CONTROL_PANEL);
+                if (i == 3) graphics_open_window(UI_WINDOW_ABOUT);
                 graphics_draw_shell();
                 return;
             }
@@ -2338,37 +3747,18 @@ void graphics_handle_click(uint16_t x, uint16_t y)
     }
 
     if (g_start_menu_open) {
-        uint16_t menu_y = (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 188);
-        if (graphics_point_in_rect(x, y, 24, (uint16_t) (menu_y + 126), 150, 22)) {
-            g_start_menu_open = false;
-            graphics_open_window(UI_WINDOW_FILES);
+        if (graphics_handle_start_menu_click(x, y)) {
             graphics_draw_shell();
             return;
         }
-        if (graphics_point_in_rect(x, y, 24, (uint16_t) (menu_y + 152), 150, 22)) {
-            g_start_menu_open = false;
-            graphics_open_window(UI_WINDOW_TERMINAL);
-            graphics_draw_shell();
-            return;
-        }
-        if (graphics_point_in_rect(x, y, 24, (uint16_t) (menu_y + 178), 150, 22)) {
-            g_start_menu_open = false;
-            graphics_open_window(UI_WINDOW_RUN);
-            graphics_draw_shell();
-            return;
-        }
-        if (graphics_point_in_rect(x, y, 24, (uint16_t) (menu_y + 204), 150, 22)) {
-            g_power_menu_x = 232;
-            g_power_menu_y = (uint16_t) (menu_y + 190);
-            g_power_menu_open = true;
-            graphics_draw_shell();
-            return;
-        }
+        graphics_reset_start_menu();
     }
 
     for (uint32_t desktop_index = 0; desktop_index < g_desktop_entry_count; desktop_index++) {
-        uint16_t icon_x = (uint16_t) (DESKTOP_ICON_START_X + (desktop_index % 2) * (DESKTOP_ICON_W + DESKTOP_ICON_GAP_X));
-        uint16_t icon_y = (uint16_t) (DESKTOP_ICON_START_Y + (desktop_index / 2) * (DESKTOP_ICON_H + DESKTOP_ICON_GAP_Y));
+        uint16_t icon_x;
+        uint16_t icon_y;
+
+        graphics_desktop_icon_position(desktop_index, &icon_x, &icon_y);
         if (graphics_point_in_rect(x, y, icon_x, icon_y, DESKTOP_ICON_W, DESKTOP_ICON_H)) {
             char path[GRAPHICS_CLIPBOARD_PATH_MAX];
             bool same_item = g_last_click_source == UI_CLICK_SOURCE_DESKTOP && g_last_click_index == desktop_index;
@@ -2423,6 +3813,14 @@ void graphics_handle_click(uint16_t x, uint16_t y)
                 char path[GRAPHICS_CLIPBOARD_PATH_MAX];
                 graphics_build_file_entry_path(g_file_selected_index, path);
                 g_context_menu_open = false;
+                graphics_create_desktop_shortcut(path);
+                graphics_refresh_desktop_entries();
+                return;
+            }
+            if (graphics_point_in_rect(x, y, (uint16_t) (g_context_menu_x + 8), (uint16_t) (g_context_menu_y + 104), 140, 22)) {
+                char path[GRAPHICS_CLIPBOARD_PATH_MAX];
+                graphics_build_file_entry_path(g_file_selected_index, path);
+                g_context_menu_open = false;
                 graphics_open_path(path);
                 graphics_draw_shell();
                 return;
@@ -2444,9 +3842,7 @@ void graphics_handle_click(uint16_t x, uint16_t y)
             }
             if (graphics_point_in_rect(x, y, (uint16_t) (g_context_menu_x + 8), (uint16_t) (g_context_menu_y + 56), 140, 22)) {
                 g_context_menu_open = false;
-                g_power_menu_x = (uint16_t) (g_context_menu_x + 170);
-                g_power_menu_y = (uint16_t) (g_context_menu_y + 48);
-                g_power_menu_open = true;
+                graphics_open_window(UI_WINDOW_CONTROL_PANEL);
                 graphics_draw_shell();
                 return;
             }
@@ -2474,7 +3870,17 @@ void graphics_handle_click(uint16_t x, uint16_t y)
         }
         graphics_bring_window_to_front((uint32_t) i);
         window = &g_windows[UI_WINDOW_MAX - 1];
-        if (graphics_point_in_rect(x, y, (uint16_t) (window->x + window->width - 29), (uint16_t) (window->y + 3), 18, 16)) {
+        if (graphics_point_in_rect(x, y, (uint16_t) (window->x + window->width - 62), (uint16_t) (window->y + 4), 14, 16)) {
+            graphics_minimize_window(UI_WINDOW_MAX - 1);
+            graphics_draw_shell();
+            return;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (window->x + window->width - 44), (uint16_t) (window->y + 4), 14, 16)) {
+            graphics_toggle_maximize_window(UI_WINDOW_MAX - 1);
+            graphics_draw_shell();
+            return;
+        }
+        if (graphics_point_in_rect(x, y, (uint16_t) (window->x + window->width - 26), (uint16_t) (window->y + 4), 18, 16)) {
             graphics_close_window(UI_WINDOW_MAX - 1);
             graphics_draw_shell();
             return;
@@ -2591,6 +3997,26 @@ void graphics_handle_click(uint16_t x, uint16_t y)
             }
         }
         if (window->kind == UI_WINDOW_TERMINAL) {
+            uint16_t content_left = (uint16_t) (window->x + 12);
+            uint16_t content_top = (uint16_t) (window->y + window->height - 40);
+            uint16_t content_width = 96;
+            uint16_t content_height = 32;
+            uint64_t now = timer_ticks();
+
+            if (graphics_point_in_rect(x, y, content_left, content_top, content_width, content_height)) {
+                if (now - g_rainbow_cat_last_click_tick < timer_hz()) {
+                    g_rainbow_cat_click_count++;
+                } else {
+                    g_rainbow_cat_click_count = 1;
+                }
+                g_rainbow_cat_last_click_tick = now;
+                if (g_rainbow_cat_click_count >= 2) {
+                    g_rainbow_cat_open = true;
+                    g_rainbow_cat_click_count = 0;
+                    graphics_draw_shell();
+                    return;
+                }
+            }
             graphics_set_terminal_focus(true);
             g_run_input_focus = false;
             g_notepad_focus = false;
@@ -2657,6 +4083,26 @@ void graphics_handle_click(uint16_t x, uint16_t y)
                 return;
             }
         }
+        if (window->kind == UI_WINDOW_CONTROL_PANEL) {
+            for (uint32_t mode = 0; mode < sizeof(g_graphics_modes) / sizeof(g_graphics_modes[0]); mode++) {
+                uint16_t row = (uint16_t) (window->y + 70 + mode * 32);
+                if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 18), row, 128, 24)) {
+                    graphics_set_resolution(g_graphics_modes[mode].width, g_graphics_modes[mode].height);
+                    return;
+                }
+            }
+            for (uint32_t style = 0; style < graphics_cursor_style_count(); style++) {
+                uint16_t col = (uint16_t) (style & 1u);
+                uint16_t row = (uint16_t) (style >> 1);
+                uint16_t button_x = (uint16_t) (window->x + 286 + col * 64);
+                uint16_t button_y = (uint16_t) (window->y + 142 + row * 28);
+
+                if (graphics_point_in_rect(x, y, button_x, button_y, 58, 22)) {
+                    graphics_set_cursor_style((uint8_t) style);
+                    return;
+                }
+            }
+        }
         if (window->kind == UI_WINDOW_POWER) {
             if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 12), (uint16_t) (window->y + 34), 110, 22)) {
                 kernel_request_shutdown();
@@ -2672,6 +4118,7 @@ void graphics_handle_click(uint16_t x, uint16_t y)
     }
 
     g_start_menu_open = false;
+    g_last_click_source = UI_CLICK_SOURCE_NONE;
     graphics_draw_shell();
 }
 
@@ -2702,6 +4149,19 @@ void graphics_handle_right_click(uint16_t x, uint16_t y)
             break;
         }
     }
+    if (g_context_menu_mode == UI_CONTEXT_MENU_DESKTOP) {
+        for (uint32_t desktop_index = 0; desktop_index < g_desktop_entry_count; desktop_index++) {
+            uint16_t icon_x;
+            uint16_t icon_y;
+
+            graphics_desktop_icon_position(desktop_index, &icon_x, &icon_y);
+            if (graphics_point_in_rect(x, y, icon_x, icon_y, DESKTOP_ICON_W, DESKTOP_ICON_H)) {
+                g_last_click_source = UI_CLICK_SOURCE_DESKTOP;
+                g_last_click_index = desktop_index;
+                break;
+            }
+        }
+    }
     graphics_context_open(x, y, g_context_menu_mode);
     graphics_draw_shell();
 }
@@ -2712,23 +4172,7 @@ void graphics_handle_mouse_move(uint16_t x, uint16_t y, uint8_t buttons)
         return;
     }
     if (g_start_menu_open) {
-        uint16_t menu_y = (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT - 188);
-        bool over_power = graphics_point_in_rect(x, y, 24, (uint16_t) (menu_y + 204), 110, 18);
-        if (over_power) {
-            g_power_menu_x = 232;
-            g_power_menu_y = (uint16_t) (menu_y + 190);
-            g_power_menu_open = true;
-        } else if (!g_context_menu_open) {
-            g_power_menu_open = false;
-        }
-    }
-    if (g_context_menu_open) {
-        bool over_power = graphics_point_in_rect(x, y, (uint16_t) (g_context_menu_x + 8), (uint16_t) (g_context_menu_y + 56), 90, 18);
-        if (over_power) {
-            g_power_menu_x = (uint16_t) (g_context_menu_x + 170);
-            g_power_menu_y = (uint16_t) (g_context_menu_y + 48);
-            g_power_menu_open = true;
-        }
+        g_power_menu_open = false;
     }
 
     if (g_dragging_window && (buttons & MOUSE_BUTTON_LEFT) != 0 && g_drag_window_index < UI_WINDOW_MAX) {
@@ -2775,10 +4219,21 @@ void graphics_handle_key_event(const key_event_t *event)
     if (!g_graphics_active || event == NULL) {
         return;
     }
+    if (g_installer_mode) {
+        return;
+    }
 
     if (g_sleeping) {
         g_sleeping = false;
         graphics_draw_shell();
+        return;
+    }
+
+    if (g_rainbow_cat_open) {
+        if (event->type == KEY_EVENT_ESC) {
+            g_rainbow_cat_open = false;
+            graphics_draw_shell();
+        }
         return;
     }
 
@@ -2941,6 +4396,13 @@ void graphics_periodic_update(uint64_t now_ticks)
         return;
     }
 
+    if (!font_ready()) {
+        if (font_init_step(128u * 1024u)) {
+            graphics_draw_shell();
+            return;
+        }
+    }
+
     if (g_session_logged_in && g_cube3d_open) {
         uint64_t cube_step = timer_hz() / 30u;
         if (cube_step == 0) {
@@ -2990,6 +4452,8 @@ static void graphics_restore_cursor(void)
 
 void graphics_mouse_redraw(uint16_t x, uint16_t y)
 {
+    const graphics_cursor_style_t *style;
+
     if (!g_graphics_active) {
         return;
     }
@@ -3000,6 +4464,7 @@ void graphics_mouse_redraw(uint16_t x, uint16_t y)
     graphics_restore_cursor();
     g_cursor_x = x;
     g_cursor_y = y;
+    style = &g_cursor_styles[g_cursor_style_index];
 
     for (uint16_t row = 0; row < 16; row++) {
         for (uint16_t col = 0; col < 16; col++) {
@@ -3008,8 +4473,9 @@ void graphics_mouse_redraw(uint16_t x, uint16_t y)
             uint16_t mask = (uint16_t) (0x8000 >> col);
 
             g_cursor_saved[row * 16 + col] = g_framebuffer[graphics_framebuffer_index(px, py)];
-            if ((g_cursor_shape[row] & mask) != 0) {
-                g_framebuffer[graphics_framebuffer_index(px, py)] = (g_cursor_fill[row] & mask) != 0 ? 0x00FFFFFF : 0x00000000;
+            if ((style->shape[row] & mask) != 0) {
+                g_framebuffer[graphics_framebuffer_index(px, py)] =
+                    (style->fill[row] & mask) != 0 ? style->fill_color : style->outline_color;
             }
         }
     }
@@ -3024,6 +4490,7 @@ void graphics_init(void)
     memset(g_backbuffer, 0, sizeof(g_backbuffer));
     g_graphics_active = false;
     g_graphics_vmware_backend = false;
+    g_graphics_boot_animation_mode = false;
     g_session_logged_in = false;
     g_selected_login_user = 0;
     g_cursor_drawn = false;
@@ -3031,6 +4498,7 @@ void graphics_init(void)
     g_cursor_x = 24;
     g_cursor_y = 24;
     g_start_menu_open = false;
+    g_start_menu_view = UI_START_MENU_ROOT;
     g_context_menu_open = false;
     g_power_menu_open = false;
     g_dragging_window = false;
@@ -3073,7 +4541,7 @@ void graphics_init(void)
 
 void graphics_notify_process_output(void)
 {
-    if (g_graphics_active) {
+    if (g_graphics_active && !g_installer_mode) {
         graphics_draw_shell();
         graphics_flush_gpu();
     }
@@ -3128,7 +4596,7 @@ uint32_t graphics_window_count(void)
 uint32_t graphics_focused_window_index(void)
 {
     for (int32_t i = UI_WINDOW_MAX - 1; i >= 0; i--) {
-        if (g_windows[i].visible) {
+        if (g_windows[i].visible && !g_windows[i].minimized) {
             return (uint32_t) i;
         }
     }
@@ -3174,25 +4642,20 @@ bool graphics_active(void)
     return g_graphics_active;
 }
 
-void graphics_open_task_manager(void)
+void graphics_set_installer_mode(bool enabled)
 {
-    if (!g_graphics_active) {
-        shell_exec_path("/taskmgr.elf");
-        return;
-    }
-    if (g_session_logged_in) {
-        graphics_open_window(UI_WINDOW_TASKMGR);
-        graphics_draw_shell();
-    }
+    g_installer_mode = enabled;
 }
 
-void graphics_open_cube3d_window(void)
+void graphics_set_boot_animation_mode(bool enabled)
 {
-    if (!g_graphics_active) {
-        graphics_enter_mode();
-    }
-    if (g_graphics_active && g_session_logged_in) {
-        graphics_open_window(UI_WINDOW_CUBE3D);
+    g_graphics_boot_animation_mode = enabled;
+}
+
+void graphics_open_task_manager(void)
+{
+    if (graphics_launch_user_program("/apps/taskmgr.elf") ||
+        graphics_launch_user_program("/taskmgr.elf")) {
         graphics_draw_shell();
     }
 }
@@ -3247,7 +4710,9 @@ void graphics_shutdown_animation(void)
 
     /* Fade to black by gradually darkening */
     for (int step = 0; step < 8; step++) {
-        for (uint32_t i = 0; i < FB_PIXELS; i++) {
+        uint32_t pixels = (uint32_t) FB_WIDTH * (uint32_t) FB_HEIGHT;
+
+        for (uint32_t i = 0; i < pixels; i++) {
             uint32_t c = g_backbuffer[i];
             uint8_t r = (uint8_t) ((c >> 16) & 0xFF);
             uint8_t g = (uint8_t) ((c >> 8) & 0xFF);
@@ -3382,19 +4847,24 @@ void graphics_enter_mode(void)
     if (mmu_is_active()) {
         g_graphics_active = true;
         g_cursor_drawn = false;
-        graphics_show_boot_loading_screen();
-    } else {
-        log_write("graphics: skipping boot frame; mmu not active");
-    }
-
-    font_init();
-
-    if (mmu_is_active()) {
-        graphics_play_boot_animation();
-        if (!g_session_logged_in) {
+        if (!g_graphics_fast_mode_switch) {
+            graphics_load_cursor_style();
+        }
+        if (!g_session_logged_in && !g_installer_mode && !g_graphics_boot_animation_mode) {
             graphics_open_window(UI_WINDOW_LOGON);
         }
-        graphics_draw_shell();
+        graphics_reflow_windows();
+        if (g_graphics_boot_animation_mode) {
+            graphics_show_boot_loading_screen();
+        } else if (g_installer_mode) {
+            graphics_fill(0x00182A3A);
+            graphics_present();
+        } else {
+            graphics_draw_shell();
+        }
+        if (!font_ready()) {
+            font_init_step(128u * 1024u);
+        }
         log_write("graphics: desktop drawn");
     } else {
         log_write("graphics: deferring full desktop draw; mmu not active");
