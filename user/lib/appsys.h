@@ -4,11 +4,16 @@
 #include "stdbool.h"
 #include "stdint.h"
 
-#define APP_ABI_VERSION      3U
+#define APP_ABI_VERSION      5U
 #define STDIN_FILENO         0U
 #define STDOUT_FILENO        1U
 #define STDERR_FILENO        2U
 #define PATH_MAX_LEN         256
+
+#define APP_SUBSYSTEM_UNKNOWN 0U
+#define APP_SUBSYSTEM_NATIVE  1U
+#define APP_SUBSYSTEM_WINDOWS 2U
+#define APP_SUBSYSTEM_CONSOLE 3U
 
 #define APP_IMAGE_FLAG_CONSOLE      0x00000001U
 #define APP_IMAGE_FLAG_GUI          0x00000002U
@@ -16,12 +21,19 @@
 #define APP_IMAGE_FLAG_SIGNED       0x00000008U
 #define APP_IMAGE_FLAG_NEEDS_R0     0x00000010U
 #define APP_IMAGE_FLAG_NEEDS_R2     0x00000020U
+#define APP_IMAGE_FLAG_CERT_PRESENT 0x00000040U
+#define APP_IMAGE_FLAG_CERT_VALID   0x00000080U
+#define APP_IMAGE_FLAG_CERT_REQUIRED 0x00000100U
+#define APP_IMAGE_FLAG_RESOURCE_TABLE 0x00000200U
+#define APP_IMAGE_FLAG_ICON_RESOURCE 0x00000400U
+#define APP_IMAGE_FLAG_MANIFEST_RESOURCE 0x00000800U
 
 #define APP_PRIV_R0 0U
 #define APP_PRIV_R2 2U
 #define APP_PRIV_R3 3U
 
 #define APP_INSTALLER_CHUNK_MAX (512U * 256U)
+#define APP_INSTALLER_COPY_TARGET_MAX (64U * 1024U * 1024U)
 #define APP_INSTALLER_MAX_TARGETS 6U
 #define APP_INSTALLER_TARGET_KIND_DISK 0U
 #define APP_INSTALLER_TARGET_KIND_PART 1U
@@ -70,10 +82,34 @@ typedef struct {
 } app_installer_target_write_request_t;
 
 typedef struct {
+    const char *source_path;
+    uint32_t source_offset;
+    const char *target_path;
+    uint32_t target_lba;
+    uint32_t byte_count;
+    uint32_t bytes_written;
+} app_installer_target_copy_request_t;
+
+typedef struct {
+    const char *source_path;
+    uint32_t source_offset;
+    void *data;
+    uint32_t byte_count;
+    uint32_t bytes_read;
+} app_installer_media_read_request_t;
+
+typedef struct {
+    const char *source_path;
+    int32_t file_size;
+    uint8_t exists;
+    uint8_t reserved[3];
+} app_installer_media_stat_request_t;
+
+typedef struct {
     uint32_t abi_version;
     uint32_t image_flags;
     uint32_t privilege_level;
-    uint32_t reserved;
+    uint32_t subsystem;
     uint32_t argc;
     char **argv;
     char **env;
@@ -135,6 +171,8 @@ typedef struct {
     bool smp_bootstrap_only;
     uint32_t smp_logical_processors;
     uint32_t smp_online_processors;
+    uint32_t smp_firmware_processors;
+    uint32_t smp_firmware_enabled_processors;
 } app_system_status_t;
 
 const app_launch_info_t *app_launch_info(void);
@@ -184,6 +222,9 @@ int app_installer_list_targets(app_installer_target_list_t *list);
 int app_installer_write_disk(const char *source_path, uint32_t source_offset, uint32_t disk_lba, uint32_t byte_count);
 int app_installer_write_buffer(const void *data, uint32_t disk_lba, uint32_t byte_count);
 int app_installer_write_target_file(const char *target_path, const void *data, uint32_t target_lba, uint32_t byte_count);
+int app_installer_copy_target_file(const char *source_path, uint32_t source_offset, uint32_t byte_count, const char *target_path, uint32_t target_lba);
+int app_installer_read_media(const char *source_path, uint32_t source_offset, void *data, uint32_t byte_count);
+int app_installer_media_size(const char *source_path);
 void app_installer_reboot(void);
 void app_exit(int code);
 

@@ -73,7 +73,7 @@ typedef uint64_t size_t;
 #define FONT_BITMAP_BYTES (UI_FONT_WIDTH * UI_FONT_HEIGHT)
 #define FONT_PIXEL_HEIGHT 18.0f
 #define FONT_BASELINE 14
-#define BOOT_FONT_REGION_PHYS 0x04000000ULL
+#define BOOT_FONT_REGION_PHYS 0x06000000ULL
 #define BOOT_FONT_HEADER_SIZE 0x1000U
 #define BOOT_FONT_MAX_BYTES 0x01800000U
 #define BOOT_FONT_MAGIC 0x544E464DU
@@ -266,41 +266,108 @@ bool font_ready(void)
     return g_font_ready;
 }
 
-uint32_t font_utf8_next(const char **cursor)
+bool font_init_failed(void)
 {
-    const uint8_t *text = (const uint8_t *) *cursor;
-    uint32_t codepoint;
+    return g_font_load_failed;
+}
 
-    if (text == NULL || text[0] == '\0') {
+uint32_t font_init_progress(void)
+{
+    uint64_t progress;
+
+    if (g_font_ready || g_font_load_failed) {
+        return 100;
+    }
+    if (!g_font_load_started || g_font_load_size == 0) {
         return 0;
     }
-    if (text[0] < 0x80) {
-        (*cursor)++;
-        return text[0];
+    progress = ((uint64_t) g_font_load_offset * 100u) / g_font_load_size;
+    return progress > 100u ? 100u : (uint32_t) progress;
+}
+
+uint32_t font_utf8_next(const char **cursor)
+{
+    const uint8_t *text;
+    uint32_t codepoint;
+    uint8_t length;
+
+    if (cursor == NULL || *cursor == NULL) {
+        return 0;
     }
-    if ((text[0] & 0xE0) == 0xC0 && (text[1] & 0xC0) == 0x80) {
-        codepoint = ((uint32_t) (text[0] & 0x1F) << 6) | (text[1] & 0x3F);
-        *cursor += 2;
+    text = (const uint8_t *) *cursor;
+    while (text[0] != '\0') {
+        if (text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF) {
+            *cursor += 3;
+            text = (const uint8_t *) *cursor;
+            continue;
+        }
+        if (text[0] < 0x80) {
+            (*cursor)++;
+            return text[0];
+        }
+        if (text[0] >= 0xC2 && text[0] <= 0xDF) {
+            length = 2;
+        } else if (text[0] >= 0xE0 && text[0] <= 0xEF) {
+            length = 3;
+        } else if (text[0] >= 0xF0 && text[0] <= 0xF4) {
+            length = 4;
+        } else {
+            (*cursor)++;
+            return 0xFFFDU;
+        }
+        for (uint8_t i = 1; i < length; i++) {
+            if (text[i] < 0x80 || text[i] > 0xBF) {
+                (*cursor)++;
+                return 0xFFFDU;
+            }
+        }
+        if (length == 2) {
+            codepoint = ((uint32_t) (text[0] & 0x1F) << 6) | (text[1] & 0x3F);
+        } else if (length == 3) {
+            codepoint = ((uint32_t) (text[0] & 0x0F) << 12) |
+                        ((uint32_t) (text[1] & 0x3F) << 6) |
+                        (text[2] & 0x3F);
+        } else {
+            codepoint = ((uint32_t) (text[0] & 0x07) << 18) |
+                        ((uint32_t) (text[1] & 0x3F) << 12) |
+                        ((uint32_t) (text[2] & 0x3F) << 6) |
+                        (text[3] & 0x3F);
+        }
+        if ((length == 2 && codepoint < 0x80) ||
+            (length == 3 && (codepoint < 0x800 ||
+                             (codepoint >= 0xD800 && codepoint <= 0xDFFF))) ||
+            (length == 4 && (codepoint < 0x10000 || codepoint > 0x10FFFF))) {
+            (*cursor)++;
+            return 0xFFFDU;
+        }
+        *cursor += length;
         return codepoint;
     }
-    if ((text[0] & 0xF0) == 0xE0 && (text[1] & 0xC0) == 0x80 && (text[2] & 0xC0) == 0x80) {
-        codepoint = ((uint32_t) (text[0] & 0x0F) << 12) |
-                    ((uint32_t) (text[1] & 0x3F) << 6) |
-                    (text[2] & 0x3F);
-        *cursor += 3;
-        return codepoint;
-    }
-    (*cursor)++;
-    return '?';
+    return 0;
 }
 
 uint32_t font_text_width(const char *text)
 {
     uint32_t width = 0;
+    uint32_t line_width = 0;
 
     while (text != NULL && *text != '\0') {
         uint32_t codepoint = font_utf8_next(&text);
-        width += font_codepoint_advance(codepoint);
+
+        if (codepoint == '\r') {
+            continue;
+        }
+        if (codepoint == '\n') {
+            if (line_width > width) {
+                width = line_width;
+            }
+            line_width = 0;
+            continue;
+        }
+        line_width += font_codepoint_advance(codepoint);
+    }
+    if (line_width > width) {
+        width = line_width;
     }
     return width;
 }
@@ -424,7 +491,7 @@ uint32_t font_codepoint_advance(uint32_t codepoint)
 {
     font_cached_glyph_t *glyph;
 
-    if (codepoint == 0) {
+    if (codepoint == 0 || codepoint == '\r' || codepoint == '\n') {
         return 0;
     }
     if (codepoint == '\t') {
@@ -447,7 +514,7 @@ void font_draw_codepoint(uint16_t x, uint16_t y, uint32_t codepoint, uint32_t co
 {
     font_cached_glyph_t *glyph;
 
-    if (plot == NULL || codepoint == 0) {
+    if (plot == NULL || codepoint == 0 || codepoint == '\r' || codepoint == '\n') {
         return;
     }
     if (codepoint == '\t') {

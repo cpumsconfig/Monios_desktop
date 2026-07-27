@@ -80,14 +80,15 @@ static uint32_t g_root_sectors;
 static uint32_t g_data_lba;
 static uint32_t g_cluster_count;
 static bool g_fat16_ready;
-static const char *g_fat16_read_cache_path;
+static char g_fat16_read_cache_path[256];
+static uint8_t g_fat16_write_buffer[8 * 512];
 static uint16_t g_fat16_read_cache_start_cluster;
 static uint32_t g_fat16_read_cache_cluster_index;
 static uint16_t g_fat16_read_cache_cluster;
 
 static void fat16_clear_read_cache(void)
 {
-    g_fat16_read_cache_path = NULL;
+    g_fat16_read_cache_path[0] = '\0';
     g_fat16_read_cache_start_cluster = 0;
     g_fat16_read_cache_cluster_index = 0;
     g_fat16_read_cache_cluster = 0;
@@ -145,6 +146,35 @@ static void ata_read_sector(uint32_t lba, void *buffer)
     }
 }
 
+static void ata_read_sectors(uint32_t lba, uint8_t count, void *buffer)
+{
+    uint16_t *dst = (uint16_t *) buffer;
+
+    if (count == 0) {
+        return;
+    }
+    if (!ata_wait_not_busy()) {
+        memset(buffer, 0, (uint32_t) count * 512u);
+        return;
+    }
+    outb(ATA_DRIVE_PORT, (uint8_t) (0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_SECTOR_COUNT_PORT, count);
+    outb(ATA_LBA_LOW_PORT, (uint8_t) (lba & 0xFF));
+    outb(ATA_LBA_MID_PORT, (uint8_t) ((lba >> 8) & 0xFF));
+    outb(ATA_LBA_HIGH_PORT, (uint8_t) ((lba >> 16) & 0xFF));
+    outb(ATA_COMMAND_PORT, ATA_CMD_READ_SECTORS);
+
+    for (uint8_t sector = 0; sector < count; sector++) {
+        if (!ata_wait_data_ready()) {
+            memset(dst, 0, (uint32_t) (count - sector) * 512u);
+            return;
+        }
+        for (uint32_t i = 0; i < 256; i++) {
+            *dst++ = inw(ATA_DATA_PORT);
+        }
+    }
+}
+
 static void ata_write_sector(uint32_t lba, const void *buffer)
 {
     const uint16_t *src = (const uint16_t *) buffer;
@@ -164,6 +194,31 @@ static void ata_write_sector(uint32_t lba, const void *buffer)
     }
     for (uint32_t i = 0; i < 256; i++) {
         outw(ATA_DATA_PORT, src[i]);
+    }
+    (void) ata_wait_not_busy();
+}
+
+static void ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer)
+{
+    const uint16_t *src = (const uint16_t *) buffer;
+
+    if (count == 0 || !ata_wait_not_busy()) {
+        return;
+    }
+    outb(ATA_DRIVE_PORT, (uint8_t) (0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_SECTOR_COUNT_PORT, count);
+    outb(ATA_LBA_LOW_PORT, (uint8_t) (lba & 0xFF));
+    outb(ATA_LBA_MID_PORT, (uint8_t) ((lba >> 8) & 0xFF));
+    outb(ATA_LBA_HIGH_PORT, (uint8_t) ((lba >> 16) & 0xFF));
+    outb(ATA_COMMAND_PORT, ATA_CMD_WRITE_SECTORS);
+
+    for (uint8_t sector = 0; sector < count; sector++) {
+        if (!ata_wait_data_ready()) {
+            return;
+        }
+        for (uint32_t i = 0; i < 256; i++) {
+            outw(ATA_DATA_PORT, *src++);
+        }
     }
     (void) ata_wait_not_busy();
 }
@@ -233,27 +288,39 @@ static uint32_t fat16_cluster_to_lba(uint16_t cluster)
 
 static uint16_t fat16_get_fat_entry(uint16_t cluster)
 {
-    uint8_t sector[512];
+    uint8_t sector[1024];
     uint32_t fat_offset = (uint32_t) cluster * 2;
     uint32_t sector_lba = g_fat_lba + (fat_offset / g_bpb.bytes_per_sector);
     uint32_t sector_offset = fat_offset % g_bpb.bytes_per_sector;
+    uint16_t value;
 
-    ata_read_sector(sector_lba, sector);
-    return *(uint16_t *) (sector + sector_offset);
+    if (sector_offset <= g_bpb.bytes_per_sector - sizeof(value)) {
+        ata_read_sector(sector_lba, sector);
+    } else {
+        ata_read_sectors(sector_lba, 2, sector);
+    }
+    memcpy(&value, sector + sector_offset, sizeof(value));
+    return value;
 }
 
 static void fat16_set_fat_entry(uint16_t cluster, uint16_t value)
 {
-    uint8_t sector[512];
+    uint8_t sector[1024];
     uint32_t fat_offset = (uint32_t) cluster * 2;
     uint32_t sector_index = fat_offset / g_bpb.bytes_per_sector;
     uint32_t sector_offset = fat_offset % g_bpb.bytes_per_sector;
 
     for (uint8_t fat = 0; fat < g_bpb.fat_count; fat++) {
         uint32_t sector_lba = g_fat_lba + fat * g_bpb.fat_size_16 + sector_index;
-        ata_read_sector(sector_lba, sector);
-        *(uint16_t *) (sector + sector_offset) = value;
-        ata_write_sector(sector_lba, sector);
+        if (sector_offset <= g_bpb.bytes_per_sector - sizeof(value)) {
+            ata_read_sector(sector_lba, sector);
+            memcpy(sector + sector_offset, &value, sizeof(value));
+            ata_write_sector(sector_lba, sector);
+        } else {
+            ata_read_sectors(sector_lba, 2, sector);
+            memcpy(sector + sector_offset, &value, sizeof(value));
+            ata_write_sectors(sector_lba, 2, sector);
+        }
     }
 }
 
@@ -720,7 +787,8 @@ int32_t fat16_read_file_at(const char *path, uint32_t offset, void *buffer, uint
     target_cluster_index = offset / cluster_bytes;
     offset_in_cluster = offset % cluster_bytes;
 
-    if (g_fat16_read_cache_path == path &&
+    if (g_fat16_read_cache_path[0] != '\0' &&
+        strcmp(g_fat16_read_cache_path, path) == 0 &&
         g_fat16_read_cache_start_cluster == first_cluster &&
         g_fat16_read_cache_cluster >= 2 &&
         g_fat16_read_cache_cluster < g_cluster_count + 2 &&
@@ -739,7 +807,9 @@ int32_t fat16_read_file_at(const char *path, uint32_t offset, void *buffer, uint
         }
     }
 
-    g_fat16_read_cache_path = path;
+    if (strlcpy(g_fat16_read_cache_path, path, sizeof(g_fat16_read_cache_path)) >= sizeof(g_fat16_read_cache_path)) {
+        g_fat16_read_cache_path[0] = '\0';
+    }
     g_fat16_read_cache_start_cluster = first_cluster;
     g_fat16_read_cache_cluster_index = target_cluster_index;
     g_fat16_read_cache_cluster = cluster;
@@ -750,12 +820,32 @@ int32_t fat16_read_file_at(const char *path, uint32_t offset, void *buffer, uint
             uint32_t sector_offset = (uint32_t) sector_index * 512u;
             uint32_t start = 0;
             uint32_t chunk;
+            uint32_t whole_sectors;
 
             if (offset_in_cluster >= sector_offset + 512u) {
                 continue;
             }
             if (offset_in_cluster > sector_offset) {
                 start = offset_in_cluster - sector_offset;
+            }
+            if (start == 0 && bytes_left >= 512u) {
+                whole_sectors = bytes_left / 512u;
+                if (whole_sectors > (uint32_t) g_bpb.sectors_per_cluster - sector_index) {
+                    whole_sectors = (uint32_t) g_bpb.sectors_per_cluster - sector_index;
+                }
+                if (whole_sectors > 255u) {
+                    whole_sectors = 255u;
+                }
+                if (whole_sectors > 1u) {
+                    ata_read_sectors(fat16_cluster_to_lba(cluster) + sector_index,
+                                     (uint8_t) whole_sectors,
+                                     dst);
+                    dst += whole_sectors * 512u;
+                    bytes_read += whole_sectors * 512u;
+                    bytes_left -= whole_sectors * 512u;
+                    sector_index = (uint8_t) (sector_index + whole_sectors - 1u);
+                    continue;
+                }
             }
             chunk = 512u - start;
             if (chunk > bytes_left) {
@@ -811,7 +901,7 @@ int32_t fat16_write_file(const char *path, const void *buffer, uint32_t size)
 
     while (remaining > 0) {
         uint16_t cluster = fat16_allocate_cluster();
-        uint8_t sector[512];
+        uint32_t sector_index = 0;
 
         if (cluster == 0) {
             if (first_cluster != 0) {
@@ -828,18 +918,25 @@ int32_t fat16_write_file(const char *path, const void *buffer, uint32_t size)
         fat16_set_fat_entry(cluster, 0xFFFF);
         previous_cluster = cluster;
 
-        for (uint8_t sector_index = 0; sector_index < g_bpb.sectors_per_cluster; sector_index++) {
-            uint32_t chunk = remaining > 512 ? 512 : remaining;
-            memset(sector, 0, sizeof(sector));
-            if (chunk > 0) {
-                memcpy(sector, src, chunk);
+        while (sector_index < g_bpb.sectors_per_cluster) {
+            uint32_t batch = (uint32_t) g_bpb.sectors_per_cluster - sector_index;
+            uint32_t batch_bytes;
+
+            if (batch > 8u) {
+                batch = 8u;
+            }
+            batch_bytes = batch * 512u;
+            memset(g_fat16_write_buffer, 0, batch_bytes);
+            if (remaining > 0) {
+                uint32_t chunk = remaining < batch_bytes ? remaining : batch_bytes;
+                memcpy(g_fat16_write_buffer, src, chunk);
                 src += chunk;
                 remaining -= chunk;
             }
-            ata_write_sector(fat16_cluster_to_lba(cluster) + sector_index, sector);
-            if (remaining == 0 && sector_index + 1 >= g_bpb.sectors_per_cluster) {
-                break;
-            }
+            ata_write_sectors(fat16_cluster_to_lba(cluster) + sector_index,
+                              (uint8_t) batch,
+                              g_fat16_write_buffer);
+            sector_index += batch;
         }
     }
 

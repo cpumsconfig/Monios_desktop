@@ -108,6 +108,7 @@ _start:
     mov dx, 0x3F8
     out dx, al
     mov rdi, r12
+    mov rsi, r13
     call kernel_main
 
 .halt:
@@ -390,7 +391,7 @@ syscall_interrupt_handler:
     call syscall_interrupt_dispatch
     push rax
     call exec_process_completed
-    cmp rax, 0
+    test al, al
     pop rax
     je .return_to_user
     call exec_resume_stack_pointer

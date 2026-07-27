@@ -158,7 +158,7 @@ wSectorNo           dd 0
 bOdd                db 0
 BootDrive           db 0
 
-KernelFileName      db "KERNEL  BIN", 0
+KernelFileName      db "KERNEL  EXE", 0
 
 EnableA20:
     in al, 92h
@@ -323,6 +323,149 @@ LongModeEntry:
     mov rsp, StackTop64Phys
     mov rbp, rsp
 
+    call LoadKernelPe64
+    test rax, rax
+    jz .invalid_kernel
     xor r12d, r12d
-    mov rax, BaseOfKernelFilePhyAddr
+    xor r13d, r13d
     jmp rax
+
+.invalid_kernel:
+    mov al, 'E'
+    mov dx, 03f8h
+    out dx, al
+.halt:
+    hlt
+    jmp .halt
+
+; Load a standard PE32+ image in place at 0x02000000. Sections are processed
+; in reverse table order so the final .text copy may overwrite the PE header.
+LoadKernelPe64:
+    mov r15, BaseOfKernelFilePhyAddr
+    mov ebx, BaseOfLoaderPhyAddr + dwKernelSize
+    mov r14d, [rbx]
+    cmp r14d, 100h
+    jb .invalid
+    cmp word [r15], 05A4Dh
+    jne .invalid
+
+    mov eax, [r15 + 03Ch]
+    cmp eax, r14d
+    jae .invalid
+    lea rbx, [r15 + rax]
+    cmp dword [rbx], 00004550h
+    jne .invalid
+
+    movzx r12d, word [rbx + 6]
+    test r12d, r12d
+    jz .invalid
+    movzx edx, word [rbx + 20]
+    cmp edx, 112
+    jb .invalid
+    lea rsi, [rbx + 24]
+    cmp word [rsi], 020Bh
+    jne .invalid
+
+    cmp qword [rsi + 24], BaseOfKernelFilePhyAddr
+    jne .invalid
+    mov r13d, [rsi + 16]
+    mov r8d, [rsi + 56]
+    test r8d, r8d
+    jz .invalid
+    cmp r13d, r8d
+    jae .invalid
+
+    lea rbx, [rbx + rdx + 24]
+    mov eax, [r15 + 03Ch]
+    add eax, 24
+    add eax, edx
+    mov edx, eax
+    mov eax, r12d
+    imul eax, 40
+    add edx, eax
+    jc .invalid
+    cmp edx, r14d
+    ja .invalid
+
+    mov r9d, r12d
+    dec r9d
+.section_loop:
+    mov eax, r9d
+    imul eax, 40
+    lea rdi, [rbx + rax]
+    mov r10d, [rdi + 8]
+    mov r11d, [rdi + 12]
+    mov r12d, [rdi + 16]
+    mov edx, [rdi + 20]
+
+    mov eax, r10d
+    cmp eax, r12d
+    jae .section_size_ready
+    mov eax, r12d
+.section_size_ready:
+    test eax, eax
+    jz .section_next
+    add eax, r11d
+    jc .invalid
+    cmp eax, r8d
+    ja .invalid
+
+    test r12d, r12d
+    jz .section_zero
+    cmp edx, r14d
+    jae .invalid
+    mov eax, edx
+    add eax, r12d
+    jc .invalid
+    cmp eax, r14d
+    ja .invalid
+
+    mov rsi, r15
+    add rsi, rdx
+    mov rdi, r15
+    add rdi, r11
+    cmp rdi, rsi
+    jbe .copy_forward
+
+    mov eax, r12d
+    add rsi, rax
+    add rdi, rax
+    dec rsi
+    dec rdi
+    mov ecx, r12d
+    std
+    rep movsb
+    cld
+    jmp .section_zero
+
+.copy_forward:
+    mov ecx, r12d
+    cld
+    rep movsb
+
+.section_zero:
+    cmp r10d, r12d
+    jbe .section_next
+    sub r10d, r12d
+    mov rdi, r15
+    add rdi, r11
+    mov eax, r12d
+    add rdi, rax
+    xor eax, eax
+    mov ecx, r10d
+    cld
+    rep stosb
+
+.section_next:
+    dec r9d
+    jns .section_loop
+
+.entry:
+    mov eax, r13d
+    add rax, r15
+    jc .invalid
+    ret
+
+.invalid:
+    xor eax, eax
+    ret

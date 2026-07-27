@@ -39,6 +39,8 @@
 #define SYS_EXEC_DEFER           33
 #define SYS_INSTALLER_CALL       34
 #define SYS_GRAPHICS_DRAW_TEXT   35
+#define SYS_CONSOLE_SET_TITLE    36
+#define SYS_OPEN_NOTEPAD_WINDOW  37
 
 void syscall_init(void);
 uint64_t syscall_interrupt_dispatch(void *frame_ptr);

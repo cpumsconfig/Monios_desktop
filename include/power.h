@@ -8,9 +8,12 @@ typedef struct {
     bool initialized;
     bool acpi_ready;
     bool power_button_ready;
+    bool sleep_ready;
+    bool reset_ready;
     bool cpu_frequency_detected;
     bool device_power_ready;
     uint16_t sci_irq;
+    uint8_t sleep_state;
     char status[64];
 } power_info_t;
 

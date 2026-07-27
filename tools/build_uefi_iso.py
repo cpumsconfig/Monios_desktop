@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import shutil
 import struct
 import sys
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,34 @@ from mkfat32 import Fat32Image, TOTAL_SECTORS  # noqa: E402
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+DRIVER_PACKAGE_NAMES = (
+    "audio",
+    "dma",
+    "gpu",
+    "pci",
+    "ide",
+    "ahci",
+    "nvme",
+    "cdrom",
+    "storage_ext",
+    "xhci",
+    "usb_ext",
+    "hid",
+    "bluetooth",
+    "hda",
+    "es1371",
+    "aac",
+    "e1000",
+    "pcnet",
+    "smbus",
+    "i2c",
+    "i3c",
+    "spi",
+    "tpm",
+    "mcb",
+    "md",
+    "rzdrv",
+)
 SECTOR = 2048
 
 
@@ -201,28 +231,98 @@ def build_esp_image(
     image = Fat32Image(esp_path, fat32_boot_sector())
     image.add_file(efi_path, "/EFI/BOOT/BOOTX64.EFI")
     image.add_file(efi_path, "/BOOTX64.EFI")
-    image.add_file(kernel_path, "/KERNEL.BIN")
+    image.add_file(kernel_path, "/KERNEL.EXE")
+    image.add_file(kernel_path, "/MONIOS/KERNEL.EXE")
+    image.add_file(PROJECT_DIR / "assets" / "boot.bmp", "/MONIOS/SYSTEM/MEDIA/BOOT.BMP")
+    for name in DRIVER_PACKAGE_NAMES:
+        image.add_file(PROJECT_DIR / "out" / f"{name}.sys", f"/MONIOS/DRIVER/{name}.SYS")
     if setup_path is not None and setup_path.exists():
-        image.add_file(setup_path, "/SETUP.ELF")
+        image.add_file(setup_path, "/SETUP.EXE")
     if font_path is not None and font_path.exists():
         image.add_file(font_path, "/FONTS/MSYH.TTC")
         image.add_file(font_path, "/MSYH.TTC")
+    for name in ("monios.dll", "console.dll", "windows.dll"):
+        dll_path = PROJECT_DIR / "out" / name
+        if dll_path.exists():
+            image.add_file(dll_path, f"/SYSTEM/LIB/{name.upper()}")
 
     install_txt = staging / "INSTALL.TXT"
     install_txt.write_text(
         "MoniOS UEFI installer media\r\n"
-        "Boot this ISO to install SYSTEM_UEFI.IMG or SYSTEM_MBR.IMG to disk.\r\n",
+        "Boot this ISO to install SYSTEM_UEFI.ZIP or SYSTEM_MBR.ZIP to disk.\r\n",
         encoding="ascii",
     )
     install_flg = staging / "INSTALL.FLG"
     install_flg.write_text("MONIOS_UEFI_INSTALLER=1\r\n", encoding="ascii")
     monios_ini = staging / "MONIOS.INI"
     monios_ini.write_text("boot=uefi\r\nmode=installer\r\n", encoding="ascii")
+    boot_wait = staging / "BOOTWAIT.FLG"
+    boot_wait.write_text("PRESS_ENTER_TO_BOOT_ISO=1\r\nTIMEOUT=3\r\n", encoding="ascii")
     image.add_file(install_txt, "/INSTALL.TXT")
     image.add_file(install_flg, "/INSTALL.FLG")
     image.add_file(monios_ini, "/MONIOS.INI")
+    image.add_file(boot_wait, "/BOOTWAIT.FLG")
     image.save()
     return esp_path.read_bytes()
+
+
+def add_zip_entry(zf: zipfile.ZipFile, source: Path, dest: str) -> None:
+    if not source.exists():
+        raise SystemExit(f"missing payload file: {source}")
+    name = dest.replace("\\", "/").strip("/")
+    zf.writestr(name.upper(), source.read_bytes(), compress_type=zipfile.ZIP_STORED)
+
+
+def build_payload_zip(output: Path, mode: str, efi: Path, kernel: Path, setup: Path | None,
+                      font: Path | None) -> bytes:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as zf:
+        loader = PROJECT_DIR / "out" / "loader.bin"
+        add_zip_entry(zf, loader, "LOADER.BIN")
+        add_zip_entry(zf, loader, "MONIOS/SYSTEM/BOOT/LOADER.BIN")
+        add_zip_entry(zf, kernel, "KERNEL.EXE")
+        add_zip_entry(zf, kernel, "MONIOS/KERNEL.EXE")
+        add_zip_entry(zf, kernel, "MONIOS/SYSTEM/BOOT/KERNEL.EXE")
+        if mode == "uefi":
+            add_zip_entry(zf, efi, "EFI/BOOT/BOOTX64.EFI")
+            add_zip_entry(zf, efi, "BOOTX64.EFI")
+        for name in (
+            "demo.exe",
+            "explorar.exe",
+            "monilog.exe",
+            "player.exe",
+            "notepad.exe",
+            "taskmgr.exe",
+            "square.exe",
+            "cube3d.exe",
+            "sysinst.exe",
+            "appdev.exe",
+            "hello.exe",
+        ):
+            add_zip_entry(zf, PROJECT_DIR / "out" / name, f"MONIOS/APPS/{name}")
+        if setup is not None and setup.exists():
+            add_zip_entry(zf, setup, "MONIOS/APPS/SETUP.EXE")
+        for name in ("monios.dll", "console.dll", "windows.dll"):
+            add_zip_entry(zf, PROJECT_DIR / "out" / name, f"MONIOS/SYSTEM/LIB/{name}")
+        for name in DRIVER_PACKAGE_NAMES:
+            add_zip_entry(zf, PROJECT_DIR / "out" / f"{name}.sys", f"MONIOS/DRIVER/{name}.SYS")
+        if font is not None and font.exists():
+            add_zip_entry(zf, font, "MONIOS/SYSTEM/FONTS/MSYH.TTC")
+        for source, dest in (
+            (PROJECT_DIR / "music_vm.wav", "MONIOS/USERS/ROOT/DESKTOP/MUSIC.WAV"),
+            (PROJECT_DIR / "bgm.m4a", "MONIOS/USERS/ROOT/DESKTOP/BGM.M4A"),
+            (PROJECT_DIR / "bgm.wav", "MONIOS/USERS/ROOT/DESKTOP/BGM.WAV"),
+            (PROJECT_DIR / "assets" / "wall.bmp", "MONIOS/SYSTEM/MEDIA/WALL.BMP"),
+            (PROJECT_DIR / "assets" / "boot.bmp", "MONIOS/SYSTEM/MEDIA/BOOT.BMP"),
+            (PROJECT_DIR / "out" / "arrow.cur", "MONIOS/SYSTEM/CURSORS/ARROW.CUR"),
+            (PROJECT_DIR / "pwd.txt", "MONIOS/SYSTEM/CONFIG/PWD.TXT"),
+            (PROJECT_DIR / "version.txt", "MONIOS/SYSTEM/VERSION.TXT"),
+        ):
+            add_zip_entry(zf, source, dest)
+    data = buffer.getvalue()
+    output.write_bytes(data)
+    return data
 
 
 def build_iso(output: Path, esp_data: bytes, root_files: list[IsoFile]) -> None:
@@ -278,11 +378,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=PROJECT_DIR / "out" / "monios_uefi_installer.iso")
     parser.add_argument("--esp", type=Path, default=PROJECT_DIR / "out" / "monios_uefi_esp.img")
     parser.add_argument("--efi", type=Path, default=PROJECT_DIR / "out" / "monios.efi")
-    parser.add_argument("--kernel", type=Path, default=PROJECT_DIR / "out" / "kernel.bin")
-    parser.add_argument("--setup", type=Path, default=PROJECT_DIR / "out" / "setup.elf")
+    parser.add_argument("--kernel", type=Path, default=PROJECT_DIR / "out" / "kernel.exe")
+    parser.add_argument("--setup", type=Path, default=PROJECT_DIR / "out" / "setup.exe")
     parser.add_argument("--font", type=Path, default=PROJECT_DIR / "out" / "msyh.ttc")
     parser.add_argument("--system-uefi", type=Path, default=PROJECT_DIR / "hd_uefi.img")
     parser.add_argument("--system-mbr", type=Path, default=PROJECT_DIR / "hd.img")
+    parser.add_argument("--system-uefi-zip", type=Path, default=PROJECT_DIR / "out" / "system_uefi.zip")
+    parser.add_argument("--system-mbr-zip", type=Path, default=PROJECT_DIR / "out" / "system_mbr.zip")
     parser.add_argument("--boot-bin", type=Path, default=PROJECT_DIR / "out" / "boot.bin")
     args = parser.parse_args()
 
@@ -290,10 +392,6 @@ def main() -> None:
         raise SystemExit(f"missing UEFI loader: {args.efi}")
     if not args.kernel.exists():
         raise SystemExit(f"missing kernel: {args.kernel}")
-    if not args.system_uefi.exists():
-        raise SystemExit(f"missing UEFI system image: {args.system_uefi}")
-    if not args.system_mbr.exists():
-        raise SystemExit(f"missing MBR system image: {args.system_mbr}")
     if not args.boot_bin.exists():
         raise SystemExit(f"missing BIOS boot sector: {args.boot_bin}")
 
@@ -313,26 +411,50 @@ def main() -> None:
     install_txt = (staging / "INSTALL.TXT").read_bytes()
     install_flg = (staging / "INSTALL.FLG").read_bytes()
     monios_ini = (staging / "MONIOS.INI").read_bytes()
+    boot_wait = (staging / "BOOTWAIT.FLG").read_bytes()
+    system_uefi_zip = build_payload_zip(args.system_uefi_zip,
+                                        "uefi",
+                                        args.efi,
+                                        args.kernel,
+                                        args.setup if args.setup.exists() else None,
+                                        args.font if args.font.exists() else None)
+    system_mbr_zip = build_payload_zip(args.system_mbr_zip,
+                                       "mbr",
+                                       args.efi,
+                                       args.kernel,
+                                       args.setup if args.setup.exists() else None,
+                                       args.font if args.font.exists() else None)
 
     root_files = [
         IsoFile(b"EFI_BOOT.IMG;1", esp_data),
         IsoFile(b"BOOTX64.EFI;1", args.efi.read_bytes()),
-        IsoFile(b"KERNEL.BIN;1", args.kernel.read_bytes()),
+        IsoFile(b"KERNEL.EXE;1", args.kernel.read_bytes()),
         IsoFile(b"INSTALL.TXT;1", install_txt),
         IsoFile(b"INSTALL.FLG;1", install_flg),
         IsoFile(b"MONIOS.INI;1", monios_ini),
-        IsoFile(b"SYSTEM_UEFI.IMG;1", args.system_uefi.read_bytes()),
-        IsoFile(b"SYSTEM_MBR.IMG;1", args.system_mbr.read_bytes()),
+        IsoFile(b"BOOTWAIT.FLG;1", boot_wait),
+        IsoFile(b"SYSTEM_UEFI.ZIP;1", system_uefi_zip),
+        IsoFile(b"SYSTEM_MBR.ZIP;1", system_mbr_zip),
         IsoFile(b"BOOT.BIN;1", args.boot_bin.read_bytes()),
     ]
     if args.setup.exists():
-        root_files.append(IsoFile(b"SETUP.ELF;1", args.setup.read_bytes()))
+        root_files.append(IsoFile(b"SETUP.EXE;1", args.setup.read_bytes()))
     if args.font.exists():
         root_files.append(IsoFile(b"MSYH.TTC;1", args.font.read_bytes()))
+    for iso_name, name in (
+        (b"MONIOS.DLL;1", "monios.dll"),
+        (b"CONSOLE.DLL;1", "console.dll"),
+        (b"WINDOWS.DLL;1", "windows.dll"),
+    ):
+        dll_path = PROJECT_DIR / "out" / name
+        if dll_path.exists():
+            root_files.append(IsoFile(iso_name, dll_path.read_bytes()))
 
     build_iso(args.output, esp_data, root_files)
     print(f"UEFI ISO: {args.output} ({args.output.stat().st_size} bytes)")
     print(f"ESP image: {args.esp} ({len(esp_data)} bytes)")
+    print(f"UEFI payload ZIP: {args.system_uefi_zip} ({len(system_uefi_zip)} bytes)")
+    print(f"MBR payload ZIP: {args.system_mbr_zip} ({len(system_mbr_zip)} bytes)")
 
 
 if __name__ == "__main__":

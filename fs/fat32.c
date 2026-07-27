@@ -95,6 +95,7 @@ static bool g_fat32_read_cache_valid;
 static uint32_t g_fat32_read_cache_start_cluster;
 static uint32_t g_fat32_read_cache_cluster_index;
 static uint32_t g_fat32_read_cache_cluster;
+static uint8_t g_fat32_write_buffer[8 * 512];
 static bool g_fat32_fat_cache_valid;
 static uint32_t g_fat32_fat_cache_lba;
 static uint8_t g_fat32_fat_cache[512];
@@ -249,6 +250,31 @@ static void ata_write_sector(uint32_t lba, const void *buffer)
     (void) ata_wait_not_busy();
 }
 
+static void ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer)
+{
+    const uint16_t *src = (const uint16_t *) buffer;
+
+    if (count == 0 || !ata_wait_not_busy()) {
+        return;
+    }
+    outb(ATA_DRIVE_PORT, (uint8_t) (0xE0 | ((lba >> 24) & 0x0F)));
+    outb(ATA_SECTOR_COUNT_PORT, count);
+    outb(ATA_LBA_LOW_PORT, (uint8_t) (lba & 0xFF));
+    outb(ATA_LBA_MID_PORT, (uint8_t) ((lba >> 8) & 0xFF));
+    outb(ATA_LBA_HIGH_PORT, (uint8_t) ((lba >> 16) & 0xFF));
+    outb(ATA_COMMAND_PORT, ATA_CMD_WRITE_SECTORS);
+
+    for (uint8_t sector = 0; sector < count; sector++) {
+        if (!ata_wait_data_ready()) {
+            return;
+        }
+        for (uint32_t i = 0; i < 256; i++) {
+            outw(ATA_DATA_PORT, *src++);
+        }
+    }
+    (void) ata_wait_not_busy();
+}
+
 static bool fat32_is_end_cluster(uint32_t cluster)
 {
     cluster &= FAT32_CLUSTER_MASK;
@@ -315,21 +341,29 @@ static uint32_t fat32_cluster_to_lba(uint32_t cluster)
 
 static uint32_t fat32_get_fat_entry(uint32_t cluster)
 {
+    uint8_t sectors[1024];
+    uint32_t value;
     uint32_t fat_offset = cluster * 4;
     uint32_t sector_lba = g_fat_lba + (fat_offset / g_bpb.bytes_per_sector);
     uint32_t sector_offset = fat_offset % g_bpb.bytes_per_sector;
 
-    if (!g_fat32_fat_cache_valid || g_fat32_fat_cache_lba != sector_lba) {
-        ata_read_sector(sector_lba, g_fat32_fat_cache);
-        g_fat32_fat_cache_lba = sector_lba;
-        g_fat32_fat_cache_valid = true;
+    if (sector_offset <= g_bpb.bytes_per_sector - sizeof(value)) {
+        if (!g_fat32_fat_cache_valid || g_fat32_fat_cache_lba != sector_lba) {
+            ata_read_sector(sector_lba, g_fat32_fat_cache);
+            g_fat32_fat_cache_lba = sector_lba;
+            g_fat32_fat_cache_valid = true;
+        }
+        memcpy(&value, g_fat32_fat_cache + sector_offset, sizeof(value));
+    } else {
+        ata_read_sectors(sector_lba, 2, sectors);
+        memcpy(&value, sectors + sector_offset, sizeof(value));
     }
-    return (*(uint32_t *) (g_fat32_fat_cache + sector_offset)) & FAT32_CLUSTER_MASK;
+    return value & FAT32_CLUSTER_MASK;
 }
 
 static void fat32_set_fat_entry(uint32_t cluster, uint32_t value)
 {
-    uint8_t sector[512];
+    uint8_t sector[1024];
     uint32_t fat_offset = cluster * 4;
     uint32_t sector_index = fat_offset / g_bpb.bytes_per_sector;
     uint32_t sector_offset = fat_offset % g_bpb.bytes_per_sector;
@@ -337,12 +371,24 @@ static void fat32_set_fat_entry(uint32_t cluster, uint32_t value)
     for (uint8_t fat = 0; fat < g_bpb.fat_count; fat++) {
         uint32_t sector_lba = g_fat_lba + fat * g_bpb.fat_size_32 + sector_index;
         uint32_t current;
-        ata_read_sector(sector_lba, sector);
-        current = *(uint32_t *) (sector + sector_offset);
-        *(uint32_t *) (sector + sector_offset) = (current & ~FAT32_CLUSTER_MASK) | (value & FAT32_CLUSTER_MASK);
-        ata_write_sector(sector_lba, sector);
-        if (fat == 0 && g_fat32_fat_cache_valid && g_fat32_fat_cache_lba == sector_lba) {
-            memcpy(g_fat32_fat_cache, sector, sizeof(g_fat32_fat_cache));
+        if (sector_offset <= g_bpb.bytes_per_sector - sizeof(current)) {
+            ata_read_sector(sector_lba, sector);
+            memcpy(&current, sector + sector_offset, sizeof(current));
+            current = (current & ~FAT32_CLUSTER_MASK) | (value & FAT32_CLUSTER_MASK);
+            memcpy(sector + sector_offset, &current, sizeof(current));
+            ata_write_sector(sector_lba, sector);
+            if (fat == 0 && g_fat32_fat_cache_valid && g_fat32_fat_cache_lba == sector_lba) {
+                memcpy(g_fat32_fat_cache, sector, sizeof(g_fat32_fat_cache));
+            }
+        } else {
+            ata_read_sectors(sector_lba, 2, sector);
+            memcpy(&current, sector + sector_offset, sizeof(current));
+            current = (current & ~FAT32_CLUSTER_MASK) | (value & FAT32_CLUSTER_MASK);
+            memcpy(sector + sector_offset, &current, sizeof(current));
+            ata_write_sectors(sector_lba, 2, sector);
+            if (fat == 0) {
+                fat32_clear_fat_cache();
+            }
         }
     }
 }
@@ -996,7 +1042,7 @@ int32_t fat32_write_file(const char *path, const void *buffer, uint32_t size)
 
     while (remaining > 0) {
         uint32_t cluster = fat32_allocate_cluster();
-        uint8_t sector[512];
+        uint32_t sector_index = 0;
 
         if (cluster == 0) {
             if (first_cluster != 0) {
@@ -1013,18 +1059,25 @@ int32_t fat32_write_file(const char *path, const void *buffer, uint32_t size)
         fat32_set_fat_entry(cluster, FAT32_CLUSTER_END);
         previous_cluster = cluster;
 
-        for (uint8_t sector_index = 0; sector_index < g_bpb.sectors_per_cluster; sector_index++) {
-            uint32_t chunk = remaining > 512 ? 512 : remaining;
-            memset(sector, 0, sizeof(sector));
-            if (chunk > 0) {
-                memcpy(sector, src, chunk);
+        while (sector_index < g_bpb.sectors_per_cluster) {
+            uint32_t batch = (uint32_t) g_bpb.sectors_per_cluster - sector_index;
+            uint32_t batch_bytes;
+
+            if (batch > 8u) {
+                batch = 8u;
+            }
+            batch_bytes = batch * 512u;
+            memset(g_fat32_write_buffer, 0, batch_bytes);
+            if (remaining > 0) {
+                uint32_t chunk = remaining < batch_bytes ? remaining : batch_bytes;
+                memcpy(g_fat32_write_buffer, src, chunk);
                 src += chunk;
                 remaining -= chunk;
             }
-            ata_write_sector(fat32_cluster_to_lba(cluster) + sector_index, sector);
-            if (remaining == 0 && sector_index + 1 >= g_bpb.sectors_per_cluster) {
-                break;
-            }
+            ata_write_sectors(fat32_cluster_to_lba(cluster) + sector_index,
+                              (uint8_t) batch,
+                              g_fat32_write_buffer);
+            sector_index += batch;
         }
     }
 

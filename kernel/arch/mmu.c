@@ -7,6 +7,8 @@
 #define PAGE_PRESENT 0x001ULL
 #define PAGE_WRITABLE 0x002ULL
 #define PAGE_USER 0x004ULL
+#define PAGE_WRITE_THROUGH 0x008ULL
+#define PAGE_CACHE_DISABLE 0x010ULL
 #define PAGE_LARGE_2M 0x080ULL
 
 typedef struct {
@@ -371,9 +373,9 @@ void init_page_tables(void)
     /* Ensure common MMIO/high framebuffer ranges are identity-mapped
      * in the kernel page tables before switching CR3. Map 0xF0000000..0xFFFFFFFF (256MB)
      * which covers QEMU/Bochs framebuffers and common MMIO regions. */
-    mmu_map_identity(0xF0000000ULL, 0x10000000ULL);
+    mmu_map_device_identity(0xF0000000ULL, 0x10000000ULL);
     /* Also map VMware SVGA MMIO region which can appear at 0xE8000000. */
-    mmu_map_identity(0xE8000000ULL, 0x01000000ULL);
+    mmu_map_device_identity(0xE8000000ULL, 0x01000000ULL);
 
     /* Dump page table entries that should cover the VMware SVGA MMIO region
      * (physical 0xE8000000). This helps verify the pd3 entry written by
@@ -427,7 +429,7 @@ void init_page_tables(void)
  * can ensure device MMIO / framebuffer physical regions are present when
  * switching to its own page tables.
  */
-void mmu_map_identity(uint64_t phys_base, uint64_t length)
+static void mmu_map_identity_flags(uint64_t phys_base, uint64_t length, uint64_t flags)
 {
     const uint64_t page_size = 0x200000ULL; /* 2MiB */
     uint64_t start = phys_base & ~(page_size - 1);
@@ -438,33 +440,49 @@ void mmu_map_identity(uint64_t phys_base, uint64_t length)
         if (addr < (uint64_t)512 * page_size) {
             /* 0..1GiB -> pd0 */
             uint64_t index = addr / page_size;
-            pd0[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd0[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr < (uint64_t)1024 * page_size) {
             /* 1GiB..2GiB -> pd1 */
             uint64_t index = (addr / page_size) - 512;
-            pd1[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd1[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr < (uint64_t)1536 * page_size) {
             /* 2GiB..3GiB -> pd2 */
             uint64_t index = (addr / page_size) - 1024;
-            pd2[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd2[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0xC0000000ULL && addr < 0x100000000ULL) {
             /* 3GiB..4GiB -> pd3 */
             uint64_t index = (addr - 0xC0000000ULL) / page_size;
-            pd3[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd3[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0x100000000ULL && addr < 0x1C0000000ULL) {
             /* 4GiB..7GiB -> pd3b (1:1 layout used earlier) */
             uint64_t index = (addr - 0x100000000ULL) / page_size;
-            pd3b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd3b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0x1C0000000ULL && addr < 0x200000000ULL) {
             /* 7GiB..8GiB -> pd7 */
             uint64_t index = (addr - 0x1C0000000ULL) / page_size;
-            pd7[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd7[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0x200000000ULL) {
             /* 8GiB+ -> pd7b */
             uint64_t index = (addr - 0x200000000ULL) / page_size;
-            pd7b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M;
+            pd7b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         }
     }
+
+    if (flags != 0 && mmu_pml4_phys != 0 && mmu_is_active()) {
+        for (uint64_t addr = start; addr < end; addr += page_size) {
+            asm volatile ("invlpg (%0)" : : "r" ((void *) (uintptr_t) addr) : "memory");
+        }
+    }
+}
+
+void mmu_map_identity(uint64_t phys_base, uint64_t length)
+{
+    mmu_map_identity_flags(phys_base, length, 0);
+}
+
+void mmu_map_device_identity(uint64_t phys_base, uint64_t length)
+{
+    mmu_map_identity_flags(phys_base, length, PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE);
 }
 
 /* Expose current kernel PML4 physical and activation check. */

@@ -940,8 +940,23 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append_u32(buffer, size, info->logical_processors);
         device_append(buffer, size, "\nonline ");
         device_append_u32(buffer, size, info->online_processors);
+        device_append(buffer, size, "\nfirmware ");
+        device_append_u32(buffer, size, info->firmware_processors);
+        device_append(buffer, size, "\nfirmware-enabled ");
+        device_append_u32(buffer, size, info->firmware_enabled_processors);
+        device_append(buffer, size, "\nlapic-mmio ");
+        device_append(buffer, size, info->lapic_mmio_ready ? "ready" : "not-ready");
+        device_append(buffer, size, "\nap-targets ");
+        device_append_u32(buffer, size, info->ap_startup_targets);
+        device_append(buffer, size, "\nap-pending ");
+        device_append_u32(buffer, size, info->ap_startup_pending);
+        device_append(buffer, size, "\napic-ids");
+        for (uint32_t i = 0; i < info->firmware_enabled_lapic_id_count && i < SMP_CPU_MAX; i++) {
+            device_append(buffer, size, " ");
+            device_append_hex_u32(buffer, size, info->firmware_enabled_lapic_ids[i]);
+        }
         device_append(buffer, size, "\nmode ");
-        device_append(buffer, size, info->bootstrap_only ? "bsp-only\n" : "ap-scheduler\n");
+        device_append(buffer, size, info->bootstrap_only ? "bsp-only; ap-startup-pending\n" : "ap-scheduler\n");
         return (int32_t) strlen(buffer);
     }
     if (strcmp(dev->name, "schedopt") == 0) {

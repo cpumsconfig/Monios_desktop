@@ -1,6 +1,8 @@
 #include "common.h"
 #include "kernel.h"
+#include "file.h"
 #include "registry.h"
+#include "ui.h"
 
 #define REGISTRY_MAX_ENTRIES 64
 
@@ -73,14 +75,25 @@ void registry_init(void)
 {
     memset(g_registry, 0, sizeof(g_registry));
     registry_set("ui.version", "1.0");
-    registry_set("shell.default", "/apps/explorar.exe");
-    registry_set("default.filemanager", "/apps/explorar.exe");
-    registry_set("default.player", "/apps/player.elf");
-    registry_set("default.editor", "/apps/notepad.elf");
-    registry_set_default_app(".rzs", "/apps/rzsinst.elf");
-    registry_set_default_app(".wav", "/apps/player.elf");
-    registry_set_default_app(".m4a", "/apps/player.elf");
-    registry_set_default_app(".txt", "/apps/notepad.elf");
+    registry_set("system.drive", "C:");
+    registry_set("system.root", UI_SYSTEM_ROOT);
+    registry_set("shell.default", UI_EXPLORER_PATH);
+    registry_set("shell.desktop", UI_ROOT_DESKTOP);
+    registry_set("ui.wallpaper", UI_WALLPAPER_PATH);
+    registry_set("ui.cursor", UI_CURSOR_ASSET_PATH);
+    registry_set("default.filemanager", UI_EXPLORER_PATH);
+    registry_set("default.player", UI_PLAYER_PATH);
+    registry_set("default.editor", UI_NOTEPAD_PATH);
+    if (file_exists(UI_RZDRV_PATH) && !file_is_dir(UI_RZDRV_PATH)) {
+        registry_set("drivers.boot.count", "1");
+        registry_set("drivers.boot.0", UI_RZDRV_PATH);
+    } else {
+        registry_set("drivers.boot.count", "0");
+    }
+    registry_set_default_app(".sys", UI_SYSINST_PATH);
+    registry_set_default_app(".wav", UI_PLAYER_PATH);
+    registry_set_default_app(".m4a", UI_PLAYER_PATH);
+    registry_set_default_app(".txt", UI_NOTEPAD_PATH);
 }
 
 bool registry_set(const char *key, const char *value)

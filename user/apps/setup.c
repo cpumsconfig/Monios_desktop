@@ -2,14 +2,15 @@
 #include "stdio.h"
 #include "string.h"
 #include "unistd.h"
+#include "path.h"
 
-#define SETUP_IMAGE_UEFI       "/SYSTEM_UEFI.IMG"
-#define SETUP_IMAGE_MBR        "/SYSTEM_MBR.IMG"
-#define SETUP_BOOT_CONFIG      "/MONIOS.INI"
-#define SETUP_AUTH_PATH        "/pwd.txt"
-#define SETUP_LOG_PATH         "/install.log"
+#define SETUP_IMAGE_UEFI       "C:\\SYSTEM_UEFI.ZIP"
+#define SETUP_IMAGE_MBR        "C:\\SYSTEM_MBR.ZIP"
+#define SETUP_BOOT_CONFIG      "C:\\MONIOS.INI"
+#define SETUP_BOOT_BIN         "C:\\BOOT.BIN"
+#define SETUP_AUTH_PATH        "C:\\Monios\\System\\Config\\pwd.txt"
+#define SETUP_LOG_PATH         "C:\\install.log"
 #define SETUP_SALT             "monios"
-#define SETUP_CHUNK_BYTES      APP_INSTALLER_CHUNK_MAX
 #define SETUP_SHA256_BLOCK     64U
 #define SETUP_SHA256_DIGEST    32U
 #define SETUP_PASSWORD_MAX     48U
@@ -25,6 +26,16 @@
 #define SETUP_REPORT_MAX       1024U
 #define SETUP_DEFAULT_PART_LBA 2048U
 #define SETUP_TICKS_PER_SEC    100U
+#define SETUP_FAT32_TOTAL_SECTORS 202752U
+#define SETUP_FAT32_RESERVED_SECTORS 32U
+#define SETUP_FAT32_FAT_COUNT 2U
+#define SETUP_FAT32_FAT_SIZE 1576U
+#define SETUP_FAT32_ROOT_CLUSTER 2U
+#define SETUP_FAT32_DATA_LBA (SETUP_FAT32_RESERVED_SECTORS + SETUP_FAT32_FAT_COUNT * SETUP_FAT32_FAT_SIZE)
+#define SETUP_ZIP_LOCAL_SIG   0x04034B50U
+#define SETUP_ZIP_CENTRAL_SIG 0x02014B50U
+#define SETUP_ZIP_END_SIG     0x06054B50U
+#define SETUP_ZIP_METHOD_STORE 0U
 
 typedef struct {
     uint32_t state[8];
@@ -248,6 +259,16 @@ static setup_target_t setup_target_for_mode(setup_target_mode_t mode)
         target.label = "BIOS/MBR";
     }
     return target;
+}
+
+static int32_t setup_media_file_size(const char *path)
+{
+    return app_installer_media_size(path);
+}
+
+static bool setup_media_file_exists(const char *path)
+{
+    return setup_media_file_size(path) >= 0;
 }
 
 static uint32_t setup_rotr(uint32_t value, uint32_t shift)
@@ -564,7 +585,7 @@ static const char *setup_target_kind_name(const app_installer_target_info_t *tar
         return "Unknown";
     }
     if (target->kind == APP_INSTALLER_TARGET_KIND_UEFI_ESP) {
-        return "Create EFI partition";
+        return "Create FAT32 partition";
     }
     if (target->kind == APP_INSTALLER_TARGET_KIND_DISK) {
         return "Whole disk";
@@ -596,7 +617,7 @@ static void setup_make_target_label(const app_installer_target_info_t *target,
         return;
     }
     if (target->kind == APP_INSTALLER_TARGET_KIND_UEFI_ESP) {
-        setup_append_text(out, out_size, "Create EFI partition (");
+        setup_append_text(out, out_size, "Create FAT32 partition (");
         setup_append_u32(out, out_size, setup_sector_mb(target->sector_count));
         setup_append_text(out, out_size, " MB)");
     } else if (target->kind == APP_INSTALLER_TARGET_KIND_DISK) {
@@ -779,7 +800,7 @@ static void setup_draw_target_screen(const char *current, const char *message)
     if (message != 0 && message[0] != '\0') {
         app_graphics_draw_text(236, 504, message, 0x00A82636);
     } else {
-        app_graphics_draw_text(236, 504, "UEFI partition mode keeps boot metadata separate.", 0x004A6278);
+        app_graphics_draw_text(236, 504, "A FAT32 partition will receive files from the selected package.", 0x004A6278);
     }
     app_graphics_draw_text(236, 542, "Target number", 0x004A6278);
     setup_draw_input_box(356, 530, 180, current, true, false);
@@ -882,6 +903,25 @@ static uint32_t setup_round_up_512(uint32_t value)
     return (value + 511U) & ~511U;
 }
 
+static uint16_t setup_load_le16(const uint8_t *data)
+{
+    return (uint16_t) data[0] | ((uint16_t) data[1] << 8);
+}
+
+static uint32_t setup_load_le32(const uint8_t *data)
+{
+    return (uint32_t) data[0] |
+           ((uint32_t) data[1] << 8) |
+           ((uint32_t) data[2] << 16) |
+           ((uint32_t) data[3] << 24);
+}
+
+static void setup_store_le16(uint8_t *data, uint16_t value)
+{
+    data[0] = (uint8_t) value;
+    data[1] = (uint8_t) (value >> 8);
+}
+
 static void setup_store_le32(uint8_t *data, uint32_t value)
 {
     data[0] = (uint8_t) value;
@@ -890,11 +930,129 @@ static void setup_store_le32(uint8_t *data, uint32_t value)
     data[3] = (uint8_t) (value >> 24);
 }
 
-static bool setup_write_single_partition_mbr(const setup_install_plan_t *plan)
+static uint32_t setup_volume_sectors_for_target(const app_installer_target_info_t *target)
+{
+    if (target == 0 || target->sector_count < SETUP_FAT32_TOTAL_SECTORS) {
+        return 0;
+    }
+    return SETUP_FAT32_TOTAL_SECTORS;
+}
+
+static bool setup_prepare_fat32_boot_sector(uint8_t boot_sector[512],
+                                            uint32_t hidden_lba,
+                                            uint32_t total_sectors)
+{
+    if (app_installer_read_media(SETUP_BOOT_BIN, 0, boot_sector, 512) != 512) {
+        return false;
+    }
+    setup_store_le16(boot_sector + 11, 512);
+    boot_sector[13] = 1;
+    setup_store_le16(boot_sector + 14, SETUP_FAT32_RESERVED_SECTORS);
+    boot_sector[16] = SETUP_FAT32_FAT_COUNT;
+    setup_store_le16(boot_sector + 17, 0);
+    setup_store_le16(boot_sector + 19, 0);
+    boot_sector[21] = 0xF8;
+    setup_store_le16(boot_sector + 22, 0);
+    setup_store_le16(boot_sector + 24, 63);
+    setup_store_le16(boot_sector + 26, 16);
+    setup_store_le32(boot_sector + 28, hidden_lba);
+    setup_store_le32(boot_sector + 32, total_sectors);
+    setup_store_le32(boot_sector + 36, SETUP_FAT32_FAT_SIZE);
+    setup_store_le16(boot_sector + 40, 0);
+    setup_store_le16(boot_sector + 42, 0);
+    setup_store_le32(boot_sector + 44, SETUP_FAT32_ROOT_CLUSTER);
+    setup_store_le16(boot_sector + 48, 1);
+    setup_store_le16(boot_sector + 50, 6);
+    boot_sector[64] = 0x80;
+    boot_sector[65] = 0;
+    boot_sector[66] = 0x29;
+    setup_store_le32(boot_sector + 67, 0x4D4F4E49U);
+    memcpy(boot_sector + 71, "MONIOS     ", 11);
+    memcpy(boot_sector + 82, "FAT32   ", 8);
+    boot_sector[510] = 0x55;
+    boot_sector[511] = 0xAA;
+    return true;
+}
+
+static bool setup_write_zero_sectors(uint32_t start_lba, uint32_t sector_count)
+{
+    static uint8_t zero[4096];
+    uint32_t done = 0;
+
+    memset(zero, 0, sizeof(zero));
+    while (done < sector_count) {
+        uint32_t sectors = sector_count - done;
+        uint32_t bytes;
+
+        if (sectors > sizeof(zero) / 512U) {
+            sectors = sizeof(zero) / 512U;
+        }
+        bytes = sectors * 512U;
+        if (app_installer_write_buffer(zero, start_lba + done, bytes) != (int) bytes) {
+            return false;
+        }
+        done += sectors;
+    }
+    return true;
+}
+
+static bool setup_write_fat32_fsinfo(uint32_t lba)
+{
+    uint8_t fsinfo[512];
+
+    memset(fsinfo, 0, sizeof(fsinfo));
+    setup_store_le32(fsinfo + 0, 0x41615252U);
+    setup_store_le32(fsinfo + 484, 0x61417272U);
+    setup_store_le32(fsinfo + 488, 0xFFFFFFFFU);
+    setup_store_le32(fsinfo + 492, 0xFFFFFFFFU);
+    fsinfo[510] = 0x55;
+    fsinfo[511] = 0xAA;
+    return app_installer_write_buffer(fsinfo, lba, sizeof(fsinfo)) == (int) sizeof(fsinfo);
+}
+
+static bool setup_format_fat32_partition(const setup_install_plan_t *plan,
+                                         const uint8_t boot_sector[512])
+{
+    uint8_t fat0[512];
+    uint32_t target_lba;
+
+    if (plan == 0 || boot_sector == 0 || plan->target.sector_count < SETUP_FAT32_TOTAL_SECTORS) {
+        return false;
+    }
+    target_lba = plan->target.start_lba;
+    setup_print_progress(8, "Formatting FAT32 partition");
+    if (!setup_write_zero_sectors(target_lba, SETUP_FAT32_RESERVED_SECTORS)) {
+        return false;
+    }
+    if (app_installer_write_buffer(boot_sector, target_lba, 512) != 512 ||
+        app_installer_write_buffer(boot_sector, target_lba + 6U, 512) != 512 ||
+        !setup_write_fat32_fsinfo(target_lba + 1U) ||
+        !setup_write_fat32_fsinfo(target_lba + 7U)) {
+        return false;
+    }
+    if (!setup_write_zero_sectors(target_lba + SETUP_FAT32_RESERVED_SECTORS,
+                                  SETUP_FAT32_FAT_COUNT * SETUP_FAT32_FAT_SIZE)) {
+        return false;
+    }
+    memset(fat0, 0, sizeof(fat0));
+    setup_store_le32(fat0 + 0, 0x0FFFFFF8U);
+    setup_store_le32(fat0 + 4, 0xFFFFFFFFU);
+    setup_store_le32(fat0 + 8, 0x0FFFFFFFU);
+    for (uint32_t fat = 0; fat < SETUP_FAT32_FAT_COUNT; fat++) {
+        uint32_t fat_lba = target_lba + SETUP_FAT32_RESERVED_SECTORS + fat * SETUP_FAT32_FAT_SIZE;
+
+        if (app_installer_write_buffer(fat0, fat_lba, sizeof(fat0)) != (int) sizeof(fat0)) {
+            return false;
+        }
+    }
+    return setup_write_zero_sectors(target_lba + SETUP_FAT32_DATA_LBA, 1);
+}
+
+static bool setup_write_partition_table(const setup_install_plan_t *plan,
+                                        const uint8_t boot_sector[512])
 {
     uint8_t mbr[512];
     uint8_t *entry;
-    uint32_t sectors;
 
     if (plan == 0 || !plan->create_partition) {
         return true;
@@ -905,6 +1063,9 @@ static bool setup_write_single_partition_mbr(const setup_install_plan_t *plan)
     }
 
     memset(mbr, 0, sizeof(mbr));
+    if (plan->media.mode == SETUP_TARGET_MBR && boot_sector != 0) {
+        memcpy(mbr, boot_sector, 446);
+    }
     entry = mbr + 446;
     entry[0] = 0x80;
     entry[1] = 0x20;
@@ -914,12 +1075,11 @@ static bool setup_write_single_partition_mbr(const setup_install_plan_t *plan)
     entry[5] = 0xFE;
     entry[6] = 0xFF;
     entry[7] = 0xFF;
-    sectors = plan->target.sector_count;
     setup_store_le32(entry + 8, plan->target.start_lba);
-    setup_store_le32(entry + 12, sectors);
+    setup_store_le32(entry + 12, plan->target.sector_count);
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
-    setup_print_progress(3, "Creating disk partition");
+    setup_print_progress(3, plan->media.mode == SETUP_TARGET_MBR ? "Writing MBR boot sector" : "Creating disk partition");
     return app_installer_write_buffer(mbr, 0, sizeof(mbr)) == (int) sizeof(mbr);
 }
 
@@ -966,10 +1126,186 @@ static void setup_read_line(char *buffer, uint32_t size, bool secret, const setu
     }
 }
 
+static bool setup_read_package_at(const char *path, uint32_t offset, void *buffer, uint32_t size)
+{
+    return app_installer_read_media(path, offset, buffer, size) == (int) size;
+}
+
+static bool setup_zip_name_to_target(const char *name, char *target, uint32_t target_size)
+{
+    uint32_t out = 0;
+    bool slash = true;
+
+    if (name == 0 || target == 0 || target_size < 2 || name[0] == '\0') {
+        return false;
+    }
+    if (strlen(PATH_ROOT) + 1U > target_size) {
+        return false;
+    }
+    strcpy(target, PATH_ROOT);
+    out = (uint32_t) strlen(target);
+    for (uint32_t i = 0; name[i] != '\0'; i++) {
+        char ch = name[i];
+
+        if (ch == ':') {
+            return false;
+        }
+        if (ch == '/' || ch == '\\') {
+            if (slash) {
+                continue;
+            }
+            slash = true;
+        } else {
+            slash = false;
+        }
+        if (out + 1U >= target_size) {
+            return false;
+        }
+        if (ch >= 'a' && ch <= 'z') {
+            ch = (char) (ch - ('a' - 'A'));
+        }
+        target[out++] = ch == '/' ? PATH_SEPARATOR : ch;
+        target[out] = '\0';
+    }
+    if (out <= strlen(PATH_ROOT)) {
+        return false;
+    }
+    for (uint32_t i = 0; target[i] != '\0'; i++) {
+        if (target[i] == '.' &&
+            (i == 0 || target[i - 1U] == PATH_SEPARATOR) &&
+            target[i + 1U] == '.' &&
+            (target[i + 2U] == PATH_SEPARATOR || target[i + 2U] == '\0')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool setup_zip_scan(const char *zip_path,
+                           uint32_t *total_uncompressed,
+                           const setup_install_plan_t *plan)
+{
+    uint32_t offset = 0;
+    int32_t package_size;
+    uint32_t copied = 0;
+    uint32_t last_percent = 12U;
+    uint64_t start_ticks = app_ticks();
+
+    if (zip_path == 0 || total_uncompressed == 0) {
+        return false;
+    }
+    if (plan != 0 && plan->image_size > 0x7FFFFFFFU) {
+        return false;
+    }
+    package_size = plan != 0 ? (int32_t) plan->image_size : setup_media_file_size(zip_path);
+    if (package_size <= 0) {
+        return false;
+    }
+    if (plan == 0) {
+        *total_uncompressed = 0;
+    }
+    while (offset + 30U <= (uint32_t) package_size) {
+        uint8_t header[30];
+        uint32_t sig;
+        uint16_t flags;
+        uint16_t method;
+        uint32_t compressed_size;
+        uint32_t uncompressed_size;
+        uint16_t name_len;
+        uint16_t extra_len;
+        uint32_t data_offset;
+        char name[128];
+        char target_path[128];
+
+        if (!setup_read_package_at(zip_path, offset, header, sizeof(header))) {
+            return false;
+        }
+        sig = setup_load_le32(header);
+        if (sig == SETUP_ZIP_CENTRAL_SIG || sig == SETUP_ZIP_END_SIG) {
+            return true;
+        }
+        if (sig != SETUP_ZIP_LOCAL_SIG) {
+            return false;
+        }
+        flags = setup_load_le16(header + 6);
+        method = setup_load_le16(header + 8);
+        compressed_size = setup_load_le32(header + 18);
+        uncompressed_size = setup_load_le32(header + 22);
+        name_len = setup_load_le16(header + 26);
+        extra_len = setup_load_le16(header + 28);
+        if ((flags & 0x0008U) != 0 ||
+            method != SETUP_ZIP_METHOD_STORE ||
+            compressed_size != uncompressed_size ||
+            name_len == 0 ||
+            name_len >= sizeof(name)) {
+            return false;
+        }
+        if (!setup_read_package_at(zip_path, offset + 30U, name, name_len)) {
+            return false;
+        }
+        name[name_len] = '\0';
+        data_offset = offset + 30U + name_len + extra_len;
+        if (data_offset + compressed_size < data_offset ||
+            data_offset + compressed_size > (uint32_t) package_size) {
+            return false;
+        }
+        if (name[name_len - 1U] != '/') {
+            if (!setup_zip_name_to_target(name, target_path, sizeof(target_path))) {
+                return false;
+            }
+            if (plan == 0) {
+                if (uncompressed_size > 0xFFFFFFFFU - *total_uncompressed) {
+                    return false;
+                }
+                *total_uncompressed += uncompressed_size;
+            } else {
+                if (uncompressed_size > APP_INSTALLER_COPY_TARGET_MAX) {
+                    setup_line("package file is too large");
+                    return false;
+                }
+                int written = app_installer_copy_target_file(zip_path,
+                                                             data_offset,
+                                                             uncompressed_size,
+                                                             target_path,
+                                                             plan->target.start_lba);
+                uint32_t percent;
+                uint32_t kb_per_sec = 0;
+                uint64_t ticks;
+
+                if (written != (int) uncompressed_size) {
+                    setup_line("file copy failed");
+                    setup_line(target_path);
+                    return false;
+                }
+                copied += uncompressed_size;
+                percent = 12U + (uint32_t) (((uint64_t) copied * 76ULL) /
+                                             (uint64_t) (*total_uncompressed == 0 ? 1U : *total_uncompressed));
+                if (percent > 88U) {
+                    percent = 88U;
+                }
+                ticks = app_ticks() - start_ticks;
+                if (ticks > 0) {
+                    kb_per_sec = (uint32_t) ((((uint64_t) copied / 1024ULL) * SETUP_TICKS_PER_SEC) / ticks);
+                }
+                if (percent != last_percent || copied == *total_uncompressed) {
+                    setup_print_copy_progress(percent,
+                                              "Copying package files",
+                                              copied,
+                                              *total_uncompressed,
+                                              kb_per_sec);
+                    last_percent = percent;
+                }
+            }
+        }
+        offset = data_offset + compressed_size;
+    }
+    return true;
+}
+
 static setup_target_t setup_select_target(void)
 {
-    bool have_uefi = app_file_exists(SETUP_IMAGE_UEFI);
-    bool have_mbr = app_file_exists(SETUP_IMAGE_MBR);
+    bool have_uefi = setup_media_file_exists(SETUP_IMAGE_UEFI);
+    bool have_mbr = setup_media_file_exists(SETUP_IMAGE_MBR);
     setup_target_mode_t mode = SETUP_TARGET_UNKNOWN;
     setup_target_t target;
     const char *boot_mode = setup_env_get("MONIOS_BOOT_MODE");
@@ -1001,10 +1337,10 @@ static setup_target_t setup_select_target(void)
     target = setup_target_for_mode(mode);
     if (target.mode == SETUP_TARGET_UEFI) {
         setup_log_add("Boot mode: UEFI");
-        setup_log_add("Image: SYSTEM_UEFI.IMG");
+        setup_log_add("Package: SYSTEM_UEFI.ZIP");
     } else if (target.mode == SETUP_TARGET_MBR) {
         setup_log_add("Boot mode: BIOS/MBR");
-        setup_log_add("Image: SYSTEM_MBR.IMG");
+        setup_log_add("Package: SYSTEM_MBR.ZIP");
     }
     return target;
 }
@@ -1017,7 +1353,7 @@ static bool setup_choose_disk_target(const setup_target_t *media,
     setup_input_ui_t ui;
     const char *message = 0;
     int count;
-    uint32_t required_sectors = setup_round_up_512(image_size) / 512U;
+    uint32_t required_sectors = SETUP_FAT32_TOTAL_SECTORS;
 
     if (chosen == 0 || media == 0 || image_size == 0) {
         return false;
@@ -1034,7 +1370,7 @@ static bool setup_choose_disk_target(const setup_target_t *media,
     setup_append_u32(g_setup_disk_model, sizeof(g_setup_disk_model), setup_sector_mb(list.disk_sector_count));
     setup_append_text(g_setup_disk_model, sizeof(g_setup_disk_model), " MB disk  ");
     setup_append_u32(g_setup_disk_model, sizeof(g_setup_disk_model), setup_bytes_mb(image_size));
-    setup_append_text(g_setup_disk_model, sizeof(g_setup_disk_model), " MB image");
+    setup_append_text(g_setup_disk_model, sizeof(g_setup_disk_model), " MB package");
     g_setup_disk_mb = setup_sector_mb(list.disk_sector_count);
     g_setup_image_mb = setup_bytes_mb(image_size);
     g_setup_disk_target_count = 0;
@@ -1044,12 +1380,11 @@ static bool setup_choose_disk_target(const setup_target_t *media,
         if (list.targets[i].sector_count == 0) {
             continue;
         }
-        if (list.targets[i].kind == APP_INSTALLER_TARGET_KIND_UEFI_ESP &&
-            media->mode != SETUP_TARGET_UEFI) {
-            continue;
-        }
+        uint32_t target_required = list.targets[i].kind == APP_INSTALLER_TARGET_KIND_DISK ?
+                                   (SETUP_DEFAULT_PART_LBA + required_sectors) :
+                                   required_sectors;
         selectable = setup_target_supported(&list.targets[i]) &&
-                     list.targets[i].sector_count >= required_sectors;
+                     list.targets[i].sector_count >= target_required;
         g_setup_disk_targets[g_setup_disk_target_count].info = list.targets[i];
         g_setup_disk_targets[g_setup_disk_target_count].selectable = selectable;
         setup_make_target_label(&list.targets[i],
@@ -1058,7 +1393,7 @@ static bool setup_choose_disk_target(const setup_target_t *media,
         setup_make_target_details(&list.targets[i],
                                   g_setup_disk_targets[g_setup_disk_target_count].details,
                                   sizeof(g_setup_disk_targets[g_setup_disk_target_count].details));
-        if (list.targets[i].sector_count < required_sectors) {
+        if (list.targets[i].sector_count < target_required) {
             setup_append_text(g_setup_disk_targets[g_setup_disk_target_count].details,
                               sizeof(g_setup_disk_targets[g_setup_disk_target_count].details),
                               " | too small");
@@ -1122,7 +1457,7 @@ static bool setup_confirm_install(const setup_install_plan_t *plan)
     setup_line("Install MoniOS to the selected target? This overwrites data.");
     setup_line(target_label);
     line[0] = '\0';
-    setup_append_text(line, sizeof(line), "Image: ");
+    setup_append_text(line, sizeof(line), "Package: ");
     setup_append_text(line, sizeof(line), plan->media.label);
     setup_append_text(line, sizeof(line), "  ");
     setup_append_u32(line, sizeof(line), g_setup_image_mb);
@@ -1133,13 +1468,13 @@ static bool setup_confirm_install(const setup_install_plan_t *plan)
     setup_append_u32(line, sizeof(line), setup_sector_mb(plan->target.sector_count));
     setup_append_text(line, sizeof(line), " MB");
     if (plan->free_mb > 0) {
-        setup_append_text(line, sizeof(line), "  remaining after image: ");
+        setup_append_text(line, sizeof(line), "  remaining after package: ");
         setup_append_u32(line, sizeof(line), plan->free_mb);
         setup_append_text(line, sizeof(line), " MB");
     }
     setup_line(line);
     if (plan->create_partition) {
-        setup_line("Partition table will be recreated with one EFI/FAT32 partition.");
+        setup_line("Partition table will be recreated with one FAT32 partition.");
     }
     fputs("Type YES to continue: ");
     ui.screen = SETUP_INPUT_CONFIRM_INSTALL;
@@ -1184,81 +1519,39 @@ static bool setup_get_password(char *password, uint32_t password_size)
     }
 }
 
-static bool setup_install_image(const setup_install_plan_t *plan)
+static bool setup_install_package(const setup_install_plan_t *plan)
 {
-    int32_t image_size;
-    uint32_t total;
-    uint32_t offset = 0;
-    uint32_t target_lba;
-    uint32_t last_percent = 5U;
     uint8_t boot_sector[512];
-    uint64_t start_ticks;
+    uint32_t total_uncompressed = 0;
 
     if (plan == 0 || plan->media.image_path == 0) {
         return false;
     }
-    image_size = app_file_size(plan->media.image_path);
-    if (image_size <= 0) {
-        setup_line("system image missing or empty");
-        return false;
-    }
-    total = setup_round_up_512((uint32_t) image_size);
-    if ((total / 512U) > plan->target.sector_count) {
+    if (plan->target.sector_count < SETUP_FAT32_TOTAL_SECTORS) {
         setup_line("selected target is too small");
         return false;
     }
-    target_lba = plan->target.start_lba;
-    if (!setup_write_single_partition_mbr(plan)) {
+    if (!setup_prepare_fat32_boot_sector(boot_sector,
+                                         plan->target.start_lba,
+                                         SETUP_FAT32_TOTAL_SECTORS)) {
+        setup_line("boot sector prepare failed");
+        return false;
+    }
+    if (!setup_write_partition_table(plan, boot_sector)) {
         setup_line("partition table write failed");
         return false;
     }
-    setup_print_progress(5, "Preparing disk image");
-    start_ticks = app_ticks();
-    while (offset < total) {
-        uint32_t remaining = total - offset;
-        uint32_t chunk = remaining > SETUP_CHUNK_BYTES ? SETUP_CHUNK_BYTES : remaining;
-        int written;
-
-        if ((chunk % 512U) != 0) {
-            chunk = setup_round_up_512(chunk);
-        }
-        written = app_installer_write_disk(plan->media.image_path, offset, target_lba + offset / 512U, chunk);
-        if (written != (int) chunk) {
-            setup_line("disk write failed");
-            return false;
-        }
-        offset += chunk;
-        uint32_t percent = 5U + (uint32_t) (((uint64_t) offset * 80ULL) / (uint64_t) total);
-        if (percent != last_percent || offset == total) {
-            uint64_t ticks = app_ticks() - start_ticks;
-            uint32_t kb_per_sec = 0;
-
-            if (ticks > 0) {
-                kb_per_sec = (uint32_t) ((((uint64_t) offset / 1024ULL) * SETUP_TICKS_PER_SEC) / ticks);
-            }
-            setup_print_copy_progress(percent,
-                                      "Writing system image",
-                                      offset,
-                                      (uint32_t) image_size,
-                                      kb_per_sec);
-            last_percent = percent;
-        }
-    }
-    if (app_file_read(plan->media.image_path, boot_sector, sizeof(boot_sector)) != (int) sizeof(boot_sector)) {
-        setup_line("boot sector read failed");
+    if (!setup_format_fat32_partition(plan, boot_sector)) {
+        setup_line("FAT32 format failed");
         return false;
     }
-    boot_sector[28] = (uint8_t) (target_lba & 0xFFU);
-    boot_sector[29] = (uint8_t) ((target_lba >> 8) & 0xFFU);
-    boot_sector[30] = (uint8_t) ((target_lba >> 16) & 0xFFU);
-    boot_sector[31] = (uint8_t) ((target_lba >> 24) & 0xFFU);
-    setup_print_progress(88, "Finalizing boot sector");
-    if (app_installer_write_buffer(boot_sector, target_lba, sizeof(boot_sector)) != (int) sizeof(boot_sector)) {
-        setup_line("boot sector write failed");
+    setup_print_progress(10, "Scanning package");
+    if (!setup_zip_scan(plan->media.image_path, &total_uncompressed, 0) || total_uncompressed == 0) {
+        setup_line("package scan failed");
         return false;
     }
-    if (app_installer_write_buffer(boot_sector, target_lba + 6U, sizeof(boot_sector)) != (int) sizeof(boot_sector)) {
-        setup_line("backup boot sector write failed");
+    if (!setup_zip_scan(plan->media.image_path, &total_uncompressed, plan)) {
+        setup_line("package copy failed");
         return false;
     }
     return true;
@@ -1277,7 +1570,7 @@ static bool setup_build_install_plan(const setup_target_t *media,
     plan->media = *media;
     plan->target = *disk_target;
     {
-        int32_t size = app_file_size(media->image_path);
+        int32_t size = setup_media_file_size(media->image_path);
 
         if (size <= 0) {
             return false;
@@ -1287,11 +1580,27 @@ static bool setup_build_install_plan(const setup_target_t *media,
     if (plan->image_size == 0) {
         return false;
     }
-    total = setup_round_up_512(plan->image_size);
+    total = SETUP_FAT32_TOTAL_SECTORS;
     plan->copy_bytes = total;
-    plan->create_partition = disk_target->kind == APP_INSTALLER_TARGET_KIND_UEFI_ESP;
-    if (disk_target->sector_count > total / 512U) {
-        plan->free_mb = setup_sector_mb(disk_target->sector_count - total / 512U);
+    plan->create_partition = disk_target->kind == APP_INSTALLER_TARGET_KIND_UEFI_ESP ||
+                             disk_target->kind == APP_INSTALLER_TARGET_KIND_DISK;
+    if (plan->create_partition) {
+        if (disk_target->sector_count < SETUP_DEFAULT_PART_LBA + SETUP_FAT32_TOTAL_SECTORS) {
+            return false;
+        }
+        plan->target.start_lba = SETUP_DEFAULT_PART_LBA;
+        plan->target.sector_count = SETUP_FAT32_TOTAL_SECTORS;
+        plan->target.partition_type = plan->media.mode == SETUP_TARGET_MBR ? 0x0C : 0xEF;
+        plan->target.active = 1;
+    } else if (plan->target.sector_count < SETUP_FAT32_TOTAL_SECTORS) {
+        return false;
+    }
+    if (plan->create_partition) {
+        if (disk_target->sector_count > SETUP_DEFAULT_PART_LBA + total) {
+            plan->free_mb = setup_sector_mb(disk_target->sector_count - SETUP_DEFAULT_PART_LBA - total);
+        }
+    } else if (disk_target->sector_count > total) {
+        plan->free_mb = setup_sector_mb(disk_target->sector_count - total);
     }
     setup_make_target_label(disk_target, plan->target_label, sizeof(plan->target_label));
     return true;
@@ -1320,18 +1629,18 @@ static void setup_build_install_report(const setup_install_plan_t *plan,
     }
     report[0] = '\0';
     setup_append_report_line(report, report_size, "MoniOS installation report", "");
-    setup_append_report_line(report, report_size, "Image mode: ", plan != 0 ? plan->media.label : "unknown");
-    setup_append_report_line(report, report_size, "Image path: ", plan != 0 ? plan->media.image_path : "unknown");
+    setup_append_report_line(report, report_size, "Package mode: ", plan != 0 ? plan->media.label : "unknown");
+    setup_append_report_line(report, report_size, "Package path: ", plan != 0 ? plan->media.image_path : "unknown");
     setup_append_report_line(report, report_size, "Target: ", plan != 0 ? plan->target_label : "unknown");
     setup_append_report_u32(report, report_size, "Disk MB: ", g_setup_disk_mb);
-    setup_append_report_u32(report, report_size, "Image MB: ", g_setup_image_mb);
+    setup_append_report_u32(report, report_size, "Package MB: ", g_setup_image_mb);
     if (plan != 0) {
         setup_append_report_u32(report, report_size, "Start LBA: ", plan->target.start_lba);
         setup_append_report_u32(report, report_size, "Target sectors: ", plan->target.sector_count);
         setup_append_report_line(report,
                                  report_size,
                                  "Partition mode: ",
-                                 plan->create_partition ? "created EFI/FAT32 partition" : "existing target");
+                                 plan->create_partition ? "created FAT32 partition" : "existing target");
     }
     setup_append_report_line(report, report_size, "", "");
     setup_append_report_line(report, report_size, "Recent setup log", "");
@@ -1375,17 +1684,17 @@ int main(int argc, char **argv)
     }
     target = setup_select_target();
     if (target.image_path == 0) {
-        setup_line("No system image found.");
-        setup_draw_error("No system image found.");
+        setup_line("No system package found.");
+        setup_draw_error("No system package found.");
         return 1;
     }
     setup_line("Installer media: ready");
     setup_line(target.label);
     setup_line(target.image_path);
-    image_size = app_file_size(target.image_path);
+    image_size = setup_media_file_size(target.image_path);
     if (image_size <= 0) {
-        setup_line("Selected image is missing or empty.");
-        setup_draw_error("Selected image is missing or empty.");
+        setup_line("Selected package is missing or empty.");
+        setup_draw_error("Selected package is missing or empty.");
         return 1;
     }
 
@@ -1412,7 +1721,7 @@ int main(int argc, char **argv)
         return 1;
     }
     setup_print_progress(0, "MoniOS Setup");
-    if (!setup_install_image(&plan)) {
+    if (!setup_install_package(&plan)) {
         setup_print_progress(100, "Installation failed");
         app_sleep_ticks(120);
         return 1;
@@ -1420,7 +1729,7 @@ int main(int argc, char **argv)
     setup_print_progress(90, "Writing password");
     if (app_installer_write_target_file(SETUP_AUTH_PATH,
                                         auth_file,
-                                        disk_target.start_lba,
+                                        plan.target.start_lba,
                                         (uint32_t) strlen(auth_file)) <= 0) {
         setup_line("Failed to write target password.");
         setup_draw_error("Failed to write target password.");

@@ -1,0 +1,10 @@
+Wallpaper source:
+https://unsplash.com/photos/landscape-photography-of-lake-and-mountain-73F4pKoUkM0
+
+Image source:
+https://images.unsplash.com/photo-1465056836041-7f43ac27dcb5
+
+Usage:
+Downloaded and cropped to 320x180 BMP for the MoniOS wallpaper loader.
+License:
+Unsplash License.

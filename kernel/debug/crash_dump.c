@@ -56,9 +56,12 @@ static void dump_hex32(uint32_t v)
 /* ── Public API ─────────────────────────────────────────────── */
 void crash_dump_init(void)
 {
+    extern uint64_t _kconfig_start;
+    volatile uint64_t *kcfg = &_kconfig_start;
+
     dump_serial_init();
-    g_kernel_phys = KERNEL_PHYS_BASE;
-    g_kernel_size = KERNEL_EARLY_MAP_LIMIT - KERNEL_PHYS_BASE;
+    g_kernel_phys = kcfg[0] != 0 ? kcfg[0] : KERNEL_PHYS_BASE;
+    g_kernel_size = 0x03000000ULL;
     dump_hdr->magic = 0;
     dump_hdr->version = 0;
 }
@@ -93,7 +96,7 @@ void crash_dump_capture(const char *process_name,
     dump_hdr->cr3         = cr3;
     dump_hdr->cr4         = cr4;
     dump_hdr->gs_base     = gs_base;
-    dump_hdr->kernel_rip  = KERNEL_PHYS_BASE;
+    dump_hdr->kernel_rip  = g_kernel_phys;
     dump_hdr->uptime_ticks = uptime;
 
     if (process_name != NULL) {
@@ -161,7 +164,7 @@ void crash_dump_flush_serial(void)
     /* Hex dump of kernel image start */
     dump_serial_write_str("\r\n-- kernel (runtime phys base, first 256 bytes) --\r\n");
     uint32_t col = 0;
-    for (uint32_t i = 0; i < 256 && (dump_hdr->kernel_phys + i) < KERNEL_EARLY_MAP_LIMIT; i++) {
+    for (uint32_t i = 0; i < 256; i++) {
         uint8_t b = ((const volatile uint8_t *)(uintptr_t)(dump_hdr->kernel_phys + i))[0];
         dump_serial_putc("0123456789ABCDEF"[b >> 4]);
         dump_serial_putc("0123456789ABCDEF"[b & 0x0F]);

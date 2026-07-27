@@ -4,6 +4,10 @@ extern void app_runtime_set_launch_info(const app_launch_info_t *info);
 
 extern int main(int argc, char **argv);
 
+void __main(void)
+{
+}
+
 int _start(const app_launch_info_t *info)
 {
     app_runtime_set_launch_info(info);

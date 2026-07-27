@@ -1,5 +1,6 @@
 #include "ahci.h"
 #include "aac.h"
+#include "acpi.h"
 #include "base64.h"
 #include "bios.h"
 #include "bitmap.h"
@@ -71,6 +72,7 @@
 #include "terminal.h"
 #include "tls.h"
 #include "tpm.h"
+#include "ui.h"
 #include "usb_ext.h"
 #include "vma.h"
 #include "vmext.h"
@@ -99,6 +101,7 @@ typedef enum {
 
 static shell_privilege_t g_shell_privilege;
 static shell_state_t g_shell_state;
+static bool g_shell_boot_complete;
 static char g_line[SHELL_LINE_MAX];
 static uint32_t g_line_len;
 static char g_password[SHELL_LINE_MAX];
@@ -128,7 +131,7 @@ static char g_complete_base[SHELL_LINE_MAX];
 static uint32_t g_complete_base_len;
 static bool g_complete_in_progress;
 
-#define SHELL_AUTH_PATH             "/pwd.txt"
+#define SHELL_AUTH_PATH             UI_AUTH_PATH
 #define SHELL_AUTH_FILE_MAX         256
 #define SHELL_HASH_TEXT_MAX         256
 #define SHELL_HASH_OUTPUT_MAX       128
@@ -236,7 +239,7 @@ static void shell_glob_expand_in_dir(
     if (*result_count >= SHELL_GLOB_MAX) return;
 
     if (dir == NULL || dir[0] == '\0') {
-        strcpy(search_path, "/");
+        strcpy(search_path, PATH_ROOT);
     } else {
         strlcpy(search_path, dir, sizeof(search_path));
     }
@@ -264,8 +267,8 @@ static void shell_glob_expand_in_dir(
                     uint32_t dlen = (uint32_t) strlen(search_path);
 
                     strcpy(full_path, search_path);
-                    if (dlen > 1) {
-                        full_path[dlen++] = '/';
+                    if (dlen > 3 && full_path[dlen - 1] != PATH_SEPARATOR) {
+                        full_path[dlen++] = PATH_SEPARATOR;
                         full_path[dlen] = '\0';
                     }
                     if (dlen + strlen(entry_name) < sizeof(full_path)) {
@@ -311,7 +314,7 @@ static bool shell_glob_expand(const char *input, char output[SHELL_LINE_MAX], ui
     }
 
     const char *pat_start = star;
-    while (pat_start > input && pat_start[-1] != '/' && pat_start[-1] != ':') {
+    while (pat_start > input && pat_start[-1] != PATH_SEPARATOR && pat_start[-1] != ':') {
         pat_start--;
     }
 
@@ -324,7 +327,7 @@ static bool shell_glob_expand(const char *input, char output[SHELL_LINE_MAX], ui
         memcpy(dir_part, input, dlen);
         dir_part[dlen] = '\0';
     } else {
-        strcpy(dir_part, "/");
+        strcpy(dir_part, PATH_ROOT);
     }
 
     memcpy(pattern_part, pat_start, plen);
@@ -333,9 +336,9 @@ static bool shell_glob_expand(const char *input, char output[SHELL_LINE_MAX], ui
     shell_glob_expand_in_dir(g_shell_cwd, pattern_part, results, &result_count);
 
     if (result_count == 0 && dlen == 0) {
-        shell_glob_expand_in_dir("/", pattern_part, results, &result_count);
-        shell_glob_expand_in_dir("/home", pattern_part, results, &result_count);
-        shell_glob_expand_in_dir("/apps", pattern_part, results, &result_count);
+        shell_glob_expand_in_dir(PATH_ROOT, pattern_part, results, &result_count);
+        shell_glob_expand_in_dir(UI_USERS_DIR, pattern_part, results, &result_count);
+        shell_glob_expand_in_dir(UI_APPS_DIR, pattern_part, results, &result_count);
     }
 
     if (result_count == 0) {
@@ -422,8 +425,8 @@ static void shell_complete_scan_dir(const char *dir, const char *prefix, bool di
                     uint32_t dlen = (uint32_t) strlen(dir);
 
                     strcpy(full, dir);
-                    if (dlen > 1) {
-                        full[dlen++] = '/';
+                    if (dlen > 3 && full[dlen - 1] != PATH_SEPARATOR) {
+                        full[dlen++] = PATH_SEPARATOR;
                         full[dlen] = '\0';
                     }
                     if (dlen + strlen(name) < sizeof(full)) {
@@ -479,7 +482,7 @@ static void shell_complete_filename(const char *prefix, uint32_t prefix_len)
     if (prefix_len > 0) {
         const char *last_slash = NULL;
         for (uint32_t i = 0; i < prefix_len; i++) {
-            if (prefix[i] == '/') last_slash = &prefix[i + 1];
+            if (prefix[i] == PATH_SEPARATOR) last_slash = &prefix[i + 1];
         }
 
         if (last_slash != NULL) {
@@ -504,8 +507,8 @@ static void shell_complete_filename(const char *prefix, uint32_t prefix_len)
     }
 
     shell_complete_scan_dir(dir, file_prefix, false);
-    shell_complete_scan_dir("/apps", file_prefix, false);
-    shell_complete_scan_dir("/home", file_prefix, false);
+    shell_complete_scan_dir(UI_APPS_DIR, file_prefix, false);
+    shell_complete_scan_dir(UI_USERS_DIR, file_prefix, false);
 }
 
 static void shell_do_tab_complete(void)
@@ -566,7 +569,7 @@ static void shell_do_tab_complete(void)
             g_line[i++] = match[j];
         }
         if (is_dir) {
-            g_line[i++] = '/';
+            g_line[i++] = PATH_SEPARATOR;
         }
         g_line[i] = '\0';
         g_line_len = i;
@@ -761,6 +764,8 @@ void shell_env_list(void)
 
 static void shell_write_prompt_prefix(void)
 {
+    char display_path[PATH_MAX_LEN + 4];
+
     if (g_shell_privilege == SHELL_PRIV_R0) {
         console_write("[R0] ");
     } else if (g_shell_privilege == SHELL_PRIV_R2) {
@@ -768,22 +773,27 @@ static void shell_write_prompt_prefix(void)
     } else {
         console_write("[R3] ");
     }
-    console_write(SHELL_DEFAULT_DRIVE);
-    console_write(g_shell_cwd);
+    if (!ui_path_to_windows(g_shell_cwd, display_path, sizeof(display_path))) {
+        strcpy(display_path, SHELL_DEFAULT_DRIVE "\\");
+    }
+    console_write(display_path);
     console_write(" $ ");
 }
 
 static void shell_print_cwd(void)
 {
-    char text[PATH_MAX_LEN + 3];
+    char text[PATH_MAX_LEN + 4];
 
-    strcpy(text, SHELL_DEFAULT_DRIVE);
-    strcpy(text + 2, g_shell_cwd);
+    if (!ui_path_to_windows(g_shell_cwd, text, sizeof(text))) {
+        strcpy(text, SHELL_DEFAULT_DRIVE "\\");
+    }
     shell_print_line(text);
 }
-
 static void shell_redraw_input_line(void)
 {
+    if (!g_shell_boot_complete) {
+        return;
+    }
     console_write("\r");
     shell_write_prompt_prefix();
     console_write(g_line);
@@ -866,6 +876,9 @@ static void shell_kill_to_end(void)
 
 static void shell_print_prompt(void)
 {
+    if (!g_shell_boot_complete) {
+        return;
+    }
     console_write("\r\n");
     shell_write_prompt_prefix();
     if (graphics_active()) {
@@ -1103,7 +1116,7 @@ static const char *shell_path_basename(const char *path)
         return "";
     }
     while (*path != '\0') {
-        if (*path == '/' || *path == '\\') {
+        if (*path == PATH_SEPARATOR) {
             base = path + 1;
         }
         path++;
@@ -1113,8 +1126,7 @@ static const char *shell_path_basename(const char *path)
 
 static bool shell_path_is_executable(const char *path)
 {
-    return shell_has_suffix(path, ".elf") ||
-           shell_has_suffix(path, ".exe");
+    return shell_has_suffix(path, ".exe");
 }
 
 static bool shell_resolve_app_executable_path(const char *path, char output[PATH_MAX_LEN])
@@ -1127,14 +1139,14 @@ static bool shell_resolve_app_executable_path(const char *path, char output[PATH
     }
     base = shell_path_basename(path);
     base_len = (uint32_t) strlen(base);
-    if (base_len == 0 || base_len + 7 > PATH_MAX_LEN) {
+    if (base_len == 0 || strlen(UI_APPS_DIR) + 1 + base_len + 1 > PATH_MAX_LEN) {
         return false;
     }
-    strcpy(output, "/apps/");
-    strcpy(output + 6, base);
+    strcpy(output, UI_APPS_DIR);
+    strcpy(output + strlen(output), PATH_SEPARATOR_STR);
+    strcpy(output + strlen(output), base);
     return file_exists(output) && !file_is_dir(output);
 }
-
 static bool shell_open_with_default_app(const char *path)
 {
     char resolved[PATH_MAX_LEN];
@@ -1171,7 +1183,9 @@ static bool shell_rm_option_is_recursive_force(const char *option)
 
 static bool shell_rm_path_is_root_wildcard(const char *path)
 {
-    return path != NULL && (strcmp(path, "/*") == 0 || strcmp(path, "/.") == 0);
+    return path != NULL &&
+           (strcmp(path, PATH_ROOT "*") == 0 || strcmp(path, PATH_ROOT ".") == 0 ||
+            strcmp(path, PATH_SEPARATOR_STR "*") == 0 || strcmp(path, PATH_SEPARATOR_STR ".") == 0);
 }
 
 static void shell_append_path(char *out, uint32_t out_size, const char *base, const char *name)
@@ -1185,12 +1199,9 @@ static void shell_append_path(char *out, uint32_t out_size, const char *base, co
 
     strcpy(out, base);
     len = (uint32_t) strlen(out);
-    if (len > 1 && len + 1 < out_size) {
-        out[len++] = '/';
+    if (len > 3 && out[len - 1] != PATH_SEPARATOR && len + 1 < out_size) {
+        out[len++] = PATH_SEPARATOR;
         out[len] = '\0';
-    }
-    if (len == 1 && out[0] == '/') {
-        out[1] = '\0';
     }
     if (len + strlen(name) + 1 < out_size) {
         strcpy(out + len, name);
@@ -1237,7 +1248,7 @@ static bool shell_remove_recursive(const char *path)
         }
     }
 
-    if (strcmp(path, "/") != 0 && !file_rmdir(path)) {
+    if (strcmp(path, PATH_ROOT) != 0 && !file_rmdir(path)) {
         ok = false;
     }
     return ok;
@@ -1245,11 +1256,13 @@ static bool shell_remove_recursive(const char *path)
 
 static void shell_check_boot_files_or_panic(void)
 {
-    if (!file_exists("/kernel.bin") && !file_exists("/loader.bin")) {
-        bsod_panic("BOOT FILES DELETED", "kernel.bin and loader.bin were removed");
+    if (!file_exists(PATH_ROOT "kernel.exe") && !file_exists(UI_KERNEL_IMAGE_PATH)) {
+        bsod_panic("BOOT FILES DELETED", "kernel.exe was removed");
+    }
+    if (!file_exists(PATH_ROOT "loader.bin") && !file_exists(UI_LOADER_IMAGE_PATH)) {
+        bsod_panic("BOOT FILES DELETED", "loader.bin was removed");
     }
 }
-
 static void shell_print_exit_code(int32_t code)
 {
     char buffer[SHELL_PRINT_BUFFER_MAX];
@@ -1292,7 +1305,7 @@ static void shell_print_exit_code(int32_t code)
 static void shell_change_directory(const char *input)
 {
     char resolved[PATH_MAX_LEN];
-    const char *target = input == NULL ? "/" : input;
+    const char *target = input == NULL ? PATH_ROOT : input;
     char pwd_pair[PATH_MAX_LEN + 4];
 
     if (!path_resolve(g_shell_cwd, target, resolved, sizeof(resolved))) {
@@ -1382,6 +1395,10 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
     uint32_t image_flags;
     uint32_t run_flags = 0;
 
+    if (shell_has_suffix(path, ".sys")) {
+        shell_print_line("SYS driver cannot run directly; use sysinst.exe to load it");
+        return;
+    }
     if (!shell_resolve_path(path, resolved)) {
         shell_print_line("invalid program path");
         return;
@@ -1397,7 +1414,7 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
             len = (uint32_t) strlen(path);
             if (len + 5 < sizeof(fallback)) {
                 strcpy(fallback, path);
-                strcpy(fallback + len, ".elf");
+                strcpy(fallback + len, ".exe");
                 if (shell_resolve_path(fallback, resolved) && file_exists(resolved) && !file_is_dir(resolved)) {
                     found_program = true;
                 } else if (shell_resolve_app_executable_path(fallback, app_resolved)) {
@@ -1432,10 +1449,6 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
         }
         run_flags |= EXEC_RUN_FLAG_ADMIN;
     }
-    if ((image_flags & EXEC_IMAGE_FLAG_CONSOLE) != 0) {
-        run_flags |= EXEC_RUN_FLAG_CONSOLE_WINDOW;
-    }
-
     program_argv[0] = resolved;
     /* expand args (support $KEY, ${KEY}, embedded) */
     static char expanded[SHELL_ARG_MAX][SHELL_ENV_LEN];
@@ -1450,9 +1463,19 @@ static void shell_run_exec_program(const char *path, uint32_t argc, char *argv[S
         env_ptrs[i] = g_env[i];
     }
 
-    if (!exec_run_with_flags(resolved, argc, program_argv, g_shell_cwd, env_ptrs, g_env_count, run_flags, &exit_code)) {
-        shell_print_line("exec failed");
-        return;
+    {
+        bool exec_ok = exec_run_with_flags(resolved,
+                                           argc,
+                                           program_argv,
+                                           g_shell_cwd,
+                                           env_ptrs,
+                                           g_env_count,
+                                           run_flags,
+                                           &exit_code);
+        if (!exec_ok) {
+            shell_print_line("exec failed");
+            return;
+        }
     }
     if (exit_code != 0) {
         shell_print_exit_code(exit_code);
@@ -1475,10 +1498,7 @@ static void shell_run_deferred_exec(void)
 
 static void shell_run_task_manager(void)
 {
-    char *argv[] = { "taskmgr.elf" };
-    const char *taskmgr_path = file_exists("/apps/taskmgr.elf") ? "/apps/taskmgr.elf" : "/taskmgr.elf";
-
-    shell_run_exec_program(taskmgr_path, 1, argv, false);
+    graphics_open_task_manager();
 }
 
 static void shell_handle_hash_command(uint32_t argc, char *argv[SHELL_ARG_MAX])
@@ -1657,8 +1677,7 @@ static uint32_t shell_split_args(char *line, char *argv[SHELL_ARG_MAX])
 static bool shell_is_device_path(const char *path)
 {
     return path != NULL &&
-           ((path[0] == '\\' && path[1] == '\\' && path[2] == '.' && path[3] == '\\') ||
-            (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/'));
+           (path[0] == '\\' && path[1] == '\\' && path[2] == '.' && path[3] == '\\');
 }
 
 static void shell_capture_begin(char *buffer, uint32_t size)
@@ -2220,7 +2239,7 @@ static void shell_run_command(char *line, bool admin_once)
 
     if (strcmp(argv[0], "ver") == 0) {
         char version_content[SHELL_STREAM_MAX];
-        if (shell_read_input_source("C:/version.txt", version_content, sizeof(version_content))) {
+        if (shell_read_input_source(UI_VERSION_PATH, version_content, sizeof(version_content))) {
             console_write(version_content);
         } else {
             shell_print_line("version.txt not found");
@@ -2240,7 +2259,7 @@ static void shell_run_command(char *line, bool admin_once)
             return;
         }
         static const char *search_paths[] = {
-            "/", "/home/root/desktop", "/home", "/apps", "/home/root", NULL
+            PATH_ROOT, UI_ROOT_DESKTOP, UI_USERS_DIR, UI_APPS_DIR, UI_ROOT_HOME, UI_SYSTEM_ROOT, NULL
         };
         char found_path[PATH_MAX_LEN];
         bool found = false;
@@ -2271,8 +2290,8 @@ static void shell_run_command(char *line, bool admin_once)
                         if (strcmp(name, argv[1]) == 0) {
                             uint32_t dlen = (uint32_t) strlen(search_paths[si]);
                             strcpy(found_path, search_paths[si]);
-                            if (dlen > 1) {
-                                found_path[dlen++] = '/';
+                            if (dlen > 3 && found_path[dlen - 1] != PATH_SEPARATOR) {
+                                found_path[dlen++] = PATH_SEPARATOR;
                                 found_path[dlen] = '\0';
                             }
                             strcpy(found_path + dlen, name);
@@ -2280,9 +2299,10 @@ static void shell_run_command(char *line, bool admin_once)
                             break;
                         }
 
-                        /* also check .elf suffix */
+                        /* also check executable suffixes */
                         uint32_t name_len = (uint32_t) strlen(name);
-                        if (name_len > 4 && strcmp(name + name_len - 4, ".elf") == 0) {
+                        if (name_len > 4 &&
+                            strcasecmp(name + name_len - 4, ".exe") == 0) {
                             char base[64];
                             uint32_t blen = name_len - 4;
                             if (blen >= sizeof(base)) blen = sizeof(base) - 1;
@@ -2292,8 +2312,8 @@ static void shell_run_command(char *line, bool admin_once)
                             if (strcmp(base, argv[1]) == 0) {
                                 uint32_t dlen = (uint32_t) strlen(search_paths[si]);
                                 strcpy(found_path, search_paths[si]);
-                                if (dlen > 1) {
-                                    found_path[dlen++] = '/';
+                                if (dlen > 3 && found_path[dlen - 1] != PATH_SEPARATOR) {
+                                    found_path[dlen++] = PATH_SEPARATOR;
                                     found_path[dlen] = '\0';
                                 }
                                 strcpy(found_path + dlen, name);
@@ -2745,7 +2765,7 @@ static void shell_run_command(char *line, bool admin_once)
     }
 
     if (strcmp(argv[0], "cd") == 0) {
-        shell_change_directory(argc >= 2 ? argv[1] : "/");
+        shell_change_directory(argc >= 2 ? argv[1] : PATH_ROOT);
         return;
     }
 
@@ -2785,22 +2805,24 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
-    if (strcmp(argv[0], "taskmgr") == 0) {
+    if (strcasecmp(argv[0], "taskmgr") == 0 ||
+        strcasecmp(argv[0], "taskmgr.exe") == 0) {
         shell_run_task_manager();
         return;
     }
 
     if (strcmp(argv[0], "appdev") == 0) {
-        char *appdev_argv[] = { "appdev.elf" };
-        const char *appdev_path = file_exists("/apps/appdev.elf") ? "/apps/appdev.elf" : "/appdev.elf";
+        char *appdev_argv[] = { "appdev.exe" };
+        const char *appdev_path = file_exists(UI_APPS_DIR PATH_SEPARATOR_STR "appdev.exe") ?
+                                  UI_APPS_DIR PATH_SEPARATOR_STR "appdev.exe" : PATH_ROOT "appdev.exe";
 
         shell_run_exec_program(appdev_path, 1, appdev_argv, admin_once);
         return;
     }
 
     if (strcmp(argv[0], "setup") == 0) {
-        char *setup_argv[] = { "setup.elf" };
-        const char *setup_path = file_exists("/apps/setup.elf") ? "/apps/setup.elf" : "/setup.elf";
+        char *setup_argv[] = { "setup.exe" };
+        const char *setup_path = file_exists(UI_SETUP_PATH) ? UI_SETUP_PATH : PATH_ROOT "setup.exe";
 
         shell_run_exec_program(setup_path, 1, setup_argv, admin_once);
         return;
@@ -2813,8 +2835,11 @@ static void shell_run_command(char *line, bool admin_once)
         } else if (argc >= 2 && strcmp(argv[1], "reboot") == 0) {
             kernel_request_reboot();
             shell_print_line("reboot requested");
+        } else if (argc >= 2 && strcmp(argv[1], "sleep") == 0) {
+            kernel_request_sleep();
+            shell_print_line("sleep requested");
         } else {
-            shell_print_line("usage: shutdown [poweroff/reboot]");
+            shell_print_line("usage: shutdown [poweroff/reboot/sleep]");
         }
         return;
     }
@@ -4356,6 +4381,11 @@ static void shell_run_command(char *line, bool admin_once)
         shell_print_line(power_status());
         shell_print_line(info->acpi_ready ? "acpi: yes" : "acpi: no");
         shell_print_line(info->power_button_ready ? "button: yes" : "button: no");
+        shell_print_line(info->reset_ready ? "reset: yes" : "reset: fallback");
+        shell_print_line(info->sleep_ready ? "sleep: yes" : "sleep: no");
+        if (info->sleep_ready) {
+            shell_print_u32_prefixed("sleep state S: ", info->sleep_state);
+        }
         shell_print_line(info->cpu_frequency_detected ? "cpu freq: detected" : "cpu freq: no");
         shell_print_line(info->device_power_ready ? "device pm: yes" : "device pm: no");
         shell_print_u32_prefixed("sci irq: ", info->sci_irq);
@@ -4378,7 +4408,19 @@ static void shell_run_command(char *line, bool admin_once)
         shell_print_line(info->status);
         shell_print_u32_prefixed("logical processors: ", info->logical_processors);
         shell_print_u32_prefixed("online processors: ", info->online_processors);
-        shell_print_line(info->bootstrap_only ? "mode: bootstrap processor only" : "mode: ap scheduler");
+        shell_print_u32_prefixed("firmware processors: ", info->firmware_processors);
+        shell_print_u32_prefixed("firmware enabled: ", info->firmware_enabled_processors);
+        shell_print_hex_u32_prefixed("lapic address: ", info->lapic_address);
+        shell_print_u32_prefixed("bootstrap lapic id: ", info->bootstrap_lapic_id);
+        shell_print_line(info->lapic_mmio_ready ? "lapic mmio: ready" : "lapic mmio: not ready");
+        shell_print_line(info->ap_startup_supported ? "ap startup: target-ready" : "ap startup: pending");
+        shell_print_u32_prefixed("ap startup targets: ", info->ap_startup_targets);
+        shell_print_u32_prefixed("ap startup pending: ", info->ap_startup_pending);
+        shell_print_u32_prefixed("enabled apic ids: ", info->firmware_enabled_lapic_id_count);
+        for (uint32_t i = 0; i < info->firmware_enabled_lapic_id_count && i < SMP_CPU_MAX; i++) {
+            shell_print_hex_u32_prefixed("apic id: ", info->firmware_enabled_lapic_ids[i]);
+        }
+        shell_print_line(info->bootstrap_only ? "mode: bootstrap processor only; ap startup pending" : "mode: ap scheduler");
         return;
     }
 
@@ -4443,7 +4485,7 @@ static void shell_run_command(char *line, bool admin_once)
         shell_rm_option_is_recursive_force(argv[1]) &&
         shell_rm_path_is_root_wildcard(argv[2])) {
         shell_print_line("rm: recursive root delete requested");
-        shell_remove_recursive("/");
+        shell_remove_recursive(PATH_ROOT);
         shell_check_boot_files_or_panic();
         shell_print_line("rm -rf ok");
         return;
@@ -4541,8 +4583,7 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
-    if (shell_has_suffix(argv[0], ".elf") ||
-        shell_has_suffix(argv[0], ".exe") ||
+    if (shell_has_suffix(argv[0], ".exe") ||
         shell_has_suffix(argv[0], ".rzs")) {
         shell_run_exec_program(argv[0], argc, argv, admin_once);
         return;
@@ -4557,6 +4598,7 @@ static void shell_run_command(char *line, bool admin_once)
 
 void shell_init(void)
 {
+    g_shell_boot_complete = false;
     g_shell_privilege = SHELL_PRIV_R3;
     g_shell_state = SHELL_STATE_COMMAND;
     g_line_len = 0;
@@ -4569,14 +4611,23 @@ void shell_init(void)
     memset(g_pending_sudo, 0, sizeof(g_pending_sudo));
     memset(g_history, 0, sizeof(g_history));
     memset(g_draft, 0, sizeof(g_draft));
-    strcpy(g_shell_cwd, "/");
+    strcpy(g_shell_cwd, PATH_ROOT);
     /* init environment */
     g_env_count = 0;
-    shell_env_set_pair("HOME=/");
-    shell_env_set_pair("PWD=/");
+    shell_env_set_pair("HOME=" PATH_ROOT);
+    shell_env_set_pair("PWD=" PATH_ROOT);
     shell_env_set_pair("USER=root");
     g_last_drawn_len = 0;
     shell_print_prompt();
+}
+
+void shell_set_boot_complete(bool complete)
+{
+    g_shell_boot_complete = complete;
+    if (complete && g_shell_state == SHELL_STATE_COMMAND) {
+        g_last_drawn_len = 0;
+        shell_print_prompt();
+    }
 }
 
 shell_privilege_t shell_privilege(void)
@@ -4635,6 +4686,9 @@ void shell_resume_text_mode(void)
     if (graphics_active()) {
         return;
     }
+    if (!g_shell_boot_complete) {
+        return;
+    }
     g_last_drawn_len = 0;
     console_clear();
 
@@ -4651,6 +4705,9 @@ void shell_resume_text_mode(void)
 
 void shell_handle_navigation_key(key_event_type_t type)
 {
+    if (!g_shell_boot_complete) {
+        return;
+    }
     if (g_shell_state != SHELL_STATE_COMMAND) {
         return;
     }
@@ -4702,6 +4759,9 @@ void shell_handle_navigation_key(key_event_type_t type)
 
 void shell_handle_special_key(key_event_type_t type)
 {
+    if (!g_shell_boot_complete) {
+        return;
+    }
     if (g_shell_state != SHELL_STATE_COMMAND) {
         return;
     }
@@ -4725,6 +4785,9 @@ void shell_handle_special_key(key_event_type_t type)
 
 void shell_handle_key_event(const key_event_t *event)
 {
+    if (!g_shell_boot_complete) {
+        return;
+    }
     if (event->type != KEY_EVENT_CHAR && event->type != KEY_EVENT_TAB && event->type != KEY_EVENT_CTRL_C) {
         return;
     }

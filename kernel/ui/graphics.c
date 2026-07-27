@@ -12,11 +12,13 @@
 #include "memory.h"
 #include "mouse.h"
 #include "net.h"
+#include "path.h"
 #include "registry.h"
 #include "session.h"
 #include "shell.h"
 #include "task.h"
 #include "terminal.h"
+#include "ui.h"
 
 #define BGA_INDEX_PORT 0x01CE
 #define BGA_DATA_PORT  0x01CF
@@ -25,10 +27,15 @@
 #define BGA_YRES       0x2
 #define BGA_BPP        0x3
 #define BGA_ENABLE     0x4
+#define BGA_VIRT_WIDTH  0x6
+#define BGA_VIRT_HEIGHT 0x7
+#define BGA_X_OFFSET   0x8
+#define BGA_Y_OFFSET   0x9
 
 #define BGA_DISABLED   0x00
 #define BGA_ENABLED    0x01
 #define BGA_LFB        0x40
+#define BGA_ID_5       0xB0C5
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -69,7 +76,7 @@
 #define CONTEXT_MENU_W 170
 #define CONTEXT_MENU_DESKTOP_H 104
 #define CONTEXT_MENU_FILES_H 128
-#define UI_WINDOW_MAX 10
+#define UI_WINDOW_MAX 24
 #define MONIOS_VERSION "1.0"
 #define UI_MENU_ITEM_H 24
 #define START_MENU_HEADER_H 36
@@ -87,11 +94,33 @@
 #define GRAPHICS_LOGIN_USERNAME_MAX 16
 #define GRAPHICS_LOGIN_PASSWORD_MAX 64
 #define GRAPHICS_FILE_NAME_MAX 32
-#define GRAPHICS_FILE_PATH_MAX 64
+#define GRAPHICS_FILE_PATH_MAX 128
+#define GRAPHICS_FILE_ITEM_MAX 64
+#define GRAPHICS_FILE_LIST_BUFFER 2048
 #define GRAPHICS_CLIPBOARD_PATH_MAX 256
+#define GRAPHICS_ICON_CACHE_MAX 48
+#define GRAPHICS_ICON_FLAG_SHORTCUT 0x00000001U
+#define GRAPHICS_ICON_FLAG_UAC      0x00000002U
 #define GRAPHICS_NOTEPAD_TEXT_MAX 2048
 #define GRAPHICS_UAC_TEXT_MAX 96
-#define GRAPHICS_CURSOR_CONFIG_PATH "/cursor.cfg"
+#define GRAPHICS_SCROLLBAR_W 12
+#define GRAPHICS_CONSOLE_ROWS CONSOLE_ROWS
+#define GRAPHICS_WINDOW_TITLE_MAX TERMINAL_WINDOW_TITLE_MAX
+#define GRAPHICS_CURSOR_CONFIG_PATH UI_CURSOR_CONFIG_PATH
+#define GRAPHICS_CURSOR_MAX_WIDTH 32
+#define GRAPHICS_CURSOR_MAX_HEIGHT 32
+#define GRAPHICS_CURSOR_MAX_PIXELS (GRAPHICS_CURSOR_MAX_WIDTH * GRAPHICS_CURSOR_MAX_HEIGHT)
+#define GRAPHICS_CURSOR_ASSET_MAX_BYTES (512U * 1024U)
+#define GRAPHICS_WALLPAPER_MAX_WIDTH 320
+#define GRAPHICS_WALLPAPER_MAX_HEIGHT 180
+#define GRAPHICS_WALLPAPER_MAX_PIXELS (GRAPHICS_WALLPAPER_MAX_WIDTH * GRAPHICS_WALLPAPER_MAX_HEIGHT)
+#define GRAPHICS_WALLPAPER_MAX_BYTES (512U * 1024U)
+#define GRAPHICS_BOOT_IMAGE_MAX_WIDTH 400
+#define GRAPHICS_BOOT_IMAGE_MAX_HEIGHT 225
+#define GRAPHICS_BOOT_IMAGE_MAX_PIXELS (GRAPHICS_BOOT_IMAGE_MAX_WIDTH * GRAPHICS_BOOT_IMAGE_MAX_HEIGHT)
+#define GRAPHICS_BOOT_IMAGE_MAX_BYTES (512U * 1024U)
+#define GRAPHICS_BOOT_FADE_STEPS 18U
+#define GRAPHICS_BOOT_FADE_DELAY 160000U
 #define UI_COLOR_WINDOW_BG 0x00F8FAFE
 #define UI_COLOR_WINDOW_EDGE 0x00CED7E4
 #define UI_COLOR_TITLE_BG 0x00F4F7FC
@@ -112,6 +141,7 @@ typedef enum {
     UI_WINDOW_LOGON,
     UI_WINDOW_FILES,
     UI_WINDOW_TERMINAL,
+    UI_WINDOW_PROCESS_CONSOLE,
     UI_WINDOW_RUN,
     UI_WINDOW_SHELL,
     UI_WINDOW_ABOUT,
@@ -156,6 +186,7 @@ typedef enum {
     GRAPHICS_ICON_FILE = 0,
     GRAPHICS_ICON_FOLDER,
     GRAPHICS_ICON_APP,
+    GRAPHICS_ICON_APP_RESOURCE,
     GRAPHICS_ICON_AUDIO,
     GRAPHICS_ICON_PACKAGE,
     GRAPHICS_ICON_DLL,
@@ -163,7 +194,12 @@ typedef enum {
     GRAPHICS_ICON_TERMINAL,
     GRAPHICS_ICON_SETTINGS,
     GRAPHICS_ICON_INFO,
-    GRAPHICS_ICON_WINDOW
+    GRAPHICS_ICON_WINDOW,
+    GRAPHICS_ICON_DRIVER,
+    GRAPHICS_ICON_UAC,
+    GRAPHICS_ICON_NETWORK_CONNECTED,
+    GRAPHICS_ICON_NETWORK_LIMITED,
+    GRAPHICS_ICON_NETWORK_OFFLINE
 } graphics_icon_kind_t;
 
 typedef struct {
@@ -179,13 +215,22 @@ typedef struct {
     uint16_t restore_y;
     uint16_t restore_width;
     uint16_t restore_height;
-    char title[24];
+    int32_t owner_pid;
+    uint32_t console_scroll_offset;
+    bool console_scroll_manual;
+    char title[GRAPHICS_WINDOW_TITLE_MAX];
 } ui_window_t;
 
 typedef struct {
     char name[GRAPHICS_FILE_NAME_MAX];
     bool is_dir;
 } graphics_file_item_t;
+
+typedef struct {
+    bool valid;
+    char path[GRAPHICS_CLIPBOARD_PATH_MAX];
+    uint32_t image_flags;
+} graphics_icon_cache_entry_t;
 
 typedef struct {
     uint16_t width;
@@ -203,7 +248,7 @@ typedef struct {
 
 static const graphics_button_t g_taskbar_buttons[] = {
     { "\u6587\u4ef6", 0x002F7FD3 },
-    { "\u7ec8\u7aef", 0x004A8A44 },
+    { "\u63a7\u5236\u53f0", 0x004A8A44 },
     { "\u8bbe\u7f6e", 0x006A67CE },
     { "\u5173\u4e8e", 0x00C06C2B }
 };
@@ -261,9 +306,12 @@ static bool g_uac_input_focus;
 static uint8_t g_uac_last_buttons;
 static uint32_t g_uac_privilege_level;
 static char g_file_current_path[GRAPHICS_FILE_PATH_MAX];
-static graphics_file_item_t g_file_items[DESKTOP_LABEL_MAX];
+static graphics_file_item_t g_file_items[GRAPHICS_FILE_ITEM_MAX];
+static graphics_icon_cache_entry_t g_icon_cache[GRAPHICS_ICON_CACHE_MAX];
+static uint32_t g_icon_cache_next;
 static uint32_t g_file_item_count;
 static uint32_t g_file_selected_index;
+static uint32_t g_file_scroll_offset;
 static ui_context_menu_mode_t g_context_menu_mode;
 static ui_clipboard_mode_t g_clipboard_mode;
 static char g_clipboard_path[GRAPHICS_CLIPBOARD_PATH_MAX];
@@ -285,6 +333,16 @@ static float g_cube3d_angle_x;
 static float g_cube3d_angle_y;
 static float g_cube3d_angle_z;
 static uint64_t g_cube3d_last_tick;
+static uint32_t g_wallpaper_pixels[GRAPHICS_WALLPAPER_MAX_PIXELS];
+static uint16_t g_wallpaper_width;
+static uint16_t g_wallpaper_height;
+static bool g_wallpaper_attempted;
+static bool g_wallpaper_loaded;
+static uint32_t g_boot_image_pixels[GRAPHICS_BOOT_IMAGE_MAX_PIXELS];
+static uint16_t g_boot_image_width;
+static uint16_t g_boot_image_height;
+static bool g_boot_image_attempted;
+static bool g_boot_image_loaded;
 
 static const uint16_t g_cursor_arrow_shape[16] = {
     0x8000, 0xC000, 0xE000, 0xF000,
@@ -353,10 +411,19 @@ static uint32_t g_fps_value = 0;
 static uint64_t g_last_fps_tick = 0;
 static uint32_t g_present_snapshot = 0;
 static uint32_t g_selected_login_user;
-static uint32_t g_cursor_saved[16 * 16];
+static uint32_t g_cursor_saved[GRAPHICS_CURSOR_MAX_PIXELS];
 static uint16_t g_cursor_x;
 static uint16_t g_cursor_y;
+static uint16_t g_cursor_draw_width;
+static uint16_t g_cursor_draw_height;
 static bool g_cursor_drawn;
+static bool g_windows_cursor_attempted;
+static bool g_windows_cursor_loaded;
+static uint16_t g_windows_cursor_width;
+static uint16_t g_windows_cursor_height;
+static uint16_t g_windows_cursor_hotspot_x;
+static uint16_t g_windows_cursor_hotspot_y;
+static uint32_t g_windows_cursor_pixels[GRAPHICS_CURSOR_MAX_PIXELS];
 static volatile uint32_t *g_framebuffer;
 static uint32_t g_backbuffer[FB_PIXELS];
 static uint16_t g_svga_io_base;
@@ -386,6 +453,8 @@ static bool graphics_launch_user_program(const char *path);
 static bool graphics_launch_user_program_with_arg(const char *path, const char *arg);
 static bool graphics_launch_named_user_program(const char *name);
 static int32_t graphics_find_window(ui_window_kind_t kind);
+static int32_t graphics_find_process_console_window(int32_t pid);
+static bool graphics_window_is_terminal(const ui_window_t *window);
 static void graphics_bring_window_to_front(uint32_t index);
 static int32_t graphics_find_mode_index(uint16_t width, uint16_t height);
 static uint16_t graphics_power_menu_top(void);
@@ -401,6 +470,7 @@ static void graphics_plot(uint16_t x, uint16_t y, uint32_t color);
 static void graphics_draw_rect_outline(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
 static void graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
 static void graphics_draw_text_aligned(uint16_t x, uint16_t y, uint16_t width, const char *text, uint32_t color);
+static void graphics_draw_text_clipped(uint16_t x, uint16_t y, uint16_t width, const char *text, uint32_t color);
 static void graphics_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint32_t color);
 static void graphics_draw_cube3d_window(const ui_window_t *window);
 static void graphics_draw_taskbar_status(void);
@@ -409,6 +479,8 @@ static void graphics_draw_logon_window(const ui_window_t *window);
 static uint16_t graphics_taskbar_pinned_start_x(void);
 static uint16_t graphics_taskbar_running_start_x(void);
 static void graphics_restore_cursor(void);
+static bool graphics_windows_cursor_ready(void);
+static bool graphics_cursor_use_windows_asset(void);
 static void graphics_draw_rainbow_cat(void);
 static void graphics_reset_start_menu(void);
 static bool graphics_point_in_rect(uint16_t px, uint16_t py, uint16_t x, uint16_t y, uint16_t width, uint16_t height);
@@ -416,6 +488,18 @@ static void graphics_fill(uint32_t color);
 static void graphics_append_path_component(char *path, uint32_t path_size, const char *component);
 static void graphics_fill_player_browser(void);
 static void graphics_player_open_browser(void);
+static uint32_t graphics_file_visible_rows(const ui_window_t *window);
+static uint32_t graphics_file_max_scroll(const ui_window_t *window);
+static void graphics_file_clamp_scroll(const ui_window_t *window);
+static void graphics_file_ensure_selected_visible(const ui_window_t *window);
+static void graphics_file_scroll_by(int32_t delta);
+static uint32_t graphics_terminal_visible_rows(const ui_window_t *window);
+static uint32_t graphics_terminal_content_rows(const ui_window_t *window);
+static uint32_t graphics_terminal_max_scroll(const ui_window_t *window);
+static void graphics_terminal_scroll_by(int32_t delta, ui_window_t *window);
+static void graphics_draw_scrollbar(uint16_t x, uint16_t y, uint16_t height,
+                                    uint32_t total, uint32_t visible, uint32_t offset,
+                                    bool dark);
 static bool graphics_player_path_is_audio(const char *path);
 static bool graphics_player_try_play(const char *path);
 
@@ -577,7 +661,7 @@ static uint16_t graphics_power_menu_top(void)
 
 static bool graphics_is_separator(char ch)
 {
-    return ch == '/' || ch == '\\';
+    return ch == PATH_SEPARATOR;
 }
 
 static uint16_t graphics_clamp_window_x(uint16_t width)
@@ -623,19 +707,142 @@ static void graphics_copy_uac_text(char *dst, uint32_t dst_size, const char *src
 
 static void graphics_reset_file_browser(void)
 {
-    strcpy(g_file_current_path, "/");
+    strcpy(g_file_current_path, UI_SYSTEM_ROOT);
     g_file_item_count = 0;
     g_file_selected_index = 0;
+    g_file_scroll_offset = 0;
+}
+
+static uint32_t graphics_file_visible_rows(const ui_window_t *window)
+{
+    uint32_t content_height;
+
+    if (window == NULL || window->height <= 78) {
+        return 1;
+    }
+    content_height = window->height - 78;
+    return content_height / 22u == 0 ? 1 : content_height / 22u;
+}
+
+static uint32_t graphics_file_max_scroll(const ui_window_t *window)
+{
+    uint32_t visible_rows = graphics_file_visible_rows(window);
+
+    return g_file_item_count > visible_rows ? g_file_item_count - visible_rows : 0;
+}
+
+static void graphics_file_clamp_scroll(const ui_window_t *window)
+{
+    uint32_t max_scroll = graphics_file_max_scroll(window);
+
+    if (g_file_scroll_offset > max_scroll) {
+        g_file_scroll_offset = max_scroll;
+    }
+    if (g_file_item_count == 0) {
+        g_file_scroll_offset = 0;
+    }
+}
+
+static void graphics_file_ensure_selected_visible(const ui_window_t *window)
+{
+    uint32_t visible_rows = graphics_file_visible_rows(window);
+    uint32_t max_scroll;
+
+    graphics_file_clamp_scroll(window);
+    max_scroll = graphics_file_max_scroll(window);
+    if (g_file_item_count == 0) {
+        return;
+    }
+    if (g_file_selected_index < g_file_scroll_offset) {
+        g_file_scroll_offset = g_file_selected_index;
+    } else if (g_file_selected_index >= g_file_scroll_offset + visible_rows) {
+        g_file_scroll_offset = g_file_selected_index - visible_rows + 1;
+    }
+    if (g_file_scroll_offset > max_scroll) {
+        g_file_scroll_offset = max_scroll;
+    }
+}
+
+static void graphics_file_scroll_by(int32_t delta)
+{
+    int32_t next;
+    int32_t max_scroll;
+    int32_t window_index = graphics_find_window(UI_WINDOW_FILES);
+    const ui_window_t *window = window_index >= 0 ? &g_windows[window_index] : NULL;
+
+    max_scroll = (int32_t) graphics_file_max_scroll(window);
+    next = (int32_t) g_file_scroll_offset + delta;
+    if (next < 0) {
+        next = 0;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
+    }
+    g_file_scroll_offset = (uint32_t) next;
+}
+
+static uint32_t graphics_terminal_visible_rows(const ui_window_t *window)
+{
+    uint32_t content_height;
+    uint32_t rows;
+
+    if (window == NULL || window->height <= 46) {
+        return 1;
+    }
+    content_height = window->height - 46;
+    rows = content_height / 14u;
+    if (rows == 0) {
+        rows = 1;
+    }
+    return rows > GRAPHICS_CONSOLE_ROWS ? GRAPHICS_CONSOLE_ROWS : rows;
+}
+
+static uint32_t graphics_terminal_content_rows(const ui_window_t *window)
+{
+    int32_t owner_pid = window != NULL ? window->owner_pid : -1;
+    uint32_t rows = (uint32_t) console_cursor_row_for_pid(owner_pid) + 1u;
+
+    if (rows == 0) {
+        rows = 1;
+    }
+    return rows > GRAPHICS_CONSOLE_ROWS ? GRAPHICS_CONSOLE_ROWS : rows;
+}
+
+static uint32_t graphics_terminal_max_scroll(const ui_window_t *window)
+{
+    uint32_t visible_rows = graphics_terminal_visible_rows(window);
+    uint32_t content_rows = graphics_terminal_content_rows(window);
+
+    return content_rows > visible_rows ? content_rows - visible_rows : 0;
+}
+
+static void graphics_terminal_scroll_by(int32_t delta, ui_window_t *window)
+{
+    int32_t next;
+    int32_t max_scroll = (int32_t) graphics_terminal_max_scroll(window);
+
+    if (window == NULL) {
+        return;
+    }
+    next = (int32_t) window->console_scroll_offset + delta;
+    if (next < 0) {
+        next = 0;
+    }
+    if (next > max_scroll) {
+        next = max_scroll;
+    }
+    window->console_scroll_offset = (uint32_t) next;
+    window->console_scroll_manual = window->console_scroll_offset < (uint32_t) max_scroll;
 }
 
 static void graphics_current_desktop_path(char output[GRAPHICS_FILE_PATH_MAX])
 {
     const session_user_t *user = session_current_user();
 
-    strcpy(output, "/home/root/desktop");
+    strcpy(output, UI_ROOT_DESKTOP);
     if (user != NULL && user->home[0] != '\0') {
         strcpy(output, user->home);
-        graphics_append_path_component(output, GRAPHICS_FILE_PATH_MAX, "desktop");
+        graphics_append_path_component(output, GRAPHICS_FILE_PATH_MAX, "Desktop");
     }
 }
 
@@ -655,12 +862,39 @@ static void graphics_draw_text_aligned(uint16_t x, uint16_t y, uint16_t width, c
     graphics_draw_text(draw_x, y, text, color);
 }
 
+static void graphics_draw_text_clipped(uint16_t x, uint16_t y, uint16_t width, const char *text, uint32_t color)
+{
+    char clipped[GRAPHICS_WINDOW_TITLE_MAX];
+    uint32_t used = 0;
+    uint32_t drawn_width = 0;
+    const char *cursor = text;
+
+    if (text == NULL || width == 0) {
+        return;
+    }
+    while (*cursor != '\0' && used + 1 < sizeof(clipped)) {
+        const char *start = cursor;
+        uint32_t codepoint = font_utf8_next(&cursor);
+        uint32_t advance = font_codepoint_advance(codepoint);
+
+        if (drawn_width + advance > width) {
+            break;
+        }
+        while (start < cursor && used + 1 < sizeof(clipped)) {
+            clipped[used++] = *start++;
+        }
+        drawn_width += advance;
+    }
+    clipped[used] = '\0';
+    graphics_draw_text(x, y, clipped, color);
+}
+
 static void graphics_append_path_component(char *path, uint32_t path_size, const char *component)
 {
     uint32_t len = (uint32_t) strlen(path);
 
-    if (len > 1 && len + 1 < path_size) {
-        path[len++] = '/';
+    if (len > 3 && path[len - 1] != PATH_SEPARATOR && len + 1 < path_size) {
+        path[len++] = PATH_SEPARATOR;
         path[len] = '\0';
     }
     if (len + strlen(component) < path_size) {
@@ -672,26 +906,21 @@ static bool graphics_pop_path_component(char *path)
 {
     uint32_t len;
 
-    if (path == NULL || path[0] == '\0' || strcmp(path, "/") == 0) {
+    if (path == NULL || path[0] == '\0' || strcmp(path, PATH_ROOT) == 0) {
         return false;
     }
     len = (uint32_t) strlen(path);
-    while (len > 0 && path[len - 1] == '/') {
+    while (len > 3 && path[len - 1] == PATH_SEPARATOR) {
         len--;
     }
-    while (len > 0 && path[len - 1] != '/') {
+    while (len > 3 && path[len - 1] != PATH_SEPARATOR) {
         len--;
     }
-    if (len == 0) {
-        path[0] = '/';
-        path[1] = '\0';
+    if (len <= 3) {
+        strcpy(path, PATH_ROOT);
         return true;
     }
     path[len] = '\0';
-    if (path[0] == '\0') {
-        path[0] = '/';
-        path[1] = '\0';
-    }
     return true;
 }
 
@@ -713,14 +942,14 @@ static uint32_t graphics_file_name_from_line(const char *line, char *name, uint3
 static void graphics_fill_file_browser(void)
 {
     uint32_t count = 0;
-    char buffer[512];
+    char buffer[GRAPHICS_FILE_LIST_BUFFER];
 
     g_file_item_count = 0;
     if (!file_list_dir(g_file_current_path, buffer, sizeof(buffer))) {
         return;
     }
 
-    for (uint32_t i = 0; buffer[i] != '\0' && count < DESKTOP_LABEL_MAX; i++) {
+    for (uint32_t i = 0; buffer[i] != '\0' && count < GRAPHICS_FILE_ITEM_MAX; i++) {
         uint32_t line_start = i;
         uint32_t line_len = 0;
 
@@ -745,6 +974,10 @@ static void graphics_fill_file_browser(void)
     g_file_item_count = count;
     if (g_file_selected_index >= g_file_item_count && g_file_item_count > 0) {
         g_file_selected_index = g_file_item_count - 1;
+    }
+    {
+        int32_t window_index = graphics_find_window(UI_WINDOW_FILES);
+        graphics_file_ensure_selected_visible(window_index >= 0 ? &g_windows[window_index] : NULL);
     }
 }
 
@@ -796,7 +1029,7 @@ static void graphics_fill_player_browser(void)
 static void graphics_player_open_browser(void)
 {
     if (g_player_current_path[0] == '\0') {
-        strcpy(g_player_current_path, "/");
+        strcpy(g_player_current_path, UI_ROOT_DESKTOP);
     }
     g_player_browser_open = true;
     g_player_selected_index = 0;
@@ -832,9 +1065,11 @@ static bool graphics_attempt_login(void)
 {
     if (!session_validate_credentials(g_login_username, g_login_password)) {
         g_login_error = true;
+        g_login_password[0] = '\0';
         return false;
     }
     g_login_error = false;
+    g_login_password[0] = '\0';
     g_session_logged_in = true;
     graphics_reset_file_browser();
     graphics_fill_file_browser();
@@ -1081,7 +1316,7 @@ static const char *graphics_path_basename(const char *path)
         return "";
     }
     while (*path != '\0') {
-        if (*path == '/') {
+        if (*path == PATH_SEPARATOR) {
             last = path + 1;
         }
         path++;
@@ -1214,27 +1449,29 @@ static bool graphics_create_desktop_shortcut(const char *target_path)
 
 static bool graphics_launch_user_program(const char *path)
 {
-    if (path == NULL || path[0] == '\0' || !file_exists(path) || file_is_dir(path)) {
+    if (exec_active() ||
+        path == NULL ||
+        path[0] == '\0' ||
+        !file_exists(path) ||
+        file_is_dir(path)) {
         return false;
     }
 
-    if (g_graphics_active && g_session_logged_in && graphics_find_window(UI_WINDOW_TERMINAL) < 0) {
-        graphics_open_window(UI_WINDOW_TERMINAL);
-    }
     shell_exec_path(path);
     return true;
 }
 
 static bool graphics_launch_user_program_with_arg(const char *path, const char *arg)
 {
-    if (path == NULL || path[0] == '\0' || arg == NULL || arg[0] == '\0' ||
+    if (exec_active() ||
+        path == NULL ||
+        path[0] == '\0' ||
+        arg == NULL ||
+        arg[0] == '\0' ||
         !file_exists(path) || file_is_dir(path)) {
         return false;
     }
 
-    if (g_graphics_active && g_session_logged_in && graphics_find_window(UI_WINDOW_TERMINAL) < 0) {
-        graphics_open_window(UI_WINDOW_TERMINAL);
-    }
     shell_exec_path_with_arg(path, arg);
     return true;
 }
@@ -1256,7 +1493,7 @@ static bool graphics_resolve_app_executable_path(const char *path, char *resolve
         return false;
     }
 
-    strcpy(resolved, "/apps");
+    strcpy(resolved, UI_APPS_DIR);
     graphics_append_path_component(resolved, resolved_size, base);
     return file_exists(resolved) && !file_is_dir(resolved);
 }
@@ -1268,28 +1505,24 @@ static bool graphics_launch_named_user_program(const char *name)
         const char *path;
     } app_alias_t;
     static const app_alias_t apps[] = {
-        { "explorar", "/apps/explorar.exe" },
-        { "explorar.exe", "/apps/explorar.exe" },
-        { "monilog", "/apps/monilog.exe" },
-        { "monilog.exe", "/apps/monilog.exe" },
-        { "demo", "/apps/demo.elf" },
-        { "demo.elf", "/apps/demo.elf" },
-        { "player", "/apps/player.elf" },
-        { "player.elf", "/apps/player.elf" },
-        { "notepad", "/apps/notepad.elf" },
-        { "notepad.elf", "/apps/notepad.elf" },
-        { "taskmgr", "/apps/taskmgr.elf" },
-        { "taskmgr.elf", "/apps/taskmgr.elf" },
-        { "square", "/apps/square.elf" },
-        { "square.elf", "/apps/square.elf" },
-        { "cube3d", "/apps/cube3d.elf" },
-        { "cube3d.elf", "/apps/cube3d.elf" },
-        { "setup", "/apps/setup.elf" },
-        { "setup.elf", "/apps/setup.elf" },
-        { "appdev", "/apps/appdev.elf" },
-        { "appdev.elf", "/apps/appdev.elf" },
-        { "rzdrv", "/apps/rzdrv.rzs" },
-        { "rzdrv.rzs", "/apps/rzdrv.rzs" },
+        { "explorar", UI_EXPLORER_PATH },
+        { "explorar.exe", UI_EXPLORER_PATH },
+        { "monilog", UI_LOGON_PATH },
+        { "monilog.exe", UI_LOGON_PATH },
+        { "demo", UI_APPS_DIR PATH_SEPARATOR_STR "demo.exe" },
+        { "demo.exe", UI_APPS_DIR PATH_SEPARATOR_STR "demo.exe" },
+        { "player", UI_PLAYER_PATH },
+        { "player.exe", UI_PLAYER_PATH },
+        { "notepad", UI_NOTEPAD_PATH },
+        { "notepad.exe", UI_NOTEPAD_PATH },
+        { "square", UI_APPS_DIR PATH_SEPARATOR_STR "square.exe" },
+        { "square.exe", UI_APPS_DIR PATH_SEPARATOR_STR "square.exe" },
+        { "cube3d", UI_APPS_DIR PATH_SEPARATOR_STR "cube3d.exe" },
+        { "cube3d.exe", UI_APPS_DIR PATH_SEPARATOR_STR "cube3d.exe" },
+        { "setup", UI_SETUP_PATH },
+        { "setup.exe", UI_SETUP_PATH },
+        { "appdev", UI_APPS_DIR PATH_SEPARATOR_STR "appdev.exe" },
+        { "appdev.exe", UI_APPS_DIR PATH_SEPARATOR_STR "appdev.exe" },
     };
 
     if (name == NULL || name[0] == '\0') {
@@ -1359,7 +1592,7 @@ static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y)
         break;
     case UI_START_MENU_APPS:
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            graphics_launch_user_program("/apps/explorar.exe");
+            graphics_launch_user_program(UI_EXPLORER_PATH);
             g_start_menu_open = false;
             return true;
         }
@@ -1369,17 +1602,17 @@ static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y)
             return true;
         }
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 2 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            graphics_launch_user_program("/apps/player.elf");
+            graphics_launch_user_program(UI_PLAYER_PATH);
             g_start_menu_open = false;
             return true;
         }
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 3 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            graphics_launch_user_program("/apps/notepad.elf");
+            graphics_launch_user_program(UI_NOTEPAD_PATH);
             g_start_menu_open = false;
             return true;
         }
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 4 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            graphics_launch_user_program("/apps/taskmgr.elf");
+            graphics_open_task_manager();
             g_start_menu_open = false;
             return true;
         }
@@ -1424,9 +1657,7 @@ static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y)
         break;
     case UI_START_MENU_NETWORK:
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 0 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            if (net_connected()) {
-                net_ping("172.16.58.1");
-            }
+            ui_network_update(timer_ticks());
             g_start_menu_open = false;
             return true;
         }
@@ -1446,7 +1677,7 @@ static bool graphics_handle_start_menu_click(uint16_t x, uint16_t y)
             return true;
         }
         if (graphics_point_in_rect(x, y, (uint16_t) (menu_x + START_MENU_LEFT_W + 12), (uint16_t) (root_top + 2 * UI_MENU_ITEM_H), START_MENU_MID_W - 24, UI_MENU_ITEM_H - 2)) {
-            g_sleeping = true;
+            kernel_request_sleep();
             g_start_menu_open = false;
             return true;
         }
@@ -1479,6 +1710,10 @@ static void graphics_open_path(const char *path)
         graphics_open_window(UI_WINDOW_FILES);
         return;
     }
+    if (strcasecmp(graphics_path_basename(open_path), "taskmgr.exe") == 0) {
+        graphics_open_task_manager();
+        return;
+    }
     if (graphics_path_is_executable(open_path)) {
         if (graphics_resolve_app_executable_path(open_path, exec_path, sizeof(exec_path))) {
             graphics_launch_user_program(exec_path);
@@ -1503,7 +1738,10 @@ static void graphics_run_command_text(const char *command)
     if (command == NULL || command[0] == '\0') {
         return;
     }
-    if (strcasecmp(command, "command") == 0 || strcasecmp(command, "cmd") == 0 || strcasecmp(command, "terminal") == 0) {
+    if (strcasecmp(command, "command") == 0 ||
+        strcasecmp(command, "cmd") == 0 ||
+        strcasecmp(command, "console") == 0 ||
+        strcasecmp(command, "terminal") == 0) {
         graphics_open_window(UI_WINDOW_TERMINAL);
     } else if (graphics_launch_named_user_program(command)) {
         return;
@@ -1663,6 +1901,50 @@ static void bga_write(uint16_t index, uint16_t value)
 {
     outw(BGA_INDEX_PORT, index);
     outw(BGA_DATA_PORT, value);
+}
+
+static uint16_t bga_read(uint16_t index)
+{
+    outw(BGA_INDEX_PORT, index);
+    return inw(BGA_DATA_PORT);
+}
+
+static void graphics_log_bga_mode(void)
+{
+    char msg[96] = "graphics bga: id=0x";
+    char hex[9];
+    char dec[12];
+    uint32_t pos = 19;
+    uint16_t id = bga_read(BGA_ID);
+    uint16_t enable = bga_read(BGA_ENABLE);
+    uint16_t xres = bga_read(BGA_XRES);
+    uint16_t yres = bga_read(BGA_YRES);
+    uint16_t bpp = bga_read(BGA_BPP);
+
+    graphics_u32_to_hex8(id, hex);
+    memcpy(msg + pos, hex + 4, 4);
+    pos += 4;
+    memcpy(msg + pos, " enable=0x", 10);
+    pos += 10;
+    graphics_u32_to_hex8(enable, hex);
+    memcpy(msg + pos, hex + 4, 4);
+    pos += 4;
+    memcpy(msg + pos, " mode=", 6);
+    pos += 6;
+    graphics_u32_to_dec(dec, xres);
+    memcpy(msg + pos, dec, strlen(dec));
+    pos += (uint32_t) strlen(dec);
+    msg[pos++] = 'x';
+    graphics_u32_to_dec(dec, yres);
+    memcpy(msg + pos, dec, strlen(dec));
+    pos += (uint32_t) strlen(dec);
+    memcpy(msg + pos, " bpp=", 5);
+    pos += 5;
+    graphics_u32_to_dec(dec, bpp);
+    memcpy(msg + pos, dec, strlen(dec));
+    pos += (uint32_t) strlen(dec);
+    msg[pos] = '\0';
+    log_write(msg);
 }
 
 static void graphics_plot(uint16_t x, uint16_t y, uint32_t color)
@@ -1897,8 +2179,20 @@ static void graphics_draw_char(uint16_t x, uint16_t y, char ch, uint32_t color)
 
 static void graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color)
 {
+    uint16_t origin_x = x;
+
     while (text != NULL && *text != '\0') {
         uint32_t codepoint = font_utf8_next(&text);
+
+        if (codepoint == '\r') {
+            x = origin_x;
+            continue;
+        }
+        if (codepoint == '\n') {
+            x = origin_x;
+            y = (uint16_t) (y + UI_FONT_HEIGHT);
+            continue;
+        }
         graphics_draw_codepoint(x, y, codepoint, color);
         x = (uint16_t) (x + font_codepoint_advance(codepoint));
     }
@@ -1978,8 +2272,7 @@ static void graphics_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, u
 
 static bool graphics_path_is_executable(const char *path)
 {
-    return graphics_path_has_suffix(path, ".elf") || graphics_path_has_suffix(path, ".ELF") ||
-           graphics_path_has_suffix(path, ".exe") || graphics_path_has_suffix(path, ".EXE");
+    return graphics_path_has_suffix(path, ".exe") || graphics_path_has_suffix(path, ".EXE");
 }
 
 static bool graphics_path_is_package(const char *path)
@@ -1987,8 +2280,48 @@ static bool graphics_path_is_package(const char *path)
     return graphics_path_has_suffix(path, ".rzs") || graphics_path_has_suffix(path, ".RZS");
 }
 
+static bool graphics_path_is_pe_image(const char *path)
+{
+    return graphics_path_is_executable(path) ||
+           graphics_path_has_suffix(path, ".sys") ||
+           graphics_path_has_suffix(path, ".SYS") ||
+           graphics_path_has_suffix(path, ".dll") ||
+           graphics_path_has_suffix(path, ".DLL");
+}
+
+static uint32_t graphics_cached_image_flags_for_path(const char *path)
+{
+    uint32_t slot = GRAPHICS_ICON_CACHE_MAX;
+    uint32_t flags;
+
+    if (path == NULL || path[0] == '\0' || !graphics_path_is_pe_image(path)) {
+        return 0;
+    }
+    if (!file_exists(path) || file_is_dir(path)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < GRAPHICS_ICON_CACHE_MAX; i++) {
+        if (g_icon_cache[i].valid && strcasecmp(g_icon_cache[i].path, path) == 0) {
+            return g_icon_cache[i].image_flags;
+        }
+        if (!g_icon_cache[i].valid && slot == GRAPHICS_ICON_CACHE_MAX) {
+            slot = i;
+        }
+    }
+    flags = exec_image_flags_for_path(path);
+    if (slot == GRAPHICS_ICON_CACHE_MAX) {
+        slot = g_icon_cache_next++ % GRAPHICS_ICON_CACHE_MAX;
+    }
+    g_icon_cache[slot].valid = true;
+    strlcpy(g_icon_cache[slot].path, path, sizeof(g_icon_cache[slot].path));
+    g_icon_cache[slot].image_flags = flags;
+    return flags;
+}
+
 static graphics_icon_kind_t graphics_icon_kind_for_path(const char *path, bool is_dir)
 {
+    uint32_t image_flags;
+
     if (is_dir) {
         return GRAPHICS_ICON_FOLDER;
     }
@@ -1998,19 +2331,41 @@ static graphics_icon_kind_t graphics_icon_kind_for_path(const char *path, bool i
     if (graphics_path_has_suffix(path, ".lnk") || graphics_path_has_suffix(path, ".LNK")) {
         return GRAPHICS_ICON_SHORTCUT;
     }
+    if (graphics_path_has_suffix(path, ".sys") || graphics_path_has_suffix(path, ".SYS")) {
+        return GRAPHICS_ICON_DRIVER;
+    }
+    if (graphics_path_has_suffix(path, ".dll") || graphics_path_has_suffix(path, ".DLL")) {
+        return GRAPHICS_ICON_DLL;
+    }
     if (graphics_path_is_executable(path)) {
+        image_flags = graphics_cached_image_flags_for_path(path);
+        if ((image_flags & EXEC_IMAGE_FLAG_ICON_RESOURCE) != 0) {
+            return GRAPHICS_ICON_APP_RESOURCE;
+        }
         return GRAPHICS_ICON_APP;
     }
     if (graphics_path_is_package(path)) {
         return GRAPHICS_ICON_PACKAGE;
     }
-    if (graphics_path_has_suffix(path, ".dll") || graphics_path_has_suffix(path, ".DLL")) {
-        return GRAPHICS_ICON_DLL;
-    }
     if (graphics_player_path_is_audio(path)) {
         return GRAPHICS_ICON_AUDIO;
     }
     return GRAPHICS_ICON_FILE;
+}
+
+static uint32_t graphics_icon_flags_for_path(const char *path, bool is_dir)
+{
+    uint32_t flags = 0;
+    uint32_t image_flags;
+
+    if (is_dir || path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    image_flags = graphics_cached_image_flags_for_path(path);
+    if ((image_flags & (EXEC_IMAGE_FLAG_NEEDS_R0 | EXEC_IMAGE_FLAG_NEEDS_R2)) != 0) {
+        flags |= GRAPHICS_ICON_FLAG_UAC;
+    }
+    return flags;
 }
 
 static graphics_icon_kind_t graphics_icon_kind_for_window(ui_window_kind_t kind)
@@ -2019,6 +2374,7 @@ static graphics_icon_kind_t graphics_icon_kind_for_window(ui_window_kind_t kind)
     case UI_WINDOW_FILES:
         return GRAPHICS_ICON_FOLDER;
     case UI_WINDOW_TERMINAL:
+    case UI_WINDOW_PROCESS_CONSOLE:
     case UI_WINDOW_SHELL:
     case UI_WINDOW_RUN:
         return GRAPHICS_ICON_TERMINAL;
@@ -2029,7 +2385,7 @@ static graphics_icon_kind_t graphics_icon_kind_for_window(ui_window_kind_t kind)
     case UI_WINDOW_PLAYER:
         return GRAPHICS_ICON_AUDIO;
     case UI_WINDOW_UAC:
-        return GRAPHICS_ICON_PACKAGE;
+        return GRAPHICS_ICON_UAC;
     case UI_WINDOW_NOTEPAD:
         return GRAPHICS_ICON_FILE;
     case UI_WINDOW_TASKMGR:
@@ -2074,6 +2430,19 @@ static void graphics_draw_shortcut_badge(uint16_t x, uint16_t y, bool small)
     graphics_draw_line((int16_t) (x + size - 4), (int16_t) (y + 2), (int16_t) (x + size - 8), (int16_t) (y + 3), 0x003C6FEA);
 }
 
+static void graphics_draw_uac_badge(uint16_t x, uint16_t y, bool small)
+{
+    uint16_t size = small ? 10 : 16;
+    uint16_t half = (uint16_t) (size / 2);
+
+    graphics_fill_soft_rect(x, y, size, size, 0x00FFFFFF);
+    graphics_draw_soft_rect_outline(x, y, size, size, 0x00708090);
+    graphics_fill_rect((uint16_t) (x + 2), (uint16_t) (y + 2), (uint16_t) (half - 2), (uint16_t) (half - 2), 0x002C78D4);
+    graphics_fill_rect((uint16_t) (x + half), (uint16_t) (y + 2), (uint16_t) (half - 2), (uint16_t) (half - 2), 0x00F2C542);
+    graphics_fill_rect((uint16_t) (x + 2), (uint16_t) (y + half), (uint16_t) (half - 2), (uint16_t) (half - 2), 0x00F2C542);
+    graphics_fill_rect((uint16_t) (x + half), (uint16_t) (y + half), (uint16_t) (half - 2), (uint16_t) (half - 2), 0x002C78D4);
+}
+
 static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind, bool small)
 {
     uint16_t w = small ? 18 : 48;
@@ -2097,6 +2466,14 @@ static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind
             graphics_fill_rect((uint16_t) (ix + 18), (uint16_t) (iy + 25), 6, 6, 0x00FFFFFF);
             graphics_fill_rect((uint16_t) (ix + 26), (uint16_t) (iy + 25), 6, 6, 0x00FFFFFF);
         }
+        break;
+    case GRAPHICS_ICON_APP_RESOURCE:
+        graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x00FFFFFF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x006FA8DC);
+        graphics_fill_rect_gradient((uint16_t) (ix + 8), (uint16_t) (iy + 7), (uint16_t) (w - 16), (uint16_t) (h - 16), 0x0038BDF8, 0x002C78D4);
+        graphics_fill_soft_rect((uint16_t) (ix + 10), (uint16_t) (iy + 9), (uint16_t) (small ? 8 : 18), (uint16_t) (small ? 7 : 15), 0x00FFFFFF);
+        graphics_fill_soft_rect((uint16_t) (ix + (small ? 8 : 22)), (uint16_t) (iy + (small ? 10 : 25)), (uint16_t) (small ? 8 : 16), (uint16_t) (small ? 6 : 12), 0x00FFE08A);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 8), (uint16_t) (iy + 7), (uint16_t) (w - 16), (uint16_t) (h - 16), 0x00CDE4FF);
         break;
     case GRAPHICS_ICON_AUDIO:
         graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 2), (uint16_t) (w - 6), (uint16_t) (h - 4), 0x00FFF8F2);
@@ -2122,6 +2499,54 @@ static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind
             graphics_draw_text((uint16_t) (ix + 17), (uint16_t) (iy + 20), "DLL", 0x0030A46C);
         }
         break;
+    case GRAPHICS_ICON_DRIVER:
+        graphics_fill_soft_rect((uint16_t) (ix + 4), (uint16_t) (iy + 5), (uint16_t) (w - 8), (uint16_t) (h - 10), 0x00EEF7FF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 4), (uint16_t) (iy + 5), (uint16_t) (w - 8), (uint16_t) (h - 10), 0x004C82B8);
+        for (uint16_t pin = 0; pin < 4; pin++) {
+            uint16_t px = (uint16_t) (ix + 8 + pin * (small ? 3 : 8));
+            graphics_fill_rect(px, (uint16_t) (iy + 2), 2, 4, 0x004C82B8);
+            graphics_fill_rect(px, (uint16_t) (iy + h - 7), 2, 4, 0x004C82B8);
+        }
+        graphics_fill_rect_gradient((uint16_t) (ix + (small ? 6 : 10)),
+                                    (uint16_t) (iy + (small ? 7 : 12)),
+                                    (uint16_t) (small ? 6 : w - 20),
+                                    (uint16_t) (small ? 6 : 18),
+                                    0x006BB9FF,
+                                    0x002C78D4);
+        if (!small) {
+            graphics_draw_text((uint16_t) (ix + 14), (uint16_t) (iy + 30), "SYS", 0x002C5F99);
+        }
+        break;
+    case GRAPHICS_ICON_UAC:
+        graphics_fill_soft_rect((uint16_t) (ix + 7), (uint16_t) (iy + 4), (uint16_t) (w - 14), (uint16_t) (h - 8), 0x00FFFFFF);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + 7), (uint16_t) (iy + 4), (uint16_t) (w - 14), (uint16_t) (h - 8), 0x008AA1B8);
+        graphics_fill_rect((uint16_t) (ix + w / 2 - 9), (uint16_t) (iy + 11), 9, (uint16_t) (small ? 7 : 15), 0x002C78D4);
+        graphics_fill_rect((uint16_t) (ix + w / 2), (uint16_t) (iy + 11), 9, (uint16_t) (small ? 7 : 15), 0x00F4C542);
+        graphics_fill_rect((uint16_t) (ix + w / 2 - 9), (uint16_t) (iy + (small ? 18 : 26)), 9, (uint16_t) (small ? 5 : 12), 0x00F4C542);
+        graphics_fill_rect((uint16_t) (ix + w / 2), (uint16_t) (iy + (small ? 18 : 26)), 9, (uint16_t) (small ? 5 : 12), 0x002C78D4);
+        graphics_draw_soft_rect_outline((uint16_t) (ix + w / 2 - 10), (uint16_t) (iy + 10), 20, (uint16_t) (small ? 14 : 28), 0x00424E5F);
+        break;
+    case GRAPHICS_ICON_NETWORK_CONNECTED:
+    case GRAPHICS_ICON_NETWORK_LIMITED:
+    case GRAPHICS_ICON_NETWORK_OFFLINE:
+        {
+            uint32_t color = kind == GRAPHICS_ICON_NETWORK_CONNECTED ? 0x002E8B57 :
+                             (kind == GRAPHICS_ICON_NETWORK_LIMITED ? 0x00C0801F : 0x00B43A3A);
+            graphics_fill_soft_rect((uint16_t) (ix + 2), (uint16_t) (iy + 4), (uint16_t) (w - 7), (uint16_t) (h - 8), 0x00F7FBFF);
+            graphics_draw_soft_rect_outline((uint16_t) (ix + 2), (uint16_t) (iy + 4), (uint16_t) (w - 7), (uint16_t) (h - 8), 0x008AA1B8);
+            graphics_fill_rect((uint16_t) (ix + 6), (uint16_t) (iy + h - 6), (uint16_t) (w - 15), 2, 0x008AA1B8);
+            if (kind == GRAPHICS_ICON_NETWORK_CONNECTED) {
+                graphics_draw_line((int16_t) (ix + 6), (int16_t) (iy + 12), (int16_t) (ix + 10), (int16_t) (iy + 16), color);
+                graphics_draw_line((int16_t) (ix + 10), (int16_t) (iy + 16), (int16_t) (ix + 17), (int16_t) (iy + 8), color);
+            } else if (kind == GRAPHICS_ICON_NETWORK_LIMITED) {
+                graphics_fill_rect((uint16_t) (ix + w - 6), (uint16_t) (iy + 6), 2, (uint16_t) (h - 12), color);
+                graphics_plot((uint16_t) (ix + w - 6), (uint16_t) (iy + h - 4), color);
+            } else {
+                graphics_draw_line((int16_t) (ix + 5), (int16_t) (iy + 7), (int16_t) (ix + w - 5), (int16_t) (iy + h - 7), color);
+                graphics_draw_line((int16_t) (ix + w - 5), (int16_t) (iy + 7), (int16_t) (ix + 5), (int16_t) (iy + h - 7), color);
+            }
+        }
+        break;
     case GRAPHICS_ICON_SHORTCUT:
         graphics_draw_icon(ix, iy, GRAPHICS_ICON_APP, small);
         graphics_draw_shortcut_badge((uint16_t) (ix + (small ? 0 : 2)), (uint16_t) (iy + h - (small ? 9 : 16)), small);
@@ -2144,7 +2569,8 @@ static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind
         graphics_fill_soft_rect((uint16_t) (ix + 4), (uint16_t) (iy + 3), (uint16_t) (w - 8), (uint16_t) (h - 6), 0x00FFF7EB);
         graphics_draw_soft_rect_outline((uint16_t) (ix + 4), (uint16_t) (iy + 3), (uint16_t) (w - 8), (uint16_t) (h - 6), 0x00C06C2B);
         graphics_fill_soft_rect((uint16_t) (ix + w / 2 - 2), (uint16_t) (iy + 8), 4, 4, 0x00C06C2B);
-        graphics_fill_rect((uint16_t) (ix + w / 2 - 1), (uint16_t) (iy + 15), 2, (uint16_t) (h - 24), 0x00C06C2B);
+        graphics_fill_rect((uint16_t) (ix + w / 2 - 1), (uint16_t) (iy + 15), 2,
+                           small ? 1 : (uint16_t) (h - 24), 0x00C06C2B);
         break;
     case GRAPHICS_ICON_WINDOW:
         graphics_fill_soft_rect((uint16_t) (ix + 3), (uint16_t) (iy + 4), (uint16_t) (w - 6), (uint16_t) (h - 8), 0x00F7FBFF);
@@ -2161,6 +2587,39 @@ static void graphics_draw_icon(uint16_t x, uint16_t y, graphics_icon_kind_t kind
             graphics_fill_rect((uint16_t) (ix + 16), (uint16_t) (iy + 27), 16, 2, 0x00CAD8E8);
         }
         break;
+    }
+}
+
+static void graphics_draw_file_icon(uint16_t x, uint16_t y, const char *path, bool is_dir, bool small)
+{
+    char shortcut_target[GRAPHICS_CLIPBOARD_PATH_MAX];
+    const char *icon_path = path;
+    bool icon_is_dir = is_dir;
+    bool shortcut = false;
+    graphics_icon_kind_t kind;
+    uint32_t flags;
+    uint16_t box = small ? 18 : 48;
+
+    if (!is_dir && path != NULL &&
+        (graphics_path_has_suffix(path, ".lnk") || graphics_path_has_suffix(path, ".LNK"))) {
+        shortcut = true;
+        if (graphics_resolve_shortcut(path, shortcut_target, sizeof(shortcut_target))) {
+            icon_path = shortcut_target;
+            icon_is_dir = file_is_dir(icon_path);
+        }
+    }
+    kind = shortcut && icon_path == path ? GRAPHICS_ICON_APP : graphics_icon_kind_for_path(icon_path, icon_is_dir);
+    flags = graphics_icon_flags_for_path(icon_path, icon_is_dir);
+    graphics_draw_icon(x, y, kind, small);
+    if ((flags & GRAPHICS_ICON_FLAG_UAC) != 0) {
+        graphics_draw_uac_badge((uint16_t) (x + box - (small ? 9 : 15)),
+                                (uint16_t) (y + box - (small ? 9 : 15)),
+                                small);
+    }
+    if (shortcut) {
+        graphics_draw_shortcut_badge((uint16_t) (x + (small ? 0 : 2)),
+                                     (uint16_t) (y + box - (small ? 9 : 16)),
+                                     small);
     }
 }
 
@@ -2314,8 +2773,10 @@ static void graphics_window_set(ui_window_t *window, ui_window_kind_t kind, uint
     window->restore_y = y;
     window->restore_width = width;
     window->restore_height = height;
-    memset(window->title, 0, sizeof(window->title));
-    strcpy(window->title, title);
+    window->owner_pid = -1;
+    window->console_scroll_offset = 0;
+    window->console_scroll_manual = false;
+    strlcpy(window->title, title != NULL ? title : "", sizeof(window->title));
     graphics_window_keep_on_screen(window);
 }
 
@@ -2397,13 +2858,36 @@ static int32_t graphics_find_window(ui_window_kind_t kind)
     return -1;
 }
 
+static int32_t graphics_find_process_console_window(int32_t pid)
+{
+    for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
+        if (g_windows[i].visible &&
+            g_windows[i].kind == UI_WINDOW_PROCESS_CONSOLE &&
+            g_windows[i].owner_pid == pid) {
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
+static bool graphics_window_is_terminal(const ui_window_t *window)
+{
+    return window != NULL &&
+           (window->kind == UI_WINDOW_TERMINAL ||
+            window->kind == UI_WINDOW_PROCESS_CONSOLE);
+}
+
 static void graphics_open_window(ui_window_kind_t kind)
 {
     ui_window_t *window = NULL;
     uint32_t window_index = 0;
+    bool allow_multiple = kind == UI_WINDOW_TERMINAL ||
+                          kind == UI_WINDOW_NOTEPAD ||
+                          kind == UI_WINDOW_PLAYER ||
+                          kind == UI_WINDOW_CUBE3D;
 
     for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
-        if (g_windows[i].visible && g_windows[i].kind == kind) {
+        if (!allow_multiple && g_windows[i].visible && g_windows[i].kind == kind) {
             window = &g_windows[i];
             window_index = i;
             break;
@@ -2439,7 +2923,9 @@ static void graphics_open_window(ui_window_kind_t kind)
         graphics_fill_file_browser();
         break;
     case UI_WINDOW_TERMINAL:
-        graphics_window_set(window, kind, graphics_clamp_window_x(500), 128, 500, 286, "\u7ec8\u7aef");
+        graphics_window_set(window, kind, graphics_clamp_window_x((uint16_t) (500 + window_index * 20)), (uint16_t) (128 + window_index * 18), 500, 286, "\u63a7\u5236\u53f0");
+        window->console_scroll_manual = false;
+        window->console_scroll_offset = GRAPHICS_CONSOLE_ROWS;
         graphics_set_terminal_focus(true);
         break;
     case UI_WINDOW_RUN:
@@ -2457,7 +2943,7 @@ static void graphics_open_window(ui_window_kind_t kind)
     case UI_WINDOW_PLAYER:
         graphics_window_set(window, kind, graphics_clamp_window_x(370), 118, 370, 320, "\u64ad\u653e\u5668");
         if (g_player_current_path[0] == '\0') {
-            strcpy(g_player_current_path, "/");
+            strcpy(g_player_current_path, UI_ROOT_DESKTOP);
         }
         if (g_player_status[0] == '\0') {
             strcpy(g_player_status, "ready");
@@ -2467,7 +2953,7 @@ static void graphics_open_window(ui_window_kind_t kind)
         graphics_window_set(window, kind, graphics_clamp_window_x(540), 78, 540, 360, "\u8bb0\u4e8b\u672c");
         g_notepad_focus = true;
         if (g_notepad_path[0] == '\0') {
-            strcpy(g_notepad_path, "/home/root/desktop/note.txt");
+            strcpy(g_notepad_path, UI_ROOT_DESKTOP PATH_SEPARATOR_STR "note.txt");
             g_notepad_text[0] = '\0';
             g_notepad_len = 0;
         }
@@ -2500,9 +2986,120 @@ static void graphics_open_window(ui_window_kind_t kind)
     graphics_bring_window_to_front(window_index);
 }
 
+bool graphics_open_process_console_window(int32_t pid, const char *title)
+{
+    ui_window_t *window = NULL;
+    uint32_t window_index = 0;
+    int32_t existing_index;
+
+    if (!g_graphics_active || g_installer_mode || pid < 0) {
+        return false;
+    }
+
+    existing_index = graphics_find_process_console_window(pid);
+    if (existing_index >= 0) {
+        window = &g_windows[existing_index];
+        if (title != NULL && title[0] != '\0') {
+            strlcpy(window->title, title, sizeof(window->title));
+        }
+        window->minimized = false;
+        graphics_set_terminal_focus(true);
+        graphics_bring_window_to_front((uint32_t) existing_index);
+        graphics_draw_shell();
+        graphics_flush_gpu();
+        return true;
+    }
+
+    for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
+        if (!g_windows[i].visible) {
+            window = &g_windows[i];
+            window_index = i;
+            break;
+        }
+    }
+    if (window == NULL) {
+        return false;
+    }
+
+    graphics_window_set(window,
+                        UI_WINDOW_PROCESS_CONSOLE,
+                        graphics_clamp_window_x((uint16_t) (560 + window_index * 20)),
+                        (uint16_t) (128 + window_index * 18),
+                        560,
+                        286,
+                        title != NULL && title[0] != '\0' ? title : "console");
+    window->owner_pid = pid;
+    window->console_scroll_manual = false;
+    window->console_scroll_offset = GRAPHICS_CONSOLE_ROWS;
+    graphics_set_terminal_focus(true);
+    graphics_bring_window_to_front(window_index);
+    graphics_draw_shell();
+    graphics_flush_gpu();
+    return true;
+}
+
+void graphics_close_process_console_window(int32_t pid)
+{
+    int32_t index = graphics_find_process_console_window(pid);
+
+    if (index < 0) {
+        return;
+    }
+    graphics_close_window((uint32_t) index);
+    graphics_draw_shell();
+    graphics_flush_gpu();
+}
+
+void graphics_mark_process_console_finished(int32_t pid, int32_t exit_code)
+{
+    int32_t index;
+    char suffix[24];
+    char code[12];
+
+    if (pid < 0) {
+        return;
+    }
+    index = graphics_find_process_console_window(pid);
+    if (index < 0) {
+        return;
+    }
+    if (exit_code < 0) {
+        graphics_u32_to_dec(code, (uint32_t) (-(exit_code + 1)) + 1U);
+    } else {
+        graphics_u32_to_dec(code, (uint32_t) exit_code);
+    }
+    strcpy(suffix, exit_code < 0 ? " [exit -" : " [exit ");
+    strcpy(suffix + strlen(suffix), code);
+    strcpy(suffix + strlen(suffix), "]");
+    if (strlen(g_windows[index].title) + strlen(suffix) + 1 < sizeof(g_windows[index].title)) {
+        strcpy(g_windows[index].title + strlen(g_windows[index].title), suffix);
+    }
+    graphics_set_terminal_focus(false);
+    graphics_draw_shell();
+    graphics_flush_gpu();
+}
+
+bool graphics_set_process_console_window_title(int32_t pid, const char *title)
+{
+    int32_t index;
+
+    if (pid < 0 || title == NULL || title[0] == '\0') {
+        return false;
+    }
+    index = graphics_find_process_console_window(pid);
+    if (index < 0) {
+        return false;
+    }
+    strlcpy(g_windows[index].title, title, sizeof(g_windows[index].title));
+    graphics_draw_shell();
+    graphics_flush_gpu();
+    return true;
+}
+
 static void graphics_close_window(uint32_t index)
 {
     ui_window_kind_t kind;
+    int32_t owner_pid;
 
     if (index >= UI_WINDOW_MAX) {
         return;
@@ -2511,9 +3108,12 @@ static void graphics_close_window(uint32_t index)
         return;
     }
     kind = g_windows[index].kind;
+    owner_pid = g_windows[index].owner_pid;
     g_windows[index].visible = false;
     g_windows[index].minimized = false;
     g_windows[index].maximized = false;
+    g_windows[index].owner_pid = -1;
+    g_windows[index].title[0] = '\0';
     if (g_dragging_window && g_drag_window_index == index) {
         g_dragging_window = false;
     }
@@ -2522,8 +3122,19 @@ static void graphics_close_window(uint32_t index)
         g_run_input_len = 0;
         g_run_input[0] = '\0';
     }
-    if (kind == UI_WINDOW_TERMINAL) {
-        graphics_set_terminal_focus(false);
+    if (kind == UI_WINDOW_TERMINAL || kind == UI_WINDOW_PROCESS_CONSOLE) {
+        bool terminal_visible = false;
+
+        for (uint32_t i = 0; i < UI_WINDOW_MAX; i++) {
+            if (g_windows[i].visible && g_windows[i].kind == UI_WINDOW_TERMINAL) {
+                terminal_visible = true;
+                break;
+            }
+        }
+        graphics_set_terminal_focus(terminal_visible);
+    }
+    if (kind == UI_WINDOW_PROCESS_CONSOLE && owner_pid >= 0) {
+        console_destroy_for_pid(owner_pid);
     }
     if (kind == UI_WINDOW_NOTEPAD) {
         g_notepad_focus = false;
@@ -2630,85 +3241,202 @@ static void graphics_wait_ticks(uint64_t wait_ticks)
     }
 }
 
-static void graphics_draw_boot_frame(uint32_t progress, uint32_t phase)
-{
-    const uint16_t bar_w = 320;
-    const uint16_t bar_h = 14;
-    const uint16_t bar_x = (FB_WIDTH - bar_w) / 2;
-    const uint16_t bar_y = FB_HEIGHT - 80;
-    uint16_t filled_w;
+static uint16_t graphics_read_le16(const uint8_t *data);
+static uint32_t graphics_read_le32(const uint8_t *data);
 
-    if (progress > 100) {
-        progress = 100;
+static bool graphics_load_boot_image_asset(void)
+{
+    uint8_t *data;
+    int32_t size;
+    uint32_t pixel_offset;
+    uint32_t dib_size;
+    int32_t width;
+    int32_t raw_height;
+    uint32_t height;
+    uint32_t stride;
+    bool top_down;
+
+    if (g_boot_image_attempted) {
+        return g_boot_image_loaded;
+    }
+    g_boot_image_attempted = true;
+    size = file_size(UI_BOOT_IMAGE_PATH);
+    if (size <= 54 || (uint32_t) size > GRAPHICS_BOOT_IMAGE_MAX_BYTES) {
+        return false;
+    }
+    data = (uint8_t *) kmalloc((uint32_t) size);
+    if (data == NULL) {
+        return false;
+    }
+    if (file_read(UI_BOOT_IMAGE_PATH, data, (uint32_t) size) != size) {
+        kfree(data);
+        return false;
+    }
+    if (data[0] != 'B' || data[1] != 'M') {
+        kfree(data);
+        return false;
     }
 
-    graphics_fill_vertical_gradient(0x00000000, 0x000A1628);
-    graphics_draw_text_aligned(0, (uint16_t) (FB_HEIGHT / 2 - 56), FB_WIDTH, "MoniOS", 0x00FFFFFF);
-    graphics_draw_text_aligned(0, (uint16_t) (FB_HEIGHT / 2 - 26), FB_WIDTH, "Starting up", 0x0085B7E8);
+    pixel_offset = graphics_read_le32(data + 10);
+    dib_size = graphics_read_le32(data + 14);
+    width = (int32_t) graphics_read_le32(data + 18);
+    raw_height = (int32_t) graphics_read_le32(data + 22);
+    if (dib_size < 40 || width <= 0 || raw_height == 0 ||
+        width > GRAPHICS_BOOT_IMAGE_MAX_WIDTH ||
+        raw_height > GRAPHICS_BOOT_IMAGE_MAX_HEIGHT ||
+        raw_height < -(int32_t) GRAPHICS_BOOT_IMAGE_MAX_HEIGHT ||
+        graphics_read_le16(data + 26) != 1 ||
+        graphics_read_le16(data + 28) != 24 ||
+        graphics_read_le32(data + 30) != 0) {
+        kfree(data);
+        return false;
+    }
 
-    graphics_fill_rect(bar_x - 1, bar_y - 1, bar_w + 2, bar_h + 2, 0x004A4A4A);
-    graphics_fill_rect(bar_x, bar_y, bar_w, bar_h, 0x001A1A1A);
+    top_down = raw_height < 0;
+    height = top_down ? (uint32_t) -raw_height : (uint32_t) raw_height;
+    stride = (((uint32_t) width * 3U) + 3U) & ~3U;
+    if (pixel_offset > (uint32_t) size || stride == 0 || height == 0 ||
+        stride > ((uint32_t) size - pixel_offset) / height) {
+        kfree(data);
+        return false;
+    }
 
-    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + 1), (uint16_t) (bar_w - 2), 1, 0x00606060);
-    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + bar_h - 2), (uint16_t) (bar_w - 2), 1, 0x00303030);
-    graphics_fill_rect((uint16_t) (bar_x + 1), (uint16_t) (bar_y + 1), 1, (uint16_t) (bar_h - 2), 0x00606060);
-    graphics_fill_rect((uint16_t) (bar_x + bar_w - 2), (uint16_t) (bar_y + 1), 1, (uint16_t) (bar_h - 2), 0x00303030);
+    for (uint32_t y = 0; y < height; y++) {
+        uint32_t source_y = top_down ? y : height - 1U - y;
+        const uint8_t *row = data + pixel_offset + source_y * stride;
 
-    filled_w = (uint16_t) ((progress * (bar_w - 4)) / 100);
-
-    if (filled_w > 0) {
-        uint16_t inner_y = (uint16_t) (bar_y + 2);
-        uint16_t inner_h = (uint16_t) (bar_h - 4);
-
-        for (uint16_t y = 0; y < inner_h; y++) {
-            uint32_t color = graphics_lerp_color(0x000058C8, 0x004CC8FF, y, inner_h > 1 ? inner_h - 1 : 1);
-            graphics_fill_rect((uint16_t) (bar_x + 2), (uint16_t) (inner_y + y), filled_w, 1, color);
+        for (uint32_t x = 0; x < (uint32_t) width; x++) {
+            uint8_t b = row[x * 3U];
+            uint8_t g = row[x * 3U + 1U];
+            uint8_t r = row[x * 3U + 2U];
+            g_boot_image_pixels[y * GRAPHICS_BOOT_IMAGE_MAX_WIDTH + x] =
+                ((uint32_t) r << 16) | ((uint32_t) g << 8) | b;
         }
-        for (uint16_t x = 0; x < filled_w; x++) {
-            uint32_t wave = (x + phase) % 64u;
-            if (wave < 20u) {
-                uint32_t color = graphics_lerp_color(0x0040C0FF, 0x00B8E8FF, wave, 19u);
-                graphics_fill_rect((uint16_t) (bar_x + 2 + x), inner_y, 1, inner_h, color);
-            } else if (wave < 36u) {
-                uint32_t color = graphics_lerp_color(0x00B8E8FF, 0x0040C0FF, wave - 20u, 15u);
-                graphics_fill_rect((uint16_t) (bar_x + 2 + x), inner_y, 1, inner_h, color);
+    }
+    g_boot_image_width = (uint16_t) width;
+    g_boot_image_height = (uint16_t) height;
+    g_boot_image_loaded = true;
+    kfree(data);
+    log_write("graphics: boot image loaded");
+    return true;
+}
+
+bool graphics_boot_load_image(void)
+{
+    return graphics_load_boot_image_asset();
+}
+
+static void graphics_draw_boot_image(uint32_t brightness)
+{
+    uint32_t scaled_width;
+    uint32_t scaled_height;
+    uint32_t crop_x = 0;
+    uint32_t crop_y = 0;
+
+    if (!g_boot_image_loaded || g_boot_image_width == 0 || g_boot_image_height == 0) {
+        graphics_fill(0x00000000);
+        return;
+    }
+    if (brightness > 100U) {
+        brightness = 100U;
+    }
+
+    if ((uint64_t) FB_WIDTH * g_boot_image_height >=
+        (uint64_t) FB_HEIGHT * g_boot_image_width) {
+        scaled_width = FB_WIDTH;
+        scaled_height = ((uint32_t) FB_WIDTH * g_boot_image_height) / g_boot_image_width;
+        crop_y = scaled_height > FB_HEIGHT ? (scaled_height - FB_HEIGHT) / 2U : 0;
+    } else {
+        scaled_height = FB_HEIGHT;
+        scaled_width = ((uint32_t) FB_HEIGHT * g_boot_image_width) / g_boot_image_height;
+        crop_x = scaled_width > FB_WIDTH ? (scaled_width - FB_WIDTH) / 2U : 0;
+    }
+    if (scaled_width == 0 || scaled_height == 0) {
+        graphics_fill(0x00000000);
+        return;
+    }
+
+    for (uint16_t y = 0; y < FB_HEIGHT; y++) {
+        uint32_t source_y = (((uint32_t) y + crop_y) * g_boot_image_height) / scaled_height;
+        if (source_y >= g_boot_image_height) {
+            source_y = g_boot_image_height - 1U;
+        }
+        for (uint16_t x = 0; x < FB_WIDTH; x++) {
+            uint32_t source_x = (((uint32_t) x + crop_x) * g_boot_image_width) / scaled_width;
+            uint32_t color;
+            uint32_t r;
+            uint32_t g;
+            uint32_t b;
+
+            if (source_x >= g_boot_image_width) {
+                source_x = g_boot_image_width - 1U;
             }
+            color = g_boot_image_pixels[source_y * GRAPHICS_BOOT_IMAGE_MAX_WIDTH + source_x];
+            r = (((color >> 16) & 0xFFU) * brightness) / 100U;
+            g = (((color >> 8) & 0xFFU) * brightness) / 100U;
+            b = ((color & 0xFFU) * brightness) / 100U;
+            graphics_plot(x, y, (r << 16) | (g << 8) | b);
         }
-        graphics_fill_rect((uint16_t) (bar_x + 2), inner_y, filled_w, 2, 0x0080D0FF);
-        graphics_fill_rect((uint16_t) (bar_x + 2), (uint16_t) (inner_y + inner_h - 2), filled_w, 1, 0x000060CC);
+    }
+}
+
+static void graphics_boot_show_brightness(uint32_t brightness)
+{
+    graphics_draw_boot_image(brightness);
+    graphics_present();
+}
+
+static void graphics_boot_delay(void)
+{
+    for (volatile uint32_t delay = 0; delay < GRAPHICS_BOOT_FADE_DELAY; delay++) {
+        asm volatile ("pause");
     }
 }
 
 static void graphics_show_boot_loading_screen(void)
 {
-    graphics_draw_boot_frame(8, 0);
-    graphics_present();
+    graphics_boot_show_brightness(g_boot_image_loaded ? 100U : 0U);
 }
 
 void graphics_boot_animation(void)
 {
-    const uint32_t frames = 72u;
-
     if (!g_graphics_active) {
         return;
     }
+    graphics_show_boot_loading_screen();
+}
 
-    asm volatile ("cli");
-    for (uint32_t frame = 0; frame <= frames; frame++) {
-        uint32_t progress = 8u + (frame * 92u) / frames;
-        uint32_t phase = (frame * 7u) % 64u;
-
-        if (progress > 100u) {
-            progress = 100u;
-        }
-        graphics_draw_boot_frame(progress, phase);
-        graphics_present();
-        for (volatile uint32_t delay = 0; delay < 24000u; delay++) {
-            asm volatile ("pause");
-        }
+void graphics_boot_update(uint32_t progress, const char *status)
+{
+    (void) progress;
+    (void) status;
+    if (!g_graphics_active) {
+        return;
     }
-    for (volatile uint32_t delay = 0; delay < 300000u; delay++) {
-        asm volatile ("pause");
+    graphics_show_boot_loading_screen();
+}
+
+void graphics_boot_finish(void)
+{
+    if (!g_graphics_active) {
+        return;
+    }
+    if (!g_boot_image_loaded && !graphics_boot_load_image()) {
+        graphics_boot_show_brightness(0);
+        return;
+    }
+
+    for (uint32_t frame = 0; frame <= GRAPHICS_BOOT_FADE_STEPS; frame++) {
+        graphics_boot_show_brightness(100U - (frame * 100U) / GRAPHICS_BOOT_FADE_STEPS);
+        graphics_boot_delay();
+    }
+    for (uint32_t frame = 0; frame <= GRAPHICS_BOOT_FADE_STEPS; frame++) {
+        graphics_boot_show_brightness((frame * 100U) / GRAPHICS_BOOT_FADE_STEPS);
+        graphics_boot_delay();
+    }
+    for (uint32_t frame = 0; frame <= GRAPHICS_BOOT_FADE_STEPS; frame++) {
+        graphics_boot_show_brightness(100U - (frame * 100U) / GRAPHICS_BOOT_FADE_STEPS);
+        graphics_boot_delay();
     }
 }
 
@@ -2755,12 +3483,391 @@ void graphics_draw_bsod(const char *process, const char *code, const char *text,
     graphics_present();
 }
 
+static uint16_t graphics_read_le16(const uint8_t *data)
+{
+    return (uint16_t) data[0] | ((uint16_t) data[1] << 8);
+}
+
+static uint32_t graphics_read_le32(const uint8_t *data)
+{
+    return (uint32_t) data[0] |
+           ((uint32_t) data[1] << 8) |
+           ((uint32_t) data[2] << 16) |
+           ((uint32_t) data[3] << 24);
+}
+
+static bool graphics_cursor_decode_dib(const uint8_t *data, uint32_t size,
+                                       uint16_t entry_width, uint16_t entry_height,
+                                       uint16_t hotspot_x, uint16_t hotspot_y)
+{
+    uint32_t dib_size;
+    int32_t dib_width;
+    int32_t dib_height;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t visible_height;
+    uint16_t planes;
+    uint16_t bpp;
+    uint32_t compression;
+    uint32_t colors_used = 0;
+    uint32_t color_entries = 0;
+    uint32_t pixel_offset;
+    uint32_t xor_stride;
+    uint32_t and_stride;
+    uint32_t xor_bytes;
+    uint32_t and_offset;
+    uint16_t dest_width;
+    uint16_t dest_height;
+    bool top_down;
+    bool has_alpha = false;
+
+    if (data == NULL || size < 40) {
+        return false;
+    }
+    dib_size = graphics_read_le32(data);
+    if (dib_size < 40 || dib_size > size) {
+        return false;
+    }
+    dib_width = (int32_t) graphics_read_le32(data + 4);
+    dib_height = (int32_t) graphics_read_le32(data + 8);
+    planes = graphics_read_le16(data + 12);
+    bpp = graphics_read_le16(data + 14);
+    compression = graphics_read_le32(data + 16);
+    if (dib_size >= 40) {
+        colors_used = graphics_read_le32(data + 32);
+    }
+    if (dib_width <= 0 || dib_height == 0 || planes != 1 ||
+        compression != 0 || (bpp != 32 && bpp != 24)) {
+        return false;
+    }
+
+    source_width = (uint32_t) dib_width;
+    source_height = dib_height < 0 ? (uint32_t) -dib_height : (uint32_t) dib_height;
+    top_down = dib_height < 0;
+    visible_height = source_height;
+    if (entry_height != 0 && source_height >= (uint32_t) entry_height * 2U) {
+        visible_height = (uint32_t) entry_height;
+    } else if ((source_height & 1U) == 0 && source_height / 2U <= 256U) {
+        visible_height = source_height / 2U;
+    }
+    if (visible_height == 0 || source_width == 0) {
+        return false;
+    }
+    if (source_width > 256U || visible_height > 256U) {
+        return false;
+    }
+
+    if (bpp <= 8) {
+        color_entries = colors_used != 0 ? colors_used : (1U << bpp);
+    }
+    pixel_offset = dib_size + color_entries * 4U;
+    xor_stride = (((source_width * (uint32_t) bpp) + 31U) / 32U) * 4U;
+    and_stride = ((source_width + 31U) / 32U) * 4U;
+    if (pixel_offset > size || xor_stride == 0 || visible_height == 0 ||
+        xor_stride > (size - pixel_offset) / visible_height) {
+        return false;
+    }
+    xor_bytes = xor_stride * visible_height;
+    and_offset = pixel_offset + xor_bytes;
+
+    if (bpp == 32) {
+        for (uint32_t sy = 0; sy < visible_height && !has_alpha; sy++) {
+            uint32_t row_index = top_down ? sy : visible_height - 1U - sy;
+            const uint8_t *row = data + pixel_offset + row_index * xor_stride;
+
+            for (uint32_t sx = 0; sx < source_width; sx++) {
+                if (row[sx * 4U + 3U] != 0) {
+                    has_alpha = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    dest_width = (uint16_t) (source_width > GRAPHICS_CURSOR_MAX_WIDTH ? GRAPHICS_CURSOR_MAX_WIDTH : source_width);
+    dest_height = (uint16_t) (visible_height > GRAPHICS_CURSOR_MAX_HEIGHT ? GRAPHICS_CURSOR_MAX_HEIGHT : visible_height);
+    if (dest_width == 0 || dest_height == 0) {
+        return false;
+    }
+
+    memset(g_windows_cursor_pixels, 0, sizeof(g_windows_cursor_pixels));
+    for (uint16_t dy = 0; dy < dest_height; dy++) {
+        uint32_t sy = ((uint32_t) dy * visible_height) / dest_height;
+        uint32_t row_index = top_down ? sy : visible_height - 1U - sy;
+        const uint8_t *row = data + pixel_offset + row_index * xor_stride;
+        const uint8_t *mask = NULL;
+
+        if (and_offset <= size && and_stride != 0 &&
+            and_stride <= (size - and_offset) / visible_height) {
+            mask = data + and_offset + row_index * and_stride;
+        }
+        for (uint16_t dx = 0; dx < dest_width; dx++) {
+            uint32_t sx = ((uint32_t) dx * source_width) / dest_width;
+            const uint8_t *pixel = row + sx * (bpp / 8U);
+            uint8_t alpha = 0xFF;
+            uint32_t color;
+
+            if (bpp == 32 && has_alpha) {
+                alpha = pixel[3];
+            }
+            if (mask != NULL && (mask[sx / 8U] & (uint8_t) (0x80U >> (sx & 7U))) != 0) {
+                alpha = 0;
+            }
+            if (alpha == 0) {
+                color = 0;
+            } else {
+                color = 0xFF000000U |
+                        ((uint32_t) pixel[2] << 16) |
+                        ((uint32_t) pixel[1] << 8) |
+                        (uint32_t) pixel[0];
+            }
+            g_windows_cursor_pixels[(uint32_t) dy * GRAPHICS_CURSOR_MAX_WIDTH + dx] = color;
+        }
+    }
+
+    g_windows_cursor_width = dest_width;
+    g_windows_cursor_height = dest_height;
+    g_windows_cursor_hotspot_x = hotspot_x < dest_width ? hotspot_x : 0;
+    g_windows_cursor_hotspot_y = hotspot_y < dest_height ? hotspot_y : 0;
+    return true;
+}
+
+static bool graphics_load_windows_cursor_asset(void)
+{
+    uint8_t *data;
+    int32_t size;
+    uint16_t type;
+    uint16_t count;
+    uint32_t best_index = 0xFFFFFFFFU;
+    uint32_t best_score = 0xFFFFFFFFU;
+
+    if (g_windows_cursor_loaded) {
+        return true;
+    }
+    if (g_windows_cursor_attempted) {
+        return false;
+    }
+
+    size = file_size(UI_CURSOR_ASSET_PATH);
+    if (size <= 0) {
+        if (file_exists(UI_CURSOR_ASSET_PATH)) {
+            g_windows_cursor_attempted = true;
+        }
+        return false;
+    }
+    g_windows_cursor_attempted = true;
+    if ((uint32_t) size < 22U || (uint32_t) size > GRAPHICS_CURSOR_ASSET_MAX_BYTES) {
+        return false;
+    }
+    data = (uint8_t *) kmalloc((uint32_t) size);
+    if (data == NULL) {
+        return false;
+    }
+    if (file_read(UI_CURSOR_ASSET_PATH, data, (uint32_t) size) != size) {
+        kfree(data);
+        return false;
+    }
+
+    type = graphics_read_le16(data + 2);
+    count = graphics_read_le16(data + 4);
+    if (graphics_read_le16(data) != 0 || type != 2 || count == 0 ||
+        count > 32 || 6U + (uint32_t) count * 16U > (uint32_t) size) {
+        kfree(data);
+        return false;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *entry = data + 6U + i * 16U;
+        uint32_t width = entry[0] == 0 ? 256U : entry[0];
+        uint32_t height = entry[1] == 0 ? 256U : entry[1];
+        uint32_t bytes = graphics_read_le32(entry + 8);
+        uint32_t offset = graphics_read_le32(entry + 12);
+        uint32_t score;
+
+        if (bytes == 0 || offset >= (uint32_t) size || bytes > (uint32_t) size - offset) {
+            continue;
+        }
+        if (width <= GRAPHICS_CURSOR_MAX_WIDTH && height <= GRAPHICS_CURSOR_MAX_HEIGHT) {
+            score = (GRAPHICS_CURSOR_MAX_WIDTH - width) + (GRAPHICS_CURSOR_MAX_HEIGHT - height);
+        } else {
+            score = 1000U + width + height;
+        }
+        if (score < best_score) {
+            best_score = score;
+            best_index = i;
+        }
+    }
+    if (best_index == 0xFFFFFFFFU) {
+        kfree(data);
+        return false;
+    }
+
+    {
+        const uint8_t *entry = data + 6U + best_index * 16U;
+        uint16_t entry_width = entry[0] == 0 ? 256U : entry[0];
+        uint16_t entry_height = entry[1] == 0 ? 256U : entry[1];
+        uint16_t hotspot_x = graphics_read_le16(entry + 4);
+        uint16_t hotspot_y = graphics_read_le16(entry + 6);
+        uint32_t bytes = graphics_read_le32(entry + 8);
+        uint32_t offset = graphics_read_le32(entry + 12);
+
+        if (offset + 8U <= (uint32_t) size &&
+            data[offset] == 0x89 && data[offset + 1] == 'P' && data[offset + 2] == 'N' && data[offset + 3] == 'G') {
+            kfree(data);
+            return false;
+        }
+        if (!graphics_cursor_decode_dib(data + offset, bytes, entry_width, entry_height, hotspot_x, hotspot_y)) {
+            kfree(data);
+            return false;
+        }
+    }
+
+    g_windows_cursor_loaded = true;
+    log_write("graphics: windows cursor loaded");
+    kfree(data);
+    return true;
+}
+
+static bool graphics_windows_cursor_ready(void)
+{
+    return g_windows_cursor_loaded || graphics_load_windows_cursor_asset();
+}
+
+static bool graphics_cursor_use_windows_asset(void)
+{
+    return g_cursor_style_index == 0 && graphics_windows_cursor_ready();
+}
+
+static bool graphics_load_wallpaper_asset(void)
+{
+    uint8_t *data;
+    int32_t size;
+    uint32_t pixel_offset;
+    uint32_t dib_size;
+    int32_t width;
+    int32_t raw_height;
+    uint32_t height;
+    uint32_t stride;
+    bool top_down;
+
+    if (g_wallpaper_attempted) {
+        return g_wallpaper_loaded;
+    }
+    g_wallpaper_attempted = true;
+    size = file_size(UI_WALLPAPER_PATH);
+    if (size <= 54 || (uint32_t) size > GRAPHICS_WALLPAPER_MAX_BYTES) {
+        return false;
+    }
+    data = (uint8_t *) kmalloc((uint32_t) size);
+    if (data == NULL) {
+        return false;
+    }
+    if (file_read(UI_WALLPAPER_PATH, data, (uint32_t) size) != size) {
+        kfree(data);
+        return false;
+    }
+    if (data[0] != 'B' || data[1] != 'M') {
+        kfree(data);
+        return false;
+    }
+    pixel_offset = graphics_read_le32(data + 10);
+    dib_size = graphics_read_le32(data + 14);
+    width = (int32_t) graphics_read_le32(data + 18);
+    raw_height = (int32_t) graphics_read_le32(data + 22);
+    if (dib_size < 40 || width <= 0 || raw_height == 0 ||
+        width > GRAPHICS_WALLPAPER_MAX_WIDTH ||
+        raw_height > GRAPHICS_WALLPAPER_MAX_HEIGHT ||
+        raw_height < -(int32_t) GRAPHICS_WALLPAPER_MAX_HEIGHT ||
+        graphics_read_le16(data + 26) != 1 ||
+        graphics_read_le16(data + 28) != 24 ||
+        graphics_read_le32(data + 30) != 0) {
+        kfree(data);
+        return false;
+    }
+    top_down = raw_height < 0;
+    height = top_down ? (uint32_t) -raw_height : (uint32_t) raw_height;
+    stride = (((uint32_t) width * 3U) + 3U) & ~3U;
+    if (pixel_offset > (uint32_t) size || stride == 0 || height == 0 ||
+        stride > ((uint32_t) size - pixel_offset) / height) {
+        kfree(data);
+        return false;
+    }
+    for (uint32_t y = 0; y < height; y++) {
+        uint32_t source_y = top_down ? y : height - 1U - y;
+        const uint8_t *row = data + pixel_offset + source_y * stride;
+
+        for (uint32_t x = 0; x < (uint32_t) width; x++) {
+            uint8_t b = row[x * 3U];
+            uint8_t g = row[x * 3U + 1U];
+            uint8_t r = row[x * 3U + 2U];
+            g_wallpaper_pixels[y * GRAPHICS_WALLPAPER_MAX_WIDTH + x] =
+                ((uint32_t) r << 16) | ((uint32_t) g << 8) | b;
+        }
+    }
+    g_wallpaper_width = (uint16_t) width;
+    g_wallpaper_height = (uint16_t) height;
+    g_wallpaper_loaded = true;
+    kfree(data);
+    return true;
+}
+
+static bool graphics_draw_wallpaper_asset(uint16_t height)
+{
+    uint32_t scaled_width;
+    uint32_t scaled_height;
+    uint32_t crop_x = 0;
+    uint32_t crop_y = 0;
+
+    if (height == 0 || !graphics_load_wallpaper_asset()) {
+        return false;
+    }
+
+    if ((uint64_t) FB_WIDTH * g_wallpaper_height >=
+        (uint64_t) height * g_wallpaper_width) {
+        scaled_width = FB_WIDTH;
+        scaled_height = ((uint32_t) FB_WIDTH * g_wallpaper_height) / g_wallpaper_width;
+        crop_y = scaled_height > height ? (scaled_height - height) / 2U : 0;
+    } else {
+        scaled_height = height;
+        scaled_width = ((uint32_t) height * g_wallpaper_width) / g_wallpaper_height;
+        crop_x = scaled_width > FB_WIDTH ? (scaled_width - FB_WIDTH) / 2U : 0;
+    }
+    if (scaled_width == 0 || scaled_height == 0) {
+        return false;
+    }
+
+    for (uint16_t y = 0; y < height; y++) {
+        uint32_t sy = (((uint32_t) y + crop_y) * g_wallpaper_height) / scaled_height;
+
+        if (sy >= g_wallpaper_height) {
+            sy = g_wallpaper_height - 1U;
+        }
+        for (uint16_t x = 0; x < FB_WIDTH; x++) {
+            uint32_t sx = (((uint32_t) x + crop_x) * g_wallpaper_width) / scaled_width;
+
+            if (sx >= g_wallpaper_width) {
+                sx = g_wallpaper_width - 1U;
+            }
+            graphics_plot(x, y, g_wallpaper_pixels[sy * GRAPHICS_WALLPAPER_MAX_WIDTH + sx]);
+        }
+    }
+    return true;
+}
 static void graphics_draw_desktop(void)
 {
     uint16_t usable_h = (uint16_t) (FB_HEIGHT > TASKBAR_HEIGHT ? FB_HEIGHT - TASKBAR_HEIGHT : FB_HEIGHT);
     uint16_t center_x = (uint16_t) (FB_WIDTH / 2);
     uint16_t fold_w = (uint16_t) (FB_WIDTH / 3);
     uint16_t fold_h = (uint16_t) (usable_h / 2);
+
+    if (graphics_draw_wallpaper_asset(usable_h)) {
+        graphics_fill_rect_gradient(0, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT), FB_WIDTH, TASKBAR_HEIGHT, 0x00F7FBFF, UI_COLOR_TASKBAR);
+        for (uint16_t x = 0; x < FB_WIDTH; x++) {
+            graphics_plot(x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT), UI_COLOR_TASKBAR_EDGE);
+            graphics_plot(x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 1), 0x00FFFFFF);
+        }
+        return;
+    }
 
     graphics_fill_vertical_gradient(0x000B1024, 0x00244CA8);
     for (uint16_t y = 0; y < usable_h; y++) {
@@ -2851,20 +3958,19 @@ static void graphics_draw_desktop_icons(void)
         char label[GRAPHICS_FILE_NAME_MAX];
         uint16_t x;
         uint16_t y;
-        graphics_icon_kind_t icon_kind;
         bool selected = g_last_click_source == UI_CLICK_SOURCE_DESKTOP && g_last_click_index == i;
-        uint32_t tile_fill = selected ? 0x002D5D9F : 0x001C2B49;
-        uint32_t tile_border = selected ? 0x008BC5FF : 0x004A7AC0;
-        uint32_t label_fill = selected ? 0x003C6FEA : 0x0015263F;
 
         graphics_desktop_icon_position(i, &x, &y);
         graphics_build_desktop_entry_path(i, path);
-        icon_kind = graphics_icon_kind_for_path(path, g_desktop_entries[i].is_dir);
         graphics_make_display_label(g_desktop_entries[i].name, label, sizeof(label));
-        graphics_fill_soft_rect((uint16_t) (x + 6), y, 62, 74, tile_fill);
-        graphics_draw_soft_rect_outline((uint16_t) (x + 6), y, 62, 74, tile_border);
-        graphics_draw_icon((uint16_t) (x + 13), (uint16_t) (y + 5), icon_kind, false);
-        graphics_fill_soft_rect((uint16_t) (x + 2), (uint16_t) (y + 56), (uint16_t) (DESKTOP_ICON_W - 4), 18, label_fill);
+        if (selected) {
+            graphics_fill_soft_rect((uint16_t) (x + 4), y, 66, 74, 0x004C83C6);
+            graphics_draw_soft_rect_outline((uint16_t) (x + 4), y, 66, 74, 0x00B8E2FF);
+        }
+        graphics_draw_file_icon((uint16_t) (x + 13), (uint16_t) (y + 5),
+                                path, g_desktop_entries[i].is_dir, false);
+        graphics_draw_text_aligned((uint16_t) (x + 1), (uint16_t) (y + 62),
+                                   DESKTOP_ICON_W, label, 0x00344A5C);
         graphics_draw_text_aligned(x, (uint16_t) (y + 61), DESKTOP_ICON_W, label, 0x00FFFFFF);
     }
 }
@@ -2983,12 +4089,20 @@ static void graphics_draw_taskbar_status(void)
     char time_text[9];
     char date_text[11];
     uint16_t panel_x = FB_WIDTH - 174;
+    graphics_icon_kind_t net_icon = GRAPHICS_ICON_NETWORK_OFFLINE;
+    ui_network_state_t net_state = ui_network_state();
+
+    if (net_state == UI_NETWORK_CONNECTED) {
+        net_icon = GRAPHICS_ICON_NETWORK_CONNECTED;
+    } else if (net_state == UI_NETWORK_LIMITED || net_state == UI_NETWORK_VALIDATING) {
+        net_icon = GRAPHICS_ICON_NETWORK_LIMITED;
+    }
 
     cmos_read_time(&now);
     graphics_fill_soft_rect(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 7), 162, 38, 0x00FFFFFF);
     graphics_draw_soft_rect_outline(panel_x, (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 7), 162, 38, 0x00D7E2EF);
 
-    graphics_draw_text((uint16_t) (panel_x + 10), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 15), net_connected() ? "OK" : "/", net_connected() ? 0x002E8B57 : 0x00B7791F);
+    graphics_draw_icon((uint16_t) (panel_x + 12), (uint16_t) (FB_HEIGHT - TASKBAR_HEIGHT + 16), net_icon, true);
 
     graphics_two_digits(&time_text[0], now.hour);
     time_text[2] = ':';
@@ -3202,7 +4316,7 @@ static void graphics_draw_control_panel_window(const ui_window_t *window)
     strcpy(line + strlen(line), " rx ");
     graphics_u32_to_dec(line + strlen(line), info->ping_replies);
     graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 292), line, 0x004A6278);
-    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 312), net_status(), 0x004A6278);
+    graphics_draw_text((uint16_t) (window->x + 238), (uint16_t) (window->y + 312), ui_network_label(), 0x004A6278);
 }
 
 static void graphics_draw_logon_window(const ui_window_t *window)
@@ -3212,9 +4326,17 @@ static void graphics_draw_logon_window(const ui_window_t *window)
     uint16_t input_x;
     uint16_t user_x;
     uint16_t button_x;
+    bool wallpaper_loaded;
 
     if (window == NULL) {
         return;
+    }
+    /* Windows 11 style full-screen login surface. */
+    wallpaper_loaded = graphics_draw_wallpaper_asset(FB_HEIGHT);
+    if (!wallpaper_loaded) {
+        graphics_fill_vertical_gradient(0x001D4F8F, 0x00091424);
+        graphics_fill_rect_gradient(0, 0, FB_WIDTH, 96, 0x00142432, 0x00091424);
+        graphics_fill_rect_gradient(0, (uint16_t) (FB_HEIGHT > 120 ? FB_HEIGHT - 120 : 0), FB_WIDTH, 120, 0x00091424, 0x001B314D);
     }
     card_x = window->x;
     card_y = window->y;
@@ -3252,9 +4374,49 @@ static void graphics_draw_logon_window(const ui_window_t *window)
     graphics_fill_soft_rect(button_x, (uint16_t) (card_y + 222), 128, 30, UI_COLOR_ACCENT);
     graphics_draw_soft_rect_outline(button_x, (uint16_t) (card_y + 222), 128, 30, 0x00B7D8FF);
     graphics_draw_text_aligned(button_x, (uint16_t) (card_y + 231), 128, "Sign in", 0x00FFFFFF);
-    if (g_login_error) {
+    if (session_auth_locked()) {
+        graphics_draw_text_aligned(card_x, (uint16_t) (card_y + 262), window->width, "Too many attempts. Try again shortly.", 0x00C0392B);
+    } else if (g_login_error) {
         graphics_draw_text_aligned(card_x, (uint16_t) (card_y + 262), window->width, "Invalid password", 0x00C0392B);
     }
+}
+
+static void graphics_draw_scrollbar(uint16_t x, uint16_t y, uint16_t height,
+                                    uint32_t total, uint32_t visible, uint32_t offset,
+                                    bool dark)
+{
+    uint16_t thumb_height;
+    uint16_t thumb_y;
+    uint32_t max_offset;
+    uint32_t track_range;
+    uint32_t thumb_offset;
+
+    if (height == 0 || total == 0 || visible >= total) {
+        return;
+    }
+    if (visible == 0) {
+        visible = 1;
+    }
+    if (offset > total - visible) {
+        offset = total - visible;
+    }
+    thumb_height = (uint16_t) (((uint32_t) height * visible) / total);
+    if (thumb_height < 18) {
+        thumb_height = 18;
+    }
+    if (thumb_height > height) {
+        thumb_height = height;
+    }
+    max_offset = total - visible;
+    track_range = height - thumb_height;
+    thumb_offset = max_offset == 0 ? 0 : ((uint32_t) track_range * offset) / max_offset;
+
+    graphics_fill_rect(x, y, GRAPHICS_SCROLLBAR_W, height, dark ? 0x00242D38 : 0x00E3EBF4);
+    graphics_draw_rect_outline(x, y, GRAPHICS_SCROLLBAR_W, height, dark ? 0x004A6278 : 0x00A7BBD1);
+    thumb_y = (uint16_t) (y + thumb_offset);
+    graphics_fill_soft_rect(x + 2, thumb_y + 2, GRAPHICS_SCROLLBAR_W - 4,
+                            thumb_height > 4 ? thumb_height - 4 : thumb_height,
+                            dark ? 0x007B9BB7 : 0x007A9BC0);
 }
 
 static void graphics_draw_window_content(const ui_window_t *window)
@@ -3280,47 +4442,94 @@ static void graphics_draw_window_content(const ui_window_t *window)
         return;
     }
     if (window->kind == UI_WINDOW_FILES) {
+        uint32_t visible_rows = graphics_file_visible_rows(window);
+        uint32_t first_item;
+        uint32_t last_item;
+        uint16_t list_top = (uint16_t) (window->y + 66);
+        uint16_t list_height = window->height > 78 ? (uint16_t) (window->height - 78) : 1;
+        uint16_t scrollbar_x = (uint16_t) (window->x + window->width - GRAPHICS_SCROLLBAR_W - 10);
+
+        graphics_file_clamp_scroll(window);
         graphics_fill_rect((uint16_t) (window->x + 8), (uint16_t) (window->y + 30), (uint16_t) (window->width - 16), 26, 0x00DCE8F4);
         graphics_draw_rect_outline((uint16_t) (window->x + 8), (uint16_t) (window->y + 30), (uint16_t) (window->width - 16), 26, 0x008AA1B8);
         graphics_draw_text((uint16_t) (window->x + 18), (uint16_t) (window->y + 37), g_file_current_path, 0x0017232E);
-        graphics_fill_rect((uint16_t) (window->x + 12), (uint16_t) (window->y + 66), 18, 18, 0x00D8E9FA);
-        graphics_draw_rect_outline((uint16_t) (window->x + 12), (uint16_t) (window->y + 66), 18, 18, 0x008AA1B8);
-        graphics_draw_text((uint16_t) (window->x + 17), (uint16_t) (window->y + 69), "<", 0x0017232E);
-        for (uint32_t i = 0; i < g_file_item_count; i++) {
-            uint16_t row_y = (uint16_t) (window->y + 66 + i * 22);
+        graphics_fill_rect((uint16_t) (window->x + 12), list_top, 18, 18, 0x00D8E9FA);
+        graphics_draw_rect_outline((uint16_t) (window->x + 12), list_top, 18, 18, 0x008AA1B8);
+        graphics_draw_text((uint16_t) (window->x + 17), (uint16_t) (list_top + 3), "<", 0x0017232E);
+        first_item = g_file_scroll_offset;
+        last_item = first_item + visible_rows;
+        if (last_item > g_file_item_count) {
+            last_item = g_file_item_count;
+        }
+        for (uint32_t i = first_item; i < last_item; i++) {
+            uint32_t row_index = i - first_item;
+            uint16_t row_y = (uint16_t) (list_top + row_index * 22);
             uint32_t fill = i == g_file_selected_index ? 0x00D8E9FA : 0x00F7FBFE;
             char path[GRAPHICS_CLIPBOARD_PATH_MAX];
 
-            graphics_fill_rect((uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20, fill);
-            graphics_draw_rect_outline((uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20, 0x00A7BBD1);
+            graphics_fill_rect((uint16_t) (window->x + 36), row_y,
+                               (uint16_t) (window->width - 48 - GRAPHICS_SCROLLBAR_W), 20, fill);
+            graphics_draw_rect_outline((uint16_t) (window->x + 36), row_y,
+                                       (uint16_t) (window->width - 48 - GRAPHICS_SCROLLBAR_W), 20, 0x00A7BBD1);
             graphics_build_file_entry_path(i, path);
-            graphics_draw_icon((uint16_t) (window->x + 42), (uint16_t) (row_y + 1),
-                               graphics_icon_kind_for_path(path, g_file_items[i].is_dir), true);
+            graphics_draw_file_icon((uint16_t) (window->x + 42), (uint16_t) (row_y + 1),
+                                    path, g_file_items[i].is_dir, true);
             graphics_draw_text((uint16_t) (window->x + 66), (uint16_t) (row_y + 5), g_file_items[i].name, 0x0017232E);
             if (g_file_items[i].is_dir) {
                 graphics_draw_text_aligned((uint16_t) (window->x + window->width - 64), (uint16_t) (row_y + 5), 40, "\u6587\u4ef6\u5939", 0x002A6CC8);
             }
         }
+        graphics_draw_scrollbar(scrollbar_x, list_top, list_height,
+                                g_file_item_count, visible_rows, g_file_scroll_offset, false);
         return;
     }
-    if (window->kind == UI_WINDOW_TERMINAL) {
-        const uint16_t *buffer = console_buffer();
-        uint16_t start_row = 0;
-        uint16_t cursor_row = console_cursor_row();
-        graphics_fill_rect((uint16_t) (window->x + 12), (uint16_t) (window->y + 34), (uint16_t) (window->width - 24), (uint16_t) (window->height - 46), 0x00161D27);
-        if (cursor_row > 12) {
-            start_row = (uint16_t) (cursor_row - 12);
+    if (graphics_window_is_terminal(window)) {
+        const uint32_t *buffer = console_buffer_for_pid(window->owner_pid);
+        uint32_t visible_rows = graphics_terminal_visible_rows(window);
+        uint32_t content_rows = graphics_terminal_content_rows(window);
+        uint16_t list_top = (uint16_t) (window->y + 34);
+        uint16_t list_height = window->height > 46 ? (uint16_t) (window->height - 46) : 1;
+        uint16_t scrollbar_x = (uint16_t) (window->x + window->width - GRAPHICS_SCROLLBAR_W - 10);
+        uint32_t max_scroll = graphics_terminal_max_scroll(window);
+        uint32_t scroll_offset = window->console_scroll_offset;
+
+        if (max_scroll == 0) {
+            scroll_offset = 0;
+        } else if (!window->console_scroll_manual) {
+            scroll_offset = max_scroll;
+        } else if (scroll_offset > max_scroll) {
+            scroll_offset = max_scroll;
         }
-        for (uint16_t row = 0; row < 13; row++) {
-            for (uint16_t col = 0; col < 38; col++) {
-                uint16_t cell = buffer[(start_row + row) * 80 + col];
-                char ch = (char) (cell & 0xFF);
-                if (ch == ' ') {
+        graphics_fill_rect((uint16_t) (window->x + 12), list_top,
+                           (uint16_t) (window->width - 24), list_height, 0x00161D27);
+        for (uint32_t row = 0; row < visible_rows; row++) {
+            uint16_t draw_x = (uint16_t) (window->x + 16);
+
+            if (scroll_offset + row >= content_rows) {
+                continue;
+            }
+            for (uint16_t col = 0; col < CONSOLE_COLUMNS; col++) {
+                uint32_t codepoint = buffer[(scroll_offset + row) * CONSOLE_COLUMNS + col];
+                uint32_t advance;
+
+                if (codepoint == ' ') {
+                    draw_x = (uint16_t) (draw_x + UI_FONT_ADVANCE);
                     continue;
                 }
-                graphics_draw_char((uint16_t) (window->x + 16 + col * 9), (uint16_t) (window->y + 40 + row * 14), ch, 0x00E8EEF5);
+                advance = font_codepoint_advance(codepoint);
+                if ((uint32_t) draw_x + advance >=
+                    (uint32_t) window->x + window->width - GRAPHICS_SCROLLBAR_W - 12) {
+                    break;
+                }
+                graphics_draw_codepoint(draw_x,
+                                        (uint16_t) (window->y + 40 + row * 14),
+                                        codepoint,
+                                        0x00E8EEF5);
+                draw_x = (uint16_t) (draw_x + advance);
             }
         }
+        graphics_draw_scrollbar(scrollbar_x, list_top, list_height,
+                                content_rows, visible_rows, scroll_offset, true);
         return;
     }
     if (window->kind == UI_WINDOW_RUN) {
@@ -3335,7 +4544,7 @@ static void graphics_draw_window_content(const ui_window_t *window)
     }
     if (window->kind == UI_WINDOW_SHELL) {
         graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 42), "命令行", 0x0017232E);
-        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 64), "使用文本模式终端", 0x0017232E);
+        graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 64), "使用文本模式控制台", 0x0017232E);
         return;
     }
     if (window->kind == UI_WINDOW_ABOUT) {
@@ -3344,7 +4553,7 @@ static void graphics_draw_window_content(const ui_window_t *window)
         uint32_t line_num = 0;
         uint32_t pos = 0;
         
-        if (file_read("/version.txt", version_content, sizeof(version_content)) > 0) {
+        if (file_read(UI_VERSION_PATH, version_content, sizeof(version_content)) > 0) {
             while (pos < sizeof(version_content) && version_content[pos] != '\0' && line_num < 6) {
                 uint32_t line_pos = 0;
                 while (pos < sizeof(version_content) && version_content[pos] != '\n' && version_content[pos] != '\0' && line_pos < sizeof(line) - 1) {
@@ -3427,8 +4636,8 @@ static void graphics_draw_window_content(const ui_window_t *window)
                 graphics_append_path_component(path, sizeof(path), g_player_items[i].name);
                 graphics_fill_rect(row_x, row_y, row_w, 20, row_fill);
                 graphics_draw_rect_outline(row_x, row_y, row_w, 20, 0x00A7BBD1);
-                graphics_draw_icon((uint16_t) (row_x + 4), (uint16_t) (row_y + 1),
-                                   graphics_icon_kind_for_path(path, g_player_items[i].is_dir), true);
+                graphics_draw_file_icon((uint16_t) (row_x + 4), (uint16_t) (row_y + 1),
+                                        path, g_player_items[i].is_dir, true);
                 graphics_draw_text((uint16_t) (row_x + 28), (uint16_t) (row_y + 5), g_player_items[i].name, 0x0017232E);
                 if (g_player_items[i].is_dir) {
                     graphics_draw_text_aligned((uint16_t) (window->x + window->width - 76), (uint16_t) (row_y + 5), 54, "\u6587\u4ef6\u5939", 0x002A6CC8);
@@ -3446,17 +4655,37 @@ static void graphics_draw_window_content(const ui_window_t *window)
         /* Text area */
         graphics_fill_rect((uint16_t) (window->x + 8), (uint16_t) (window->y + 48), (uint16_t) (window->width - 16), (uint16_t) (window->height - 58), 0x00FFFFFF);
         graphics_draw_rect_outline((uint16_t) (window->x + 8), (uint16_t) (window->y + 48), (uint16_t) (window->width - 16), (uint16_t) (window->height - 58), 0x008AA1B8);
-        for (uint32_t i = 0, row = 0, col = 0; g_notepad_text[i] != '\0' && row < 16; i++) {
-            if (g_notepad_text[i] == '\n') {
-                row++;
-                col = 0;
-                continue;
-            }
-            graphics_draw_char((uint16_t) (window->x + 14 + col * 9), (uint16_t) (window->y + 54 + row * 16), g_notepad_text[i], 0x0017232E);
-            col++;
-            if (col >= 52) {
-                row++;
-                col = 0;
+        {
+            const char *cursor = g_notepad_text;
+            uint16_t draw_x = (uint16_t) (window->x + 14);
+            uint32_t row = 0;
+            uint16_t right = (uint16_t) (window->x + window->width - 14);
+
+            while (cursor != NULL && *cursor != '\0' && row < 16) {
+                uint32_t codepoint = font_utf8_next(&cursor);
+                uint32_t advance;
+
+                if (codepoint == '\r') {
+                    continue;
+                }
+                if (codepoint == '\n') {
+                    row++;
+                    draw_x = (uint16_t) (window->x + 14);
+                    continue;
+                }
+                advance = font_codepoint_advance(codepoint);
+                if ((uint32_t) draw_x + advance > right) {
+                    row++;
+                    draw_x = (uint16_t) (window->x + 14);
+                    if (row >= 16) {
+                        break;
+                    }
+                }
+                graphics_draw_codepoint(draw_x,
+                                        (uint16_t) (window->y + 54 + row * UI_FONT_HEIGHT),
+                                        codepoint,
+                                        0x0017232E);
+                draw_x = (uint16_t) (draw_x + advance);
             }
         }
         return;
@@ -3468,7 +4697,7 @@ static void graphics_draw_window_content(const ui_window_t *window)
             graphics_draw_text((uint16_t) (window->x + 70), (uint16_t) (window->y + 66), "运行中", 0x0017232E);
         }
         if (net_info()->present) {
-            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 90), net_status(), 0x0017232E);
+            graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 90), ui_network_label(), 0x0017232E);
         }
         graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 114), audio_current_track()[0] ? audio_current_track() : "音频已停止", 0x0017232E);
         graphics_draw_text((uint16_t) (window->x + 16), (uint16_t) (window->y + 138), "图形", 0x0017232E);
@@ -3530,7 +4759,11 @@ static void graphics_draw_window(const ui_window_t *window)
     graphics_fill_rect((uint16_t) (window->x + 2), (uint16_t) (window->y + UI_TITLEBAR_H), (uint16_t) (window->width - 4), 1, 0x00DFE7F0);
     graphics_fill_soft_rect((uint16_t) (window->x + 10), (uint16_t) (window->y + 8), 10, 10, UI_COLOR_ACCENT);
     graphics_fill_rect((uint16_t) (window->x + 15), (uint16_t) (window->y + 8), 5, 10, 0x004DB5FF);
-    graphics_draw_text((uint16_t) (window->x + 28), (uint16_t) (window->y + 7), window->title, UI_COLOR_TITLE_TEXT);
+    graphics_draw_text_clipped((uint16_t) (window->x + 28),
+                               (uint16_t) (window->y + 7),
+                               window->width > 112 ? (uint16_t) (window->width - 112) : 1,
+                               window->title,
+                               UI_COLOR_TITLE_TEXT);
     graphics_fill_soft_rect((uint16_t) (window->x + window->width - 66), (uint16_t) (window->y + 5), 16, 18, 0x00F5F8FC);
     graphics_draw_text((uint16_t) (window->x + window->width - 62), (uint16_t) (window->y + 6), "-", 0x004B5C70);
     graphics_fill_soft_rect((uint16_t) (window->x + window->width - 46), (uint16_t) (window->y + 5), 16, 18, window->maximized ? 0x00E7F0FF : 0x00F5F8FC);
@@ -3651,7 +4884,7 @@ void graphics_handle_click(uint16_t x, uint16_t y)
             return;
         }
         if (graphics_point_in_rect(x, y, (uint16_t) (g_power_menu_x + 8), (uint16_t) (g_power_menu_y + 56), 140, 22)) {
-            g_sleeping = true;
+            kernel_request_sleep();
             g_power_menu_open = false;
             graphics_draw_shell();
             return;
@@ -3893,16 +5126,38 @@ void graphics_handle_click(uint16_t x, uint16_t y)
             return;
         }
         if (window->kind == UI_WINDOW_FILES) {
+            uint32_t visible_rows = graphics_file_visible_rows(window);
+            uint16_t list_top = (uint16_t) (window->y + 66);
+            uint16_t list_height = window->height > 78 ? (uint16_t) (window->height - 78) : 1;
+            uint16_t scrollbar_x = (uint16_t) (window->x + window->width - GRAPHICS_SCROLLBAR_W - 10);
+
+            graphics_set_terminal_focus(false);
             if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 12), (uint16_t) (window->y + 66), 18, 18)) {
                 graphics_file_browser_go_up();
                 graphics_draw_shell();
                 return;
             }
-            for (uint32_t entry_index = 0; entry_index < g_file_item_count; entry_index++) {
-                uint16_t row_y = (uint16_t) (window->y + 66 + entry_index * 22);
-                if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20)) {
+            if (graphics_point_in_rect(x, y, scrollbar_x, list_top, GRAPHICS_SCROLLBAR_W, list_height)) {
+                uint32_t max_scroll = graphics_file_max_scroll(window);
+                if (max_scroll > 0) {
+                    uint32_t relative = y > list_top ? (uint32_t) (y - list_top) : 0;
+                    g_file_scroll_offset = (relative * max_scroll) / list_height;
+                    if (g_file_scroll_offset > max_scroll) {
+                        g_file_scroll_offset = max_scroll;
+                    }
+                }
+                graphics_draw_shell();
+                return;
+            }
+            for (uint32_t row_index = 0; row_index < visible_rows; row_index++) {
+                uint32_t entry_index = g_file_scroll_offset + row_index;
+                uint16_t row_y = (uint16_t) (list_top + row_index * 22);
+                if (entry_index < g_file_item_count &&
+                    graphics_point_in_rect(x, y, (uint16_t) (window->x + 36), row_y,
+                                           (uint16_t) (window->width - 48 - GRAPHICS_SCROLLBAR_W), 20)) {
                     bool same_item = g_file_selected_index == entry_index;
                     g_file_selected_index = entry_index;
+                    graphics_file_ensure_selected_visible(window);
                     if (same_item) {
                         char path[GRAPHICS_CLIPBOARD_PATH_MAX];
                         graphics_build_file_entry_path(entry_index, path);
@@ -3925,7 +5180,7 @@ void graphics_handle_click(uint16_t x, uint16_t y)
                     if (g_player_selected_path[0] != '\0') {
                         graphics_player_try_play(g_player_selected_path);
                     } else {
-                        graphics_player_try_play("/music.wav");
+                        graphics_player_try_play(PATH_ROOT "music.wav");
                     }
                 } else {
                     audio_toggle_pause();
@@ -3996,13 +5251,34 @@ void graphics_handle_click(uint16_t x, uint16_t y)
                 }
             }
         }
-        if (window->kind == UI_WINDOW_TERMINAL) {
+        if (graphics_window_is_terminal(window)) {
             uint16_t content_left = (uint16_t) (window->x + 12);
             uint16_t content_top = (uint16_t) (window->y + window->height - 40);
             uint16_t content_width = 96;
             uint16_t content_height = 32;
+            uint16_t list_top = (uint16_t) (window->y + 34);
+            uint16_t list_height = window->height > 46 ? (uint16_t) (window->height - 46) : 1;
+            uint16_t scrollbar_x = (uint16_t) (window->x + window->width - GRAPHICS_SCROLLBAR_W - 10);
             uint64_t now = timer_ticks();
 
+            if (graphics_point_in_rect(x, y, scrollbar_x, list_top, GRAPHICS_SCROLLBAR_W, list_height)) {
+                uint32_t max_scroll = graphics_terminal_max_scroll(window);
+
+                graphics_set_terminal_focus(true);
+                if (max_scroll > 0) {
+                    uint32_t relative = y > list_top ? (uint32_t) (y - list_top) : 0;
+                    window->console_scroll_offset = (relative * max_scroll) / list_height;
+                    if (window->console_scroll_offset > max_scroll) {
+                        window->console_scroll_offset = max_scroll;
+                    }
+                    window->console_scroll_manual = window->console_scroll_offset < max_scroll;
+                } else {
+                    window->console_scroll_offset = 0;
+                    window->console_scroll_manual = false;
+                }
+                graphics_draw_shell();
+                return;
+            }
             if (graphics_point_in_rect(x, y, content_left, content_top, content_width, content_height)) {
                 if (now - g_rainbow_cat_last_click_tick < timer_hz()) {
                     g_rainbow_cat_click_count++;
@@ -4138,9 +5414,15 @@ void graphics_handle_right_click(uint16_t x, uint16_t y)
             continue;
         }
         if (graphics_point_in_rect(x, y, window->x, window->y, window->width, window->height)) {
-            for (uint32_t entry_index = 0; entry_index < g_file_item_count; entry_index++) {
-                uint16_t row_y = (uint16_t) (window->y + 66 + entry_index * 22);
-                if (graphics_point_in_rect(x, y, (uint16_t) (window->x + 36), row_y, (uint16_t) (window->width - 48), 20)) {
+            uint32_t visible_rows = graphics_file_visible_rows(window);
+            uint16_t list_top = (uint16_t) (window->y + 66);
+
+            for (uint32_t row_index = 0; row_index < visible_rows; row_index++) {
+                uint32_t entry_index = g_file_scroll_offset + row_index;
+                uint16_t row_y = (uint16_t) (list_top + row_index * 22);
+                if (entry_index < g_file_item_count &&
+                    graphics_point_in_rect(x, y, (uint16_t) (window->x + 36), row_y,
+                                           (uint16_t) (window->width - 48 - GRAPHICS_SCROLLBAR_W), 20)) {
                     g_file_selected_index = entry_index;
                     g_context_menu_mode = UI_CONTEXT_MENU_FILES;
                     break;
@@ -4195,6 +5477,29 @@ void graphics_handle_mouse_move(uint16_t x, uint16_t y, uint8_t buttons)
         g_player_button_pressed = false;
     }
     g_prev_mouse_buttons = buttons;
+}
+
+void graphics_handle_mouse_wheel(uint16_t x, uint16_t y, int32_t delta)
+{
+    if (!g_graphics_active || delta == 0) {
+        return;
+    }
+    for (int32_t i = UI_WINDOW_MAX - 1; i >= 0; i--) {
+        ui_window_t *window = &g_windows[i];
+
+        if (!window->visible || window->minimized ||
+            !graphics_point_in_rect(x, y, window->x, window->y, window->width, window->height)) {
+            continue;
+        }
+        if (window->kind == UI_WINDOW_FILES) {
+            graphics_file_scroll_by(delta);
+            graphics_draw_shell();
+        } else if (graphics_window_is_terminal(window)) {
+            graphics_terminal_scroll_by(delta, window);
+            graphics_draw_shell();
+        }
+        return;
+    }
 }
 
 void graphics_handle_alt_f4(void)
@@ -4327,6 +5632,34 @@ void graphics_handle_key_event(const key_event_t *event)
     }
 
     if (event->type != KEY_EVENT_CHAR) {
+        int32_t focused_window_index = -1;
+
+        for (int32_t i = UI_WINDOW_MAX - 1; i >= 0; i--) {
+            if (g_windows[i].visible && !g_windows[i].minimized) {
+                focused_window_index = i;
+                break;
+            }
+        }
+        if (focused_window_index >= 0 &&
+            g_windows[focused_window_index].kind == UI_WINDOW_FILES) {
+            ui_window_t *window = &g_windows[focused_window_index];
+
+            if (event->type == KEY_EVENT_UP && g_file_selected_index > 0) {
+                g_file_selected_index--;
+            } else if (event->type == KEY_EVENT_DOWN &&
+                       g_file_selected_index + 1 < g_file_item_count) {
+                g_file_selected_index++;
+            } else if (event->type == KEY_EVENT_HOME) {
+                g_file_selected_index = 0;
+            } else if (event->type == KEY_EVENT_END && g_file_item_count > 0) {
+                g_file_selected_index = g_file_item_count - 1;
+            } else {
+                return;
+            }
+            graphics_file_ensure_selected_visible(window);
+            graphics_draw_shell();
+            return;
+        }
         if (g_terminal_input_focus) {
             if (event->type == KEY_EVENT_UP) shell_handle_navigation_key(KEY_EVENT_UP);
             if (event->type == KEY_EVENT_DOWN) shell_handle_navigation_key(KEY_EVENT_DOWN);
@@ -4396,6 +5729,8 @@ void graphics_periodic_update(uint64_t now_ticks)
         return;
     }
 
+    ui_network_update(now_ticks);
+
     if (!font_ready()) {
         if (font_init_step(128u * 1024u)) {
             graphics_draw_shell();
@@ -4438,48 +5773,86 @@ static void graphics_restore_cursor(void)
         return;
     }
 
-    for (uint16_t row = 0; row < 16; row++) {
-        for (uint16_t col = 0; col < 16; col++) {
+    for (uint16_t row = 0; row < g_cursor_draw_height; row++) {
+        for (uint16_t col = 0; col < g_cursor_draw_width; col++) {
             uint16_t px = g_cursor_x + col;
             uint16_t py = g_cursor_y + row;
             if (px < FB_WIDTH && py < FB_HEIGHT) {
-                g_framebuffer[graphics_framebuffer_index(px, py)] = g_cursor_saved[row * 16 + col];
+                g_framebuffer[graphics_framebuffer_index(px, py)] =
+                    g_cursor_saved[(uint32_t) row * GRAPHICS_CURSOR_MAX_WIDTH + col];
             }
         }
     }
     g_cursor_drawn = false;
+    g_cursor_draw_width = 0;
+    g_cursor_draw_height = 0;
 }
 
 void graphics_mouse_redraw(uint16_t x, uint16_t y)
 {
     const graphics_cursor_style_t *style;
+    bool use_windows_cursor;
+    uint16_t cursor_width;
+    uint16_t cursor_height;
 
     if (!g_graphics_active) {
         return;
     }
 
-    if (x > FB_WIDTH - 16) x = FB_WIDTH - 16;
-    if (y > FB_HEIGHT - 16) y = FB_HEIGHT - 16;
+    use_windows_cursor = graphics_cursor_use_windows_asset();
+    cursor_width = use_windows_cursor ? g_windows_cursor_width : 16;
+    cursor_height = use_windows_cursor ? g_windows_cursor_height : 16;
+    if (cursor_width == 0 || cursor_width > GRAPHICS_CURSOR_MAX_WIDTH) {
+        cursor_width = 16;
+        use_windows_cursor = false;
+    }
+    if (cursor_height == 0 || cursor_height > GRAPHICS_CURSOR_MAX_HEIGHT) {
+        cursor_height = 16;
+        use_windows_cursor = false;
+    }
+
+    if (FB_WIDTH <= cursor_width) {
+        x = 0;
+    } else if (x > FB_WIDTH - cursor_width) {
+        x = (uint16_t) (FB_WIDTH - cursor_width);
+    }
+    if (FB_HEIGHT <= cursor_height) {
+        y = 0;
+    } else if (y > FB_HEIGHT - cursor_height) {
+        y = (uint16_t) (FB_HEIGHT - cursor_height);
+    }
 
     graphics_restore_cursor();
     g_cursor_x = x;
     g_cursor_y = y;
     style = &g_cursor_styles[g_cursor_style_index];
 
-    for (uint16_t row = 0; row < 16; row++) {
-        for (uint16_t col = 0; col < 16; col++) {
+    for (uint16_t row = 0; row < cursor_height; row++) {
+        for (uint16_t col = 0; col < cursor_width; col++) {
             uint16_t px = x + col;
             uint16_t py = y + row;
-            uint16_t mask = (uint16_t) (0x8000 >> col);
 
-            g_cursor_saved[row * 16 + col] = g_framebuffer[graphics_framebuffer_index(px, py)];
-            if ((style->shape[row] & mask) != 0) {
-                g_framebuffer[graphics_framebuffer_index(px, py)] =
-                    (style->fill[row] & mask) != 0 ? style->fill_color : style->outline_color;
+            g_cursor_saved[(uint32_t) row * GRAPHICS_CURSOR_MAX_WIDTH + col] =
+                g_framebuffer[graphics_framebuffer_index(px, py)];
+            if (use_windows_cursor) {
+                uint32_t color = g_windows_cursor_pixels[(uint32_t) row * GRAPHICS_CURSOR_MAX_WIDTH + col];
+
+                if ((color & 0xFF000000U) != 0) {
+                    g_framebuffer[graphics_framebuffer_index(px, py)] = color & 0x00FFFFFFU;
+                }
+            } else {
+                uint16_t mask = (uint16_t) (0x8000 >> col);
+
+                if ((style->shape[row] & mask) != 0) {
+                    g_framebuffer[graphics_framebuffer_index(px, py)] =
+                        (style->fill[row] & mask) != 0 ? style->fill_color : style->outline_color;
+                }
             }
         }
     }
 
+    g_cursor_draw_width = cursor_width;
+    g_cursor_draw_height = cursor_height;
     g_cursor_drawn = true;
     graphics_flush_gpu();
 }
@@ -4497,6 +5870,15 @@ void graphics_init(void)
     g_framebuffer = NULL;
     g_cursor_x = 24;
     g_cursor_y = 24;
+    g_cursor_draw_width = 0;
+    g_cursor_draw_height = 0;
+    g_windows_cursor_attempted = false;
+    g_windows_cursor_loaded = false;
+    g_windows_cursor_width = 0;
+    g_windows_cursor_height = 0;
+    g_windows_cursor_hotspot_x = 0;
+    g_windows_cursor_hotspot_y = 0;
+    memset(g_windows_cursor_pixels, 0, sizeof(g_windows_cursor_pixels));
     g_start_menu_open = false;
     g_start_menu_view = UI_START_MENU_ROOT;
     g_context_menu_open = false;
@@ -4515,6 +5897,7 @@ void graphics_init(void)
     g_run_input_len = 0;
     g_run_input[0] = '\0';
     g_run_input_focus = false;
+    g_file_scroll_offset = 0;
     graphics_set_terminal_focus(false);
     g_sleeping = false;
     g_uac_program[0] = '\0';
@@ -4532,10 +5915,19 @@ void graphics_init(void)
     graphics_reset_file_browser();
     g_player_button_pressed = false;
     g_player_browser_open = false;
-    strcpy(g_player_current_path, "/");
+    strcpy(g_player_current_path, UI_ROOT_DESKTOP);
     g_player_item_count = 0;
     g_player_selected_index = 0;
     g_player_selected_path[0] = '\0';
+    g_wallpaper_attempted = false;
+    g_wallpaper_loaded = false;
+    g_wallpaper_width = 0;
+    g_wallpaper_height = 0;
+    g_boot_image_attempted = false;
+    g_boot_image_loaded = false;
+    g_boot_image_width = 0;
+    g_boot_image_height = 0;
+    memset(g_boot_image_pixels, 0, sizeof(g_boot_image_pixels));
     strcpy(g_player_status, "ready");
 }
 
@@ -4652,12 +6044,48 @@ void graphics_set_boot_animation_mode(bool enabled)
     g_graphics_boot_animation_mode = enabled;
 }
 
+void graphics_reload_cursor_style(void)
+{
+    if (g_graphics_active) {
+        graphics_load_cursor_style();
+    }
+}
+
 void graphics_open_task_manager(void)
 {
-    if (graphics_launch_user_program("/apps/taskmgr.elf") ||
-        graphics_launch_user_program("/taskmgr.elf")) {
+    if (!g_graphics_active) {
+        return;
+    }
+    graphics_open_window(UI_WINDOW_TASKMGR);
+    if (graphics_find_window(UI_WINDOW_TASKMGR) >= 0) {
         graphics_draw_shell();
     }
+}
+
+bool graphics_open_notepad_window(void)
+{
+    if (!g_graphics_active) {
+        return false;
+    }
+    graphics_open_window(UI_WINDOW_NOTEPAD);
+    if (graphics_find_window(UI_WINDOW_NOTEPAD) >= 0) {
+        graphics_draw_shell();
+        return true;
+    }
+    return false;
+}
+
+bool graphics_open_cube3d_window(void)
+{
+    if (!g_graphics_active) {
+        return false;
+    }
+    graphics_open_window(UI_WINDOW_CUBE3D);
+    if (graphics_find_window(UI_WINDOW_CUBE3D) >= 0) {
+        graphics_draw_shell();
+        return true;
+    }
+    return false;
 }
 
 void graphics_leave_mode(void)
@@ -4756,7 +6184,7 @@ void graphics_enter_mode(void)
      * selected mode before we switch to the kernel CR3.
      */
     framebuffer_map_length = (uint64_t) FB_PIXELS * sizeof(uint32_t) + 0x400000ULL;
-    mmu_map_identity((uint64_t)addr, framebuffer_map_length);
+    mmu_map_device_identity((uint64_t)addr, framebuffer_map_length);
     /* If kernel page-tables are not yet active (we're still on loader/boot
      * page-tables), avoid performing writes to high MMIO framebuffer
      * addresses which will cause page faults. Defer graphics activation
@@ -4820,14 +6248,25 @@ void graphics_enter_mode(void)
         log_write("graphics: using vmware svga ii");
     } else {
         g_graphics_vmware_backend = false;
+        /*
+         * QEMU's std VGA exposes the Bochs VBE registers, but some firmware
+         * paths leave the controller on an old VBE version. Select the
+         * highest common BGA version before programming the mode.
+         */
+        bga_write(BGA_ID, BGA_ID_5);
         bga_write(BGA_ENABLE, BGA_DISABLED);
         bga_write(BGA_XRES, FB_WIDTH);
         bga_write(BGA_YRES, FB_HEIGHT);
         bga_write(BGA_BPP, 32);
+        bga_write(BGA_VIRT_WIDTH, FB_WIDTH);
+        bga_write(BGA_VIRT_HEIGHT, FB_HEIGHT);
+        bga_write(BGA_X_OFFSET, 0);
+        bga_write(BGA_Y_OFFSET, 0);
         bga_write(BGA_ENABLE, BGA_ENABLED | BGA_LFB);
         g_graphics_framebuffer_addr = addr;
         g_framebuffer_pitch_bytes = FB_WIDTH * sizeof(uint32_t);
         g_framebuffer_pitch_pixels = FB_WIDTH;
+        graphics_log_bga_mode();
         log_write("graphics: using bochs/qemu bga");
     }
 
@@ -4847,7 +6286,7 @@ void graphics_enter_mode(void)
     if (mmu_is_active()) {
         g_graphics_active = true;
         g_cursor_drawn = false;
-        if (!g_graphics_fast_mode_switch) {
+        if (!g_graphics_fast_mode_switch && !g_graphics_boot_animation_mode) {
             graphics_load_cursor_style();
         }
         if (!g_session_logged_in && !g_installer_mode && !g_graphics_boot_animation_mode) {
@@ -4862,10 +6301,17 @@ void graphics_enter_mode(void)
         } else {
             graphics_draw_shell();
         }
-        if (!font_ready()) {
+        /*
+         * Boot animation uses fallback glyphs until the filesystem stage
+         * explicitly loads the UI font. Do not start font I/O here because
+         * graphics_enter_mode() may run before file_auto_mount().
+         */
+        if (!font_ready() && !g_graphics_boot_animation_mode) {
             font_init_step(128u * 1024u);
         }
-        log_write("graphics: desktop drawn");
+        log_write(g_graphics_boot_animation_mode ?
+                  "graphics: boot animation ready" :
+                  "graphics: desktop drawn");
     } else {
         log_write("graphics: deferring full desktop draw; mmu not active");
         g_graphics_active = false;

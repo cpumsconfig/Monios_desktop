@@ -3,14 +3,13 @@ ENTRY(_start)
 /*
  * MoniOS kernel linker script - x86_64
  *
- * The loader reads kernel.bin into a low real-mode buffer and then copies
- * the runtime image to 0x00200000. Keeping the runtime base above 1 MiB
- * avoids BIOS/loader overlap and leaves 1..2 MiB for boot-time scratch.
+ * The PE image is based at 0x02000000. BIOS and UEFI loaders map its standard
+ * PE sections at ImageBase + VirtualAddress before entering the PE entrypoint.
  */
 
 SECTIONS
 {
-    . = 0x200000;
+    . = 0x2000000;
 
     .text : ALIGN(16) SUBALIGN(16)
     {
@@ -38,8 +37,8 @@ SECTIONS
     .kconfig : ALIGN(8)
     {
         _kconfig_start = .;
-        KERNEL_BASE_PA   = 0x200000;
-        KERNEL_BASE_VA   = 0xFFFF800000200000;
+        KERNEL_BASE_PA   = 0x2000000;
+        KERNEL_BASE_VA   = 0xFFFF800002000000;
         QUAD(0);            /* kernel_base_pa, filled by kernel.c */
         QUAD(0);            /* kernel_base_va, filled by kernel.c */
         _panic_notifier_fn = .;
@@ -59,5 +58,16 @@ SECTIONS
         *(COMMON)
         *(.bss*)
         __bss_end = .;
+    }
+
+    .reloc : ALIGN(4)
+    {
+        *(.reloc)
+    }
+
+    /DISCARD/ :
+    {
+        *(.comment)
+        *(.note.GNU-stack)
     }
 }

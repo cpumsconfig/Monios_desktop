@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     (void) argc;
     (void) argv;
 
-    write_line("taskmgr.elf");
+    write_line("taskmgr.exe");
     write_line("MONIOS task manager");
     if (app_get_system_status(&status) >= 0) {
         fputs("tasks: ");
@@ -79,16 +79,20 @@ int main(int argc, char **argv)
         write_u32_line(status.gpu_presents);
         fputs("windows: ");
         write_u32_line(status.wm_windows);
-        fputs("terminal lines: ");
+        fputs("console lines: ");
         write_u32_line(status.terminal_lines);
         fputs("smp online/logical: ");
         write_u32(status.smp_online_processors);
         fputs("/");
         write_u32_line(status.smp_logical_processors);
+        fputs("smp firmware/enabled: ");
+        write_u32(status.smp_firmware_processors);
+        fputs("/");
+        write_u32_line(status.smp_firmware_enabled_processors);
     } else {
         write_line("system status unavailable");
     }
     write_line("kernel tasks: keypoll guipoll deskui");
-    write_line("apps: run programs appear in terminal output");
+    write_line("apps: each Console has an independent output buffer");
     return 0;
 }

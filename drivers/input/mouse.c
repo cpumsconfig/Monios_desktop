@@ -284,3 +284,11 @@ void mouse_get_snapshot(mouse_snapshot_t *snapshot)
     snapshot->wheel_enabled = mouse_state.wheel_enabled ? 1 : 0;
     snapshot->reserved = 0;
 }
+
+int32_t mouse_consume_wheel_delta(void)
+{
+    int32_t delta = mouse_state.wheel_delta;
+
+    mouse_state.wheel_delta = 0;
+    return delta;
+}

@@ -5,7 +5,21 @@
 #include "mouse.h"
 #include "string.h"
 #include "system_status.h"
-#include "syscall.h"
+#include "console_dll.h"
+#include "windows_dll.h"
+
+#if defined(__GNUC__)
+#define APP_API_DLL_IMPORT __attribute__((dllimport))
+#else
+#define APP_API_DLL_IMPORT
+#endif
+
+APP_API_DLL_IMPORT int32_t monios_getcwd(char *buffer, uint32_t size);
+APP_API_DLL_IMPORT int32_t monios_get_mouse(mouse_snapshot_t *snapshot);
+APP_API_DLL_IMPORT int32_t monios_get_system_status(system_status_t *status);
+APP_API_DLL_IMPORT int32_t monios_request_r2(const char *reason);
+APP_API_DLL_IMPORT int32_t monios_request_r0(const char *reason);
+APP_API_DLL_IMPORT void monios_exit_process(int32_t code);
 
 extern const exec_launch_info_t *g_app_launch_info;
 
@@ -16,12 +30,12 @@ static inline const exec_launch_info_t *app_launch_info(void)
 
 static inline int32_t app_handle_write(uint64_t handle, const char *buffer, uint32_t size)
 {
-    return (int32_t) syscall3(SYS_HANDLE_WRITE, handle, (uint64_t) buffer, size);
+    return console_write_handle(handle, buffer, size);
 }
 
 static inline int32_t app_handle_read(uint64_t handle, char *buffer, uint32_t size)
 {
-    return (int32_t) syscall3(SYS_HANDLE_READ, handle, (uint64_t) buffer, size);
+    return console_read_handle(handle, buffer, size);
 }
 
 static inline int32_t app_write_string(uint64_t handle, const char *text)
@@ -31,49 +45,47 @@ static inline int32_t app_write_string(uint64_t handle, const char *text)
 
 static inline int32_t app_get_cwd(char *buffer, uint32_t size)
 {
-    return (int32_t) syscall2(SYS_GET_CWD, (uint64_t) buffer, size);
+    return monios_getcwd(buffer, size);
 }
 
 static inline int32_t app_get_mouse(mouse_snapshot_t *snapshot)
 {
-    return (int32_t) syscall2(SYS_MOUSE_GET_STATE, (uint64_t) snapshot, sizeof(*snapshot));
+    return monios_get_mouse(snapshot);
 }
 
 static inline int32_t app_get_system_status(system_status_t *status)
 {
-    return (int32_t) syscall2(SYS_SYSTEM_STATUS, (uint64_t) status, sizeof(*status));
+    return monios_get_system_status(status);
 }
 
 static inline void app_enter_graphics_mode(void)
 {
-    (void) syscall0(SYS_ENTER_GRAPHICS_MODE);
+    windows_enter_graphics_mode();
 }
 
 static inline int32_t app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
 {
-    uint64_t pos = ((uint64_t) x << 48) | ((uint64_t) y << 32) | ((uint64_t) width << 16) | height;
-
-    return (int32_t) syscall2(SYS_GRAPHICS_FILL_RECT, pos, color);
+    return windows_fill_rect(x, y, width, height, color);
 }
 
 static inline void app_graphics_present(void)
 {
-    (void) syscall0(SYS_GRAPHICS_PRESENT);
+    windows_present();
 }
 
 static inline bool app_request_r2(const char *reason)
 {
-    return syscall1(SYS_REQUEST_R2, (uint64_t) reason) == 0;
+    return monios_request_r2(reason) == 0;
 }
 
 static inline bool app_request_r0(const char *reason)
 {
-    return syscall1(SYS_REQUEST_R0, (uint64_t) reason) == 0;
+    return monios_request_r0(reason) == 0;
 }
 
 static inline void app_exit(int32_t code)
 {
-    (void) syscall1(SYS_EXIT_PROCESS, (uint64_t) code);
+    monios_exit_process(code);
     for (;;) {
     }
 }

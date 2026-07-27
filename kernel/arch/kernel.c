@@ -36,6 +36,7 @@
 #include "keyboard.h"
 #include "lazyalloc.h"
 #include "graphics.h"
+#include "font.h"
 #include "bios.h"
 #include "bitmap.h"
 #include "buddy.h"
@@ -66,6 +67,7 @@
 #include "syscall.h"
 #include "task.h"
 #include "terminal.h"
+#include "ui.h"
 #include "tls.h"
 #include "http.h"
 #include "usb_ext.h"
@@ -77,6 +79,7 @@
 #include "power.h"
 #include "opp.h"
 #include "od.h"
+#include "path.h"
 
 static bool g_graphics_mode_requested;
 static bool g_graphics_mode_toggle_requested;
@@ -84,6 +87,7 @@ static keyboard_status_t g_keyboard_status;
 static uint8_t g_last_mouse_buttons;
 static bool g_shutdown_requested;
 static bool g_reboot_requested;
+static bool g_sleep_requested;
 static bool g_installer_boot_media;
 
 static void u32_to_2dec(char *dst, uint32_t value)
@@ -170,7 +174,7 @@ void log_write(const char *str)
     build_uptime_prefix(prefix);
     serial_write(prefix);
     serial_write(str);
-    serial_write("\r\n");
+    serial_write_char('\n');
 }
 
 void log_write_event(const char *tag, const char *detail)
@@ -185,7 +189,7 @@ void log_write_event(const char *tag, const char *detail)
     serial_write(tag);
     serial_write(": ");
     serial_write(detail);
-    serial_write("\r\n");
+    serial_write_char('\n');
 }
 
 void log_write_bool_event(const char *tag, bool enabled)
@@ -223,14 +227,17 @@ void kernel_log_hex_u32(const char *label, uint32_t value)
 
 void kernel_request_shutdown(void)
 {
-    /* 调试：直接输出 'S' 表示 shutdown 被请求 */
-    asm volatile ("movb $0x53, %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "ax", "dx");
     g_shutdown_requested = true;
 }
 
 void kernel_request_reboot(void)
 {
     g_reboot_requested = true;
+}
+
+void kernel_request_sleep(void)
+{
+    g_sleep_requested = true;
 }
 
 void kernel_request_graphics_mode(void)
@@ -248,6 +255,11 @@ bool kernel_reboot_requested(void)
     return g_reboot_requested;
 }
 
+bool kernel_sleep_requested(void)
+{
+    return g_sleep_requested;
+}
+
 static void kernel_shutdown_processes_and_drivers(void)
 {
     log_write("power: stopping processes");
@@ -259,28 +271,44 @@ static void kernel_shutdown_processes_and_drivers(void)
 
 static void kernel_poweroff(void)
 {
-    /* 调试：直接输出 'P' 表示进入 poweroff */
-    asm volatile ("movb $0x50, %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "ax", "dx");
     log_write("power: acpi poweroff");
 
-    /* Show shutdown animation: black screen + shutdown message via graphics */
     graphics_shutdown_animation();
 
-    /* Try ACPI shutdown first */
     if (acpi_poweroff()) {
-        /* ACPI accepted but QEMU may still be running. */
+        for (uint32_t i = 0; i < 1000000; i++) {
+            io_wait();
+        }
     }
 
-    /* QEMU isa-debug-exit fallback: port 0x501, value 0x31
-       QEMU exits with status (value << 1) | 1 = 0x63 = 99 */
-    /* 调试：注释掉 poweroff，换成死循环 */
-    /* outb(0x501, 0x31); */
-    for (;;) { asm volatile ("hlt"); }
-
-    /* QEMU older fallback ports */
+    log_write("power: fallback poweroff ports");
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
     outw(0x4004, 0x3400);
+    for (;;) { asm volatile ("hlt"); }
+}
+
+static void kernel_reboot(void)
+{
+    log_write("power: acpi reboot");
+    graphics_shutdown_animation();
+    (void) acpi_reboot();
+    for (;;) {
+        asm volatile ("hlt");
+    }
+}
+
+static void kernel_sleep(void)
+{
+    log_write("power: acpi sleep");
+    if (!acpi_sleep()) {
+        log_write("power: acpi sleep unavailable");
+        return;
+    }
+    for (uint32_t i = 0; i < 100000; i++) {
+        io_wait();
+    }
+    log_write("power: sleep returned");
 }
 
 static void kernel_handle_key_event(const key_event_t *event)
@@ -421,28 +449,29 @@ static void kernel_delete_file_if_present(const char *path)
 
 static void ensure_desktop_layout(void)
 {
+    char path[96];
+
     session_init();
-    if (!file_exists("/home/root/desktop")) {
-        file_mkdir("/home/root/desktop");
+    ui_ensure_system_layout();
+    kernel_delete_file_if_present(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "rzdrv.rzs");
+    kernel_delete_file_if_present(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "dll.lnk");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "files.lnk", UI_EXPLORER_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "apps.lnk", UI_APPS_DIR "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "player.lnk", UI_PLAYER_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "notes.lnk", UI_NOTEPAD_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "taskmgr.lnk", UI_TASKMGR_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "square.lnk", UI_APPS_DIR PATH_SEPARATOR_STR "square.exe\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "cube3d.lnk", UI_APPS_DIR PATH_SEPARATOR_STR "cube3d.exe\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "setup.lnk", UI_SETUP_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "dev.lnk", UI_APPS_DIR PATH_SEPARATOR_STR "appdev.exe\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "dll.lnk", UI_MONIOS_DLL_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "driver.lnk", UI_RZDRV_PATH "\n");
+    kernel_write_file_if_missing(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "blank.txt", "");
+    if (file_exists(UI_WALLPAPER_PATH) &&
+        !file_exists(UI_ROOT_DESKTOP PATH_SEPARATOR_STR "wallpaper.lnk")) {
+        strcpy(path, UI_ROOT_DESKTOP PATH_SEPARATOR_STR "wallpaper.lnk");
+        kernel_write_file_if_missing(path, UI_WALLPAPER_PATH "\n");
     }
-    kernel_delete_file_if_present("/home/root/desktop/player.elf");
-    kernel_delete_file_if_present("/home/root/desktop/notepad.elf");
-    kernel_delete_file_if_present("/home/root/desktop/taskmgr.elf");
-    kernel_delete_file_if_present("/home/root/desktop/square.elf");
-    kernel_delete_file_if_present("/home/root/desktop/cube3d.elf");
-    kernel_delete_file_if_present("/home/root/desktop/setup.elf");
-    kernel_delete_file_if_present("/home/root/desktop/appdev.elf");
-    kernel_write_file_if_missing("/home/root/desktop/files.lnk", "/apps/explorar.exe\n");
-    kernel_write_file_if_missing("/home/root/desktop/apps.lnk", "/apps\n");
-    kernel_write_file_if_missing("/home/root/desktop/player.lnk", "/apps/player.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/notes.lnk", "/apps/notepad.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/taskmgr.lnk", "/apps/taskmgr.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/square.lnk", "/apps/square.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/cube3d.lnk", "/apps/cube3d.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/setup.lnk", "/apps/setup.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/dev.lnk", "/apps/appdev.elf\n");
-    kernel_write_file_if_missing("/home/root/desktop/dll.lnk", "/apps/moniapi.dll\n");
-    kernel_write_file_if_missing("/home/root/desktop/blank.txt", "");
 }
 
 static void task_poll_graphics_input(void *arg)
@@ -456,7 +485,16 @@ static void task_poll_graphics_input(void *arg)
     }
 
     mouse_get_snapshot(&snapshot);
+    if (exec_active()) {
+        g_last_mouse_buttons = snapshot.buttons;
+        return;
+    }
     graphics_handle_mouse_move((uint16_t) snapshot.x_pixels, (uint16_t) snapshot.y_pixels, snapshot.buttons);
+    if (snapshot.wheel_delta != 0) {
+        graphics_handle_mouse_wheel((uint16_t) snapshot.x_pixels,
+                                    (uint16_t) snapshot.y_pixels,
+                                    mouse_consume_wheel_delta());
+    }
     if ((snapshot.buttons & MOUSE_BUTTON_LEFT) != 0 && (g_last_mouse_buttons & MOUSE_BUTTON_LEFT) == 0) {
         graphics_handle_click((uint16_t) snapshot.x_pixels, (uint16_t) snapshot.y_pixels);
     }
@@ -478,6 +516,13 @@ static void task_update_desktop_shell(void *arg)
 static void draw_console_banner(void)
 {
     console_clear();
+}
+
+static void kernel_boot_animation_update(uint32_t progress, const char *status)
+{
+    if (graphics_active()) {
+        graphics_boot_update(progress, status);
+    }
 }
 
 void kernel_run_periodic_work(void)
@@ -517,15 +562,27 @@ void kernel_run_exec_periodic_work(void)
     running = false;
 }
 
-void kernel_main(uint64_t boot_mode)
+void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
 {
     bool boot_is_uefi = (boot_mode & 1ULL) != 0;
 
     asm volatile ("cli");
     serial_init();
-    serial_write("KERNEL BOOT\r\n");
+    console_init();
+    serial_write("KERNEL BOOT");
+    serial_write_char('\n');
     g_log_quiet = false;
     log_write("boot: serial online");
+    /* Loaders may provide the actual physical load base in .kconfig after
+     * relocating the PE image. BIOS leaves it zero and uses the link base. */
+    extern uint64_t _kconfig_start;
+    volatile uint64_t *kcfg = &_kconfig_start;
+    uint64_t kernel_phys_base = kcfg[0] != 0 ? kcfg[0] : KERNEL_PHYS_BASE;
+    uint64_t kernel_virt_base = kcfg[1] != 0 ? kcfg[1] : KERNEL_VIRT_BASE;
+    kcfg[0] = kernel_phys_base;
+    kcfg[1] = kernel_virt_base;
+    kcfg[2] = 0;
+    kcfg[3] = 0;
     crash_dump_init();
     log_write("boot: crash dump online");
     gdb_stub_init();
@@ -535,13 +592,6 @@ void kernel_main(uint64_t boot_mode)
 
     /* kconfig section – written by kernel, read by crash_dump
      * to locate kernel global state after a crash. */
-    extern uint64_t _kconfig_start;
-    volatile uint64_t *kcfg = &_kconfig_start;
-    kcfg[0] = KERNEL_PHYS_BASE;  /* kernel physical base (identity-mapped) */
-    kcfg[1] = KERNEL_VIRT_BASE;  /* kernel virtual base */
-    kcfg[2] = 0;                /* panic notifier (future) */
-    kcfg[3] = 0;
-
     /* ftrace symbol table – map PA → name for key entry points.
      * Forward declarations for functions defined in other .c files. */
     extern void cpu_exception_dispatch(void);
@@ -580,7 +630,7 @@ void kernel_main(uint64_t boot_mode)
     };
     ftrace_set_symbols(ftrace_addrs, ftrace_names,
         (uint32_t)(sizeof(ftrace_addrs) / sizeof(ftrace_addrs[0])),
-        KERNEL_PHYS_BASE);
+        kernel_phys_base);
 
     log_write("boot: init gdt");
     init_gdt();
@@ -606,18 +656,25 @@ void kernel_main(uint64_t boot_mode)
     bios_init();
     rtc_init();
     gop_init();
+    log_write("boot: start startup animation");
+    graphics_set_boot_animation_mode(true);
+    graphics_enter_mode();
+    graphics_boot_animation();
+    kernel_boot_animation_update(8, "Detecting hardware");
     log_write("boot: detect cpu");
     cpu_log_info();
     cpu_enable_fpu_sse();
-    smp_init();
     cmos_log_time();
     log_write("boot: init acpi");
-    acpi_init();
+    acpi_init(boot_rsdp);
+    log_write("boot: enumerate smp topology");
+    smp_init();
     log_write("boot: init dma");
     dma_init();
     dma_log_state();
     log_write("boot: probe pci");
     pci_log_devices();
+    kernel_boot_animation_update(28, "Hardware ready");
     scheduler_init();
     schedopt_init();
     pcb_init();
@@ -633,12 +690,14 @@ void kernel_main(uint64_t boot_mode)
     power_init();
     opp_init();
     od_init();
+    kernel_boot_animation_update(40, "Starting kernel services");
     log_write("boot: probe audio");
     audio_init();
     aac_init();
     audio_log_state();
     log_write("boot: init syscalls");
     syscall_init();
+    kernel_boot_animation_update(52, "Starting system services");
     log_write("boot: init filesystem");
     file_init();
     cdrom_init();
@@ -648,14 +707,34 @@ void kernel_main(uint64_t boot_mode)
     } else {
         log_write("boot: filesystem mount failed");
     }
-    g_installer_boot_media = (file_exists("/INSTALL.FLG") && file_exists("/SETUP.ELF")) ||
+    graphics_boot_load_image();
+    graphics_reload_cursor_style();
+    kernel_boot_animation_update(58, "Mounting filesystem");
+    log_write("boot: load UI font");
+    while (!font_ready()) {
+        if (font_init_failed()) {
+            log_write("boot: UI font load failed; refusing to enter system");
+            kernel_boot_animation_update(58, "UI font load failed");
+            asm volatile ("cli");
+            for (;;) {
+                asm volatile ("hlt");
+            }
+        }
+        font_init_step(256u * 1024u);
+        kernel_boot_animation_update(58u + (font_init_progress() * 20u) / 100u,
+                                     "Loading UI font");
+    }
+    log_write("boot: UI font ready");
+    kernel_boot_animation_update(78, "UI font ready");
+    g_installer_boot_media = (file_exists(PATH_ROOT "INSTALL.FLG") &&
+                              file_exists(PATH_ROOT "SETUP.EXE")) ||
                              installer_boot_media_present();
     /* Filesystem auto-mounted during boot. */
     log_write("boot: init registry");
     registry_init();
     log_write("boot: init device namespace");
     device_init();
-    log_write("boot: init terminal emulator");
+    log_write("boot: init console manager");
     terminal_init();
     log_write("boot: load drivers");
     driver_manager_init();
@@ -678,19 +757,18 @@ void kernel_main(uint64_t boot_mode)
     browser_init();
     gpu_init();
     gui_init();
+    kernel_boot_animation_update(88, "Drivers and services ready");
     log_write("boot: init session");
     ensure_desktop_layout();
     log_write("boot: init input");
     init_input();
     hid_init();
+    kernel_boot_animation_update(92, "Initializing input");
 
-    if (!g_installer_boot_media) {
-        log_write("boot: graphics animation pending");
-        g_graphics_mode_requested = false;
-    } else {
+    if (g_installer_boot_media) {
         log_write("boot: installer media detected");
-        g_graphics_mode_requested = false;
     }
+    g_graphics_mode_requested = false;
     log_write("boot: create tasks");
     task_create("keypoll", task_poll_keyboard_events, NULL, 1, true);
     task_create("guipoll", task_poll_graphics_input, NULL, 1, true);
@@ -700,23 +778,23 @@ void kernel_main(uint64_t boot_mode)
     log_write("boot: init shell");
     shell_init();
     shell_env_set("MONIOS_BOOT_MODE", boot_is_uefi ? "uefi" : "mbr");
-
-    if (!g_installer_boot_media) {
-        log_write("boot: enter graphics");
-        graphics_set_boot_animation_mode(true);
-        graphics_enter_mode();
-        graphics_boot_animation();
-        graphics_set_boot_animation_mode(false);
-        graphics_draw_shell();
-    }
+    kernel_boot_animation_update(98, "Starting shell");
+    kernel_boot_animation_update(100, g_installer_boot_media ? "Installer ready" : "Ready");
+    graphics_boot_finish();
+    graphics_set_boot_animation_mode(false);
 
     log_write("boot: enable interrupts");
     asm volatile ("sti");
-    if (g_installer_boot_media && file_exists("/SETUP.ELF")) {
+    if (g_installer_boot_media && file_exists(PATH_ROOT "SETUP.EXE")) {
         log_write("boot: launch setup");
         graphics_set_installer_mode(true);
+        graphics_leave_mode();
         graphics_enter_mode();
-        shell_exec_path_admin("/SETUP.ELF");
+        shell_exec_path_admin(PATH_ROOT "SETUP.EXE");
+        shell_set_boot_complete(true);
+    } else {
+        graphics_draw_shell();
+        shell_set_boot_complete(true);
     }
     log_write("boot: main loop");
     while (1) {
@@ -738,10 +816,14 @@ void kernel_main(uint64_t boot_mode)
             log_write("power: reboot requested");
             asm volatile ("cli");
             kernel_shutdown_processes_and_drivers();
-            graphics_shutdown_animation();
-            outb(0x64, 0xFE);
+            kernel_reboot();
             for (;;) {
+                asm volatile ("cli; hlt");
             }
+        }
+        if (g_sleep_requested) {
+            g_sleep_requested = false;
+            kernel_sleep();
         }
         kernel_run_periodic_work();
     }

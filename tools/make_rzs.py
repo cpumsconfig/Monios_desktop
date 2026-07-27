@@ -19,6 +19,13 @@ MANIFEST_SIZE = struct.calcsize(MANIFEST_FORMAT)
 HEADER_SIZE = 116
 
 
+def is_pe_image(image: bytes) -> bool:
+    if len(image) < 0x40 or image[:2] != b"MZ":
+        return False
+    pe_offset = struct.unpack_from("<I", image, 0x3C)[0]
+    return pe_offset + 4 <= len(image) and image[pe_offset:pe_offset + 4] == b"PE\0\0"
+
+
 def build_manifest(magic: bytes, version: int, header_size: int, image_size: int, image_flags: int, signature_size: int, image_hash: bytes) -> bytes:
     return struct.pack(
         MANIFEST_FORMAT,
@@ -48,7 +55,7 @@ def load_signing_key(path: str | None):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Wrap an ELF64 image as a MONIOS .rzs package")
+    parser = argparse.ArgumentParser(description="Wrap a PE32+ image as a MONIOS .rzs package")
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--flags", default="driver,console,r2", help="comma separated: driver,console,r0,r2")
@@ -57,8 +64,8 @@ def main() -> None:
     args = parser.parse_args()
 
     image = args.input.read_bytes()
-    if len(image) < 4 or image[:4] != b"\x7fELF":
-        raise SystemExit(f"{args.input} is not an ELF image")
+    if not is_pe_image(image):
+        raise SystemExit(f"{args.input} is not a PE image")
 
     flags = 0
     requested = {part.strip().lower() for part in args.flags.split(",") if part.strip()}

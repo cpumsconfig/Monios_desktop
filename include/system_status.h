@@ -43,6 +43,8 @@ typedef struct {
     bool smp_bootstrap_only;
     uint32_t smp_logical_processors;
     uint32_t smp_online_processors;
+    uint32_t smp_firmware_processors;
+    uint32_t smp_firmware_enabled_processors;
 } system_status_t;
 
 #endif

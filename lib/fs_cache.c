@@ -2,8 +2,8 @@
 #include "fs_cache.h"
 
 #define FS_CACHE_SLOTS 16U
-#define FS_CACHE_BLOCK_SIZE 512U
-#define FS_CACHE_PATH_MAX 96U
+#define FS_CACHE_BLOCK_SIZE 4096U
+#define FS_CACHE_PATH_MAX 512U
 
 typedef struct {
     bool valid;
@@ -26,18 +26,35 @@ static bool fs_cache_path_equal(const char *a, const char *b)
     return strcmp(a, b) == 0;
 }
 
-static void fs_cache_copy_path(char *dst, uint32_t size, const char *src)
+static bool fs_cache_path_is_cacheable(const char *path)
 {
     uint32_t i = 0;
 
-    if (size == 0) {
-        return;
+    if (path == NULL) {
+        return false;
     }
-    while (src != NULL && src[i] != '\0' && i + 1 < size) {
+    while (path[i] != '\0') {
+        if (i + 1 >= FS_CACHE_PATH_MAX) {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+static bool fs_cache_copy_path(char *dst, uint32_t size, const char *src)
+{
+    uint32_t i = 0;
+
+    if (dst == NULL || src == NULL || size == 0) {
+        return false;
+    }
+    while (src[i] != '\0' && i + 1 < size) {
         dst[i] = src[i];
         i++;
     }
     dst[i] = '\0';
+    return src[i] == '\0';
 }
 
 void fs_cache_init(void)
@@ -86,7 +103,7 @@ static bool fs_cache_copy_from_slot(fs_cache_slot_t *slot, uint32_t offset, void
         return false;
     }
     in_block = offset - slot->block_start;
-    if (in_block + size > slot->data_size) {
+    if (in_block >= slot->data_size || size > slot->data_size - in_block) {
         return false;
     }
     memcpy(buffer, slot->data + in_block, size);
@@ -106,7 +123,10 @@ int32_t fs_cache_read_at(const char *path, uint32_t offset, void *buffer, uint32
     if (path == NULL || buffer == NULL || loader == NULL) {
         return -1;
     }
-    if (!g_info.enabled) {
+    if (offset > 0xFFFFFFFFu - (size - 1u)) {
+        return -1;
+    }
+    if (!g_info.enabled || !fs_cache_path_is_cacheable(path)) {
         return loader(path, offset, buffer, size);
     }
 
@@ -123,12 +143,16 @@ int32_t fs_cache_read_at(const char *path, uint32_t offset, void *buffer, uint32
 
         slot = fs_cache_find(path, block_start);
         if (slot == NULL) {
+            uint32_t load_size = FS_CACHE_BLOCK_SIZE;
             int32_t loaded;
 
             g_info.misses++;
             slot = fs_cache_choose_slot();
             memset(slot, 0, sizeof(*slot));
-            loaded = loader(path, block_start, slot->data, FS_CACHE_BLOCK_SIZE);
+            if (block_start > 0xFFFFFFFFu - (load_size - 1u)) {
+                load_size = 0xFFFFFFFFu - block_start + 1u;
+            }
+            loaded = loader(path, block_start, slot->data, load_size);
             if (loaded <= 0) {
                 strcpy(g_info.status, "fscache: backend miss");
                 return copied > 0 ? (int32_t) copied : loaded;
@@ -137,7 +161,10 @@ int32_t fs_cache_read_at(const char *path, uint32_t offset, void *buffer, uint32
             slot->block_start = block_start;
             slot->data_size = (uint32_t) loaded;
             slot->age = ++g_age;
-            fs_cache_copy_path(slot->path, sizeof(slot->path), path);
+            if (!fs_cache_copy_path(slot->path, sizeof(slot->path), path)) {
+                slot->valid = false;
+                return copied > 0 ? (int32_t) copied : loader(path, current, (uint8_t *) buffer + copied, want);
+            }
             g_info.fills++;
         }
 

@@ -6,18 +6,26 @@
 
 static bool path_is_separator(char ch)
 {
-    return ch == '/' || ch == '\\';
+    return ch == PATH_SEPARATOR;
+}
+
+static char path_upper_drive(char drive)
+{
+    if (drive >= 'a' && drive <= 'z') {
+        return (char) (drive - 'a' + 'A');
+    }
+    return drive;
 }
 
 static bool path_has_drive_prefix(const char *path)
 {
-    char ch;
+    char drive;
 
     if (path == NULL || path[0] == '\0' || path[1] != ':') {
         return false;
     }
-    ch = path[0];
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+    drive = path_upper_drive(path[0]);
+    return drive >= 'A' && drive <= 'Z';
 }
 
 static bool path_process_stream(const char *path,
@@ -25,7 +33,8 @@ static bool path_process_stream(const char *path,
                                 uint32_t output_size,
                                 uint32_t *length,
                                 uint32_t previous_lengths[PATH_COMPONENT_MAX],
-                                uint32_t *depth)
+                                uint32_t *depth,
+                                uint32_t root_length)
 {
     char component[PATH_COMPONENT_NAME_MAX];
 
@@ -63,11 +72,11 @@ static bool path_process_stream(const char *path,
         }
 
         old_length = *length;
-        if (*length > 1) {
+        if (*length > root_length) {
             if (*length + 1 >= output_size) {
                 return false;
             }
-            output[(*length)++] = '/';
+            output[(*length)++] = PATH_SEPARATOR;
         }
         if (*length + component_length >= output_size) {
             return false;
@@ -82,45 +91,95 @@ static bool path_process_stream(const char *path,
     return true;
 }
 
-static const char *path_skip_drive_prefix(const char *path)
+static const char *path_after_drive_prefix(const char *path)
 {
     if (!path_has_drive_prefix(path)) {
         return path;
     }
-    path += 2;
-    while (path_is_separator(*path)) {
-        path++;
+    return path + 2;
+}
+
+static char path_drive_for(const char *path, char fallback)
+{
+    if (path_has_drive_prefix(path)) {
+        return path_upper_drive(path[0]);
     }
-    return path;
+    return fallback;
 }
 
 bool path_is_absolute(const char *path)
 {
-    return path != NULL && (path[0] == '/' || path[0] == '\\' || path_has_drive_prefix(path));
+    return path != NULL &&
+           (path[0] == PATH_SEPARATOR || path_has_drive_prefix(path));
 }
 
 bool path_resolve(const char *base, const char *input, char *output, uint32_t output_size)
 {
     uint32_t previous_lengths[PATH_COMPONENT_MAX];
     uint32_t depth = 0;
-    uint32_t length = 1;
+    uint32_t length = 3;
+    char drive = 'C';
+    const char *stream;
 
-    if (output == NULL || output_size < 2 || input == NULL) {
+    if (output == NULL || output_size < 4 || input == NULL) {
         return false;
     }
 
-    output[0] = '/';
-    output[1] = '\0';
+    for (stream = input; *stream != '\0'; stream++) {
+        if (*stream == '/') {
+            return false;
+        }
+    }
+    if (base != NULL) {
+        for (stream = base; *stream != '\0'; stream++) {
+            if (*stream == '/') {
+                return false;
+            }
+        }
+    }
+
+    if (path_has_drive_prefix(input)) {
+        drive = path_drive_for(input, drive);
+    } else if (path_is_absolute(input)) {
+        drive = path_drive_for(base, drive);
+    } else {
+        drive = path_drive_for(base, drive);
+    }
+
+    output[0] = drive;
+    output[1] = ':';
+    output[2] = PATH_SEPARATOR;
+    output[3] = '\0';
 
     if (path_is_absolute(input)) {
-        return path_process_stream(path_skip_drive_prefix(input), output, output_size, &length, previous_lengths, &depth);
+        stream = path_after_drive_prefix(input);
+        return path_process_stream(stream,
+                                   output,
+                                   output_size,
+                                   &length,
+                                   previous_lengths,
+                                   &depth,
+                                   3);
     }
 
     if (base != NULL && path_is_absolute(base)) {
-        if (!path_process_stream(path_skip_drive_prefix(base), output, output_size, &length, previous_lengths, &depth)) {
+        stream = path_after_drive_prefix(base);
+        if (!path_process_stream(stream,
+                                 output,
+                                 output_size,
+                                 &length,
+                                 previous_lengths,
+                                 &depth,
+                                 3)) {
             return false;
         }
     }
 
-    return path_process_stream(input, output, output_size, &length, previous_lengths, &depth);
+    return path_process_stream(input,
+                               output,
+                               output_size,
+                               &length,
+                               previous_lengths,
+                               &depth,
+                               3);
 }

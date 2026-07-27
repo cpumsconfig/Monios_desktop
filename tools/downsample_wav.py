@@ -9,7 +9,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
-    parser.add_argument("--rate", type=int, default=11025)
+    parser.add_argument("--rate", type=int, default=44100)
     args = parser.parse_args()
 
     with wave.open(str(args.source), "rb") as src:
@@ -26,11 +26,21 @@ def main() -> None:
     converted = bytearray(target_frames * frame_size)
     out_pos = 0
     for out_frame in range(target_frames):
-        frame_index = (out_frame * source_rate) // args.rate
-        if frame_index >= source_frames:
+        src_pos = (out_frame * source_rate * 65536) // args.rate
+        frame_index = src_pos >> 16
+        frac = src_pos & 0xFFFF
+        if frame_index + 1 >= source_frames:
             frame_index = source_frames - 1
-        pos = frame_index * frame_size
-        converted[out_pos:out_pos + frame_size] = frames[pos:pos + frame_size]
+            pos = frame_index * frame_size
+            converted[out_pos:out_pos + frame_size] = frames[pos:pos + frame_size]
+        else:
+            pos_a = frame_index * frame_size
+            pos_b = (frame_index + 1) * frame_size
+            for ch in range(channels):
+                a = int.from_bytes(frames[pos_a + ch * 2:pos_a + ch * 2 + 2], "little", signed=True)
+                b = int.from_bytes(frames[pos_b + ch * 2:pos_b + ch * 2 + 2], "little", signed=True)
+                sample = a + (((b - a) * frac) >> 16)
+                converted[out_pos + ch * 2:out_pos + ch * 2 + 2] = int(sample).to_bytes(2, "little", signed=True)
         out_pos += frame_size
     converted = bytes(converted[:out_pos])
 

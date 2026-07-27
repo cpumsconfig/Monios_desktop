@@ -50,7 +50,7 @@ int main(int argc, char **argv)
     char cwd[PATH_MAX_LEN];
     app_mouse_snapshot_t snapshot;
 
-    write_line("demo.elf started");
+    write_line("demo.exe started");
     if (app_getcwd(cwd, sizeof(cwd)) >= 0) {
         fputs("cwd: ");
         write_line(cwd);

@@ -4,10 +4,15 @@
 #include "stdbool.h"
 #include "stdint.h"
 
-#define EXEC_ABI_VERSION      3U
+#define EXEC_ABI_VERSION      5U
 #define EXEC_HANDLE_STDIN     0U
 #define EXEC_HANDLE_STDOUT    1U
 #define EXEC_HANDLE_STDERR    2U
+
+#define EXEC_SUBSYSTEM_UNKNOWN 0U
+#define EXEC_SUBSYSTEM_NATIVE  1U
+#define EXEC_SUBSYSTEM_WINDOWS 2U
+#define EXEC_SUBSYSTEM_CONSOLE 3U
 
 #define EXEC_IMAGE_FLAG_CONSOLE      0x00000001U
 #define EXEC_IMAGE_FLAG_GUI          0x00000002U
@@ -15,6 +20,12 @@
 #define EXEC_IMAGE_FLAG_SIGNED       0x00000008U
 #define EXEC_IMAGE_FLAG_NEEDS_R0     0x00000010U
 #define EXEC_IMAGE_FLAG_NEEDS_R2     0x00000020U
+#define EXEC_IMAGE_FLAG_CERT_PRESENT 0x00000040U
+#define EXEC_IMAGE_FLAG_CERT_VALID   0x00000080U
+#define EXEC_IMAGE_FLAG_CERT_REQUIRED 0x00000100U
+#define EXEC_IMAGE_FLAG_RESOURCE_TABLE 0x00000200U
+#define EXEC_IMAGE_FLAG_ICON_RESOURCE 0x00000400U
+#define EXEC_IMAGE_FLAG_MANIFEST_RESOURCE 0x00000800U
 
 #define EXEC_RUN_FLAG_CONSOLE_WINDOW 0x00000001U
 #define EXEC_RUN_FLAG_ADMIN          0x00000002U
@@ -40,7 +51,7 @@ typedef struct {
     uint32_t abi_version;
     uint32_t image_flags;
     uint32_t privilege_level;
-    uint32_t reserved;
+    uint32_t subsystem;
     uint32_t argc;
     char **argv;
     char **env;

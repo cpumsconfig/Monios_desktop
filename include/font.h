@@ -3,19 +3,22 @@
 
 #include "stdbool.h"
 #include "stdint.h"
+#include "ui.h"
 
 #define UI_FONT_WIDTH 20
 #define UI_FONT_HEIGHT 18
 #define UI_FONT_ADVANCE 12
 #define UI_FONT_WIDE_ADVANCE 18
-#define UI_FONT_PATH "/fonts/msyh.ttc"
-#define UI_FONT_FALLBACK_PATH "/MSYH.TTC"
+#define UI_FONT_PATH UI_BOOT_FONT_PATH
+#define UI_FONT_FALLBACK_PATH "C:\\MSYH.TTC"
 
 typedef void (*font_plot_fn)(uint16_t x, uint16_t y, uint32_t color);
 
 void font_init(void);
 bool font_init_step(uint32_t budget_bytes);
 bool font_ready(void);
+bool font_init_failed(void);
+uint32_t font_init_progress(void);
 uint32_t font_text_width(const char *text);
 uint32_t font_utf8_next(const char **cursor);
 uint32_t font_codepoint_advance(uint32_t codepoint);

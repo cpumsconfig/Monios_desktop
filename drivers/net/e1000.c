@@ -406,35 +406,40 @@ void e1000_poll(void (*handler)(const uint8_t *packet, uint16_t length))
 {
     while (g_ready && g_rx_enabled && (g_rx_desc[g_rx_tail].status & E1000_DESC_STATUS_DD) != 0) {
         uint16_t length = g_rx_desc[g_rx_tail].length;
+        uint8_t errors = g_rx_desc[g_rx_tail].errors;
         uint8_t *packet = (uint8_t *) g_rx_buffer_dma[g_rx_tail].virtual_address;
         uint32_t done = g_rx_tail;
 
-        g_net->rx_packets++;
-        /* Log brief packet summary: ethertype and first bytes (up to 16) */
-        if (length >= 14) {
-            uint16_t ether_type = (uint16_t) ((packet[12] << 8) | packet[13]);
-            char line[128];
-            char tmp[16];
-            strcpy(line, "e1000: rx eth=0x");
-            e1000_append_hex32(tmp, ether_type);
-            strcat(line, tmp + 4); /* use last 4 hex chars */
-            strcat(line, " bytes=");
-            e1000_append_dec(tmp, length);
-            strcat(line, tmp);
-            strcat(line, " data=");
-            for (uint32_t i = 0; i < 16 && i < (uint32_t) length; i++) {
-                char hex[3];
-                const char hexchars[] = "0123456789ABCDEF";
-                hex[0] = hexchars[(packet[i] >> 4) & 0xF];
-                hex[1] = hexchars[packet[i] & 0xF];
-                hex[2] = '\0';
-                strcat(line, hex);
-                if (i < 15 && i < (uint32_t) length - 1) strcat(line, " ");
+        if (length > 0 && length <= E1000_BUFFER_SIZE && errors == 0) {
+            g_net->rx_packets++;
+            /* Log brief packet summary: ethertype and first bytes (up to 16) */
+            if (length >= 14) {
+                uint16_t ether_type = (uint16_t) ((packet[12] << 8) | packet[13]);
+                char line[128];
+                char tmp[16];
+                strcpy(line, "e1000: rx eth=0x");
+                e1000_append_hex32(tmp, ether_type);
+                strcat(line, tmp + 4); /* use last 4 hex chars */
+                strcat(line, " bytes=");
+                e1000_append_dec(tmp, length);
+                strcat(line, tmp);
+                strcat(line, " data=");
+                for (uint32_t i = 0; i < 16 && i < (uint32_t) length; i++) {
+                    char hex[3];
+                    const char hexchars[] = "0123456789ABCDEF";
+                    hex[0] = hexchars[(packet[i] >> 4) & 0xF];
+                    hex[1] = hexchars[packet[i] & 0xF];
+                    hex[2] = '\0';
+                    strcat(line, hex);
+                    if (i < 15 && i < (uint32_t) length - 1) strcat(line, " ");
+                }
+                log_write(line);
             }
-            log_write(line);
-        }
-        if (handler != NULL) {
-            handler(packet, length);
+            if (handler != NULL) {
+                handler(packet, length);
+            }
+        } else {
+            e1000_debug_state("rx dropped invalid descriptor");
         }
         g_rx_desc[done].address = g_rx_buffer_dma[done].physical_address;
         g_rx_desc[done].length = 0;

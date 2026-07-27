@@ -87,9 +87,12 @@ static int32_t syscall_handle_write(uint64_t handle, const char *buffer, uint32_
         return (int32_t) size;
     }
 
-    for (uint32_t i = 0; i < size; i++) {
-        console_write_char(buffer[i]);
+    if (exec_active()) {
+        console_write_process_buffer(pcb_current_pid(), buffer, size);
+    } else {
+        console_write_buffer(buffer, size);
     }
+    graphics_notify_process_output();
     return (int32_t) size;
 }
 
@@ -207,6 +210,8 @@ static int32_t syscall_system_status(system_status_t *status, uint32_t size)
     snapshot.smp_bootstrap_only = smp->bootstrap_only;
     snapshot.smp_logical_processors = smp->logical_processors;
     snapshot.smp_online_processors = smp->online_processors;
+    snapshot.smp_firmware_processors = smp->firmware_processors;
+    snapshot.smp_firmware_enabled_processors = smp->firmware_enabled_processors;
 
     if (exec_active()) {
         if (!app_memory_copy_to_user(status, &snapshot, sizeof(snapshot))) {
@@ -497,6 +502,123 @@ static uint64_t syscall_installer_call(uint64_t call, void *request_ptr, uint32_
         }
         return (uint64_t) result;
     }
+    if (call == INSTALLER_CALL_COPY_TARGET) {
+        installer_target_copy_request_t request;
+        char source_path[PATH_MAX_LEN];
+        char target_path[PATH_MAX_LEN];
+        int32_t result;
+
+        if (request_ptr == NULL || request_size < sizeof(request)) {
+            return (uint64_t) -1;
+        }
+        if (exec_active()) {
+            if (!app_memory_copy_from_user(&request, request_ptr, sizeof(request)) ||
+                !app_memory_copy_string_from_user(source_path, sizeof(source_path), request.source_path) ||
+                !app_memory_copy_string_from_user(target_path, sizeof(target_path), request.target_path)) {
+                exec_abort_from_exception(13, 0);
+                return (uint64_t) -1;
+            }
+        } else {
+            request = *((installer_target_copy_request_t *) request_ptr);
+            if (request.source_path == NULL || request.target_path == NULL ||
+                strlen(request.source_path) >= sizeof(source_path) ||
+                strlen(request.target_path) >= sizeof(target_path)) {
+                return (uint64_t) -1;
+            }
+            strcpy(source_path, request.source_path);
+            strcpy(target_path, request.target_path);
+        }
+        result = installer_copy_file_to_target(source_path,
+                                               request.source_offset,
+                                               request.byte_count,
+                                               target_path,
+                                               request.target_lba);
+        request.bytes_written = result > 0 ? (uint32_t) result : 0;
+        if (exec_active()) {
+            (void) app_memory_copy_to_user(request_ptr, &request, sizeof(request));
+        } else {
+            *((installer_target_copy_request_t *) request_ptr) = request;
+        }
+        return (uint64_t) result;
+    }
+    if (call == INSTALLER_CALL_READ_MEDIA) {
+        installer_media_read_request_t request;
+        char source_path[PATH_MAX_LEN];
+        uint8_t data[INSTALLER_MEDIA_READ_MAX];
+        int32_t result;
+
+        if (request_ptr == NULL || request_size < sizeof(request)) {
+            return (uint64_t) -1;
+        }
+        if (exec_active()) {
+            if (!app_memory_copy_from_user(&request, request_ptr, sizeof(request)) ||
+                !app_memory_copy_string_from_user(source_path, sizeof(source_path), request.source_path) ||
+                request.byte_count > sizeof(data)) {
+                exec_abort_from_exception(13, 0);
+                return (uint64_t) -1;
+            }
+        } else {
+            request = *((installer_media_read_request_t *) request_ptr);
+            if (request.source_path == NULL || strlen(request.source_path) >= sizeof(source_path) ||
+                request.byte_count > sizeof(data)) {
+                return (uint64_t) -1;
+            }
+            strcpy(source_path, request.source_path);
+        }
+        result = installer_read_media_file(source_path,
+                                           request.source_offset,
+                                           data,
+                                           request.byte_count);
+        request.bytes_read = result > 0 ? (uint32_t) result : 0;
+        if (result > 0 && exec_active() &&
+            !app_memory_copy_to_user(request.data, data, (uint32_t) result)) {
+            exec_abort_from_exception(13, 0);
+            return (uint64_t) -1;
+        }
+        if (result > 0 && !exec_active() && request.data != NULL) {
+            memcpy(request.data, data, (uint32_t) result);
+        }
+        if (exec_active()) {
+            (void) app_memory_copy_to_user(request_ptr, &request, sizeof(request));
+        } else {
+            *((installer_media_read_request_t *) request_ptr) = request;
+        }
+        return (uint64_t) result;
+    }
+    if (call == INSTALLER_CALL_STAT_MEDIA) {
+        installer_media_stat_request_t request;
+        char source_path[PATH_MAX_LEN];
+        int32_t result;
+
+        if (request_ptr == NULL || request_size < sizeof(request)) {
+            return (uint64_t) -1;
+        }
+        if (exec_active()) {
+            if (!app_memory_copy_from_user(&request, request_ptr, sizeof(request)) ||
+                !app_memory_copy_string_from_user(source_path, sizeof(source_path), request.source_path)) {
+                exec_abort_from_exception(13, 0);
+                return (uint64_t) -1;
+            }
+        } else {
+            request = *((installer_media_stat_request_t *) request_ptr);
+            if (request.source_path == NULL || strlen(request.source_path) >= sizeof(source_path)) {
+                return (uint64_t) -1;
+            }
+            strcpy(source_path, request.source_path);
+        }
+        result = installer_media_file_size(source_path);
+        request.file_size = result;
+        request.exists = result >= 0 ? 1U : 0U;
+        request.reserved[0] = 0;
+        request.reserved[1] = 0;
+        request.reserved[2] = 0;
+        if (exec_active()) {
+            (void) app_memory_copy_to_user(request_ptr, &request, sizeof(request));
+        } else {
+            *((installer_media_stat_request_t *) request_ptr) = request;
+        }
+        return (uint64_t) result;
+    }
     return (uint64_t) -1;
 }
 
@@ -561,6 +683,24 @@ uint64_t syscall_interrupt_dispatch(void *frame_ptr)
             }
         }
         return 0;
+    case SYS_CONSOLE_SET_TITLE: {
+        char title[TERMINAL_WINDOW_TITLE_MAX];
+
+        if ((const char *) frame->rbx == NULL) {
+            return (uint64_t) -1;
+        }
+        if (exec_active()) {
+            if (!app_memory_copy_string_from_user(title,
+                                                  sizeof(title),
+                                                  (const char *) frame->rbx)) {
+                exec_abort_from_exception(13, 0);
+                return (uint64_t) -1;
+            }
+        } else {
+            strlcpy(title, (const char *) frame->rbx, sizeof(title));
+        }
+        return terminal_set_process_console_title(pcb_current_pid(), title) ? 0 : (uint64_t) -1;
+    }
     case SYS_FILE_ROOT_COUNT:
         return file_root_entry_count();
     case SYS_FILE_READ: {
@@ -705,7 +845,9 @@ uint64_t syscall_interrupt_dispatch(void *frame_ptr)
         return path != NULL && audio_play_file(path) ? 0 : (uint64_t) -1;
     }
     case SYS_OPEN_CUBE3D_WINDOW:
-        return (uint64_t) -1;
+        return graphics_open_cube3d_window() ? 0 : (uint64_t) -1;
+    case SYS_OPEN_NOTEPAD_WINDOW:
+        return graphics_open_notepad_window() ? 0 : (uint64_t) -1;
     case SYS_SOCKET_CALL:
         if (frame->rbx == SOCKET_CALL_UDP_OPEN) {
             socket_open_request_t request;

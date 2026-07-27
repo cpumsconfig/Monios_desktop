@@ -1,0 +1,2 @@
+marker at byte: 5229
+surrounding bytes: b'l\r\n\r\nload_font_optional:\r\n    ; Reserve a boot-font region and copy \\\\MSYH.TTC into i'

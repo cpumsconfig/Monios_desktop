@@ -19,6 +19,7 @@ bool session_login(uint32_t index);
 bool session_login_name(const char *name);
 bool session_validate_credentials(const char *username, const char *password);
 bool session_verify_password(const char *password);
+bool session_auth_locked(void);
 const char *session_default_desktop_app(void);
 const char *session_default_logon_app(void);
 

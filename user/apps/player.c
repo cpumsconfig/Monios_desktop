@@ -2,7 +2,7 @@
 #include "unistd.h"
 #include "appsys.h"
 
-#define DEFAULT_TRACK "/home/root/desktop/music.wav"
+#define DEFAULT_TRACK "C:\\Monios\\Users\\root\\Desktop\\music.wav"
 
 static void write_line(const char *text)
 {
@@ -18,7 +18,7 @@ int main(int argc, char **argv)
     if (argc >= 2 && argv[1] != 0 && argv[1][0] != '\0') {
         path = argv[1];
     }
-    write_line("player.elf");
+    write_line("player.exe");
     fputs("track: ");
     write_line(path);
     if (app_audio_play_file(path) == 0) {

@@ -8,8 +8,6 @@ BaseOfStack             equ 07c00h
 %include "load.inc"
 
 LABEL_START:
-    mov al, 'B'
-    call DebugPutc
     mov ax, cs
     mov ds, ax
     mov es, ax
@@ -65,13 +63,9 @@ LABEL_GOTO_NEXT_SECTOR_IN_ROOT_DIR:
     add dword [wSectorNo], 1
     jmp LABEL_SEARCH_IN_ROOT_DIR_BEGIN
 LABEL_NO_LOADERBIN:
-    mov al, 'N'
-    call DebugPutc
     jmp $
 
 LABEL_FILENAME_FOUND:
-    mov al, 'L'
-    call DebugPutc
     and di, 0FFE0h
 
     mov eax, [es:di + 01Ch]
@@ -109,8 +103,6 @@ LABEL_GOON_LOADING_FILE:
     mov [wLoadSegment], ax
     jmp LABEL_GOON_LOADING_FILE
 LABEL_FILE_LOADED:
-    mov al, 'J'
-    call DebugPutc
     push word 0
     popf
     cld
@@ -145,21 +137,6 @@ ReadSector:
     int 13h
     pop ds
     pop si
-    ret
-
-DebugPutc:
-    push ax
-    push bx
-    push dx
-    mov dx, 03f8h
-    out dx, al
-    mov ah, 0eh
-    mov bh, 0
-    mov bl, 07h
-    int 10h
-    pop dx
-    pop bx
-    pop ax
     ret
 
 DiskAddressPacket:

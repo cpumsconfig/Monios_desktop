@@ -325,9 +325,9 @@ def build_fat12_image(kernel_bin_data, loader_bin_data):
     # File size
     struct.pack_into("<I", root, 0x1C, len(loader_bin_data))
 
-    # Root directory entry for KERNEL  BIN
+    # Root directory entry for KERNEL  EXE
     entry2_offset = 32
-    root[entry2_offset:entry2_offset + 11] = b"KERNEL  BIN"
+    root[entry2_offset:entry2_offset + 11] = b"KERNEL  EXE"
     root[entry2_offset + 0x0B] = 0x20
     struct.pack_into("<H", root, entry2_offset + 0x14, 0)
     struct.pack_into("<H", root, entry2_offset + 0x1A, 3)  # cluster 3
@@ -344,7 +344,7 @@ def build_fat12_image(kernel_bin_data, loader_bin_data):
         pad = 512 - len(loader_bin_data) % 512
         image[data_offset + len(loader_bin_data):data_offset + len(loader_bin_data) + pad] = b"\x00" * pad
 
-    # Cluster 3: kernel.bin
+    # Cluster 3: kernel.exe
     kern_offset = data_offset + 512
     image[kern_offset:kern_offset + len(kernel_bin_data)] = kernel_bin_data
 
@@ -631,19 +631,19 @@ timeout: 5
 
 :MoniOS
     protocol: linux
-    kernel_path: /boot/kernel.bin
+    kernel_path: /boot/kernel.exe
     cmdline: root=/dev/ram0
 """
     with open(os.path.join(efi_staging, "limine.conf"), "w") as f:
         f.write(limine_conf)
 
     # Copy kernel
-    kernel_bin = os.path.join(project_dir, "out", "kernel.bin")
+    kernel_bin = os.path.join(project_dir, "out", "kernel.exe")
     boot_dir = os.path.join(efi_staging, "boot")
     os.makedirs(boot_dir, exist_ok=True)
     if os.path.exists(kernel_bin):
         import shutil
-        shutil.copy(kernel_bin, os.path.join(boot_dir, "kernel.bin"))
+        shutil.copy(kernel_bin, os.path.join(boot_dir, "kernel.exe"))
 
     # Try using xorriso for UEFI-only
     xorriso_path = None
@@ -725,7 +725,7 @@ def build_uefi_iso_manual(efi_staging, output_iso):
         while len(iso) % SECTOR_SIZE:
             iso += b"\x00"
 
-    kernel_path = os.path.join(efi_staging, "boot", "kernel.bin")
+    kernel_path = os.path.join(efi_staging, "boot", "kernel.exe")
     if os.path.exists(kernel_path):
         with open(kernel_path, "rb") as f:
             kern_data = f.read()
@@ -762,12 +762,12 @@ def main():
     os.makedirs(os.path.dirname(output_iso), exist_ok=True)
 
     # Kernel and loader paths
-    kernel_bin = os.path.join(project_dir, "out", "kernel.bin")
+    kernel_bin = os.path.join(project_dir, "out", "kernel.exe")
     loader_bin = os.path.join(project_dir, "out", "loader.bin")
     # Check for required files
     missing = []
     if not os.path.exists(kernel_bin):
-        missing.append("kernel.bin")
+        missing.append("kernel.exe")
     if not os.path.exists(loader_bin):
         missing.append("loader.bin")
 

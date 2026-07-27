@@ -1,18 +1,8 @@
-#include "stdio.h"
-#include "unistd.h"
-#include "appsys.h"
-
-static void write_line(const char *text)
-{
-    fputs(text);
-    fputs("\r\n");
-}
+#include "windows_dll.h"
 
 int main(int argc, char **argv)
 {
     (void) argc;
     (void) argv;
-    write_line("notepad.elf");
-    write_line("graphical notepad");
-    return 0;
+    return windows_open_notepad_window() == 0 ? 0 : 1;
 }

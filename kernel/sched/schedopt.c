@@ -18,7 +18,11 @@ void schedopt_refresh(void)
     g_schedopt_info.dispatches = sched->dispatches;
     strcpy(g_schedopt_info.policy, scheduler_policy_name(sched->policy));
     strcpy(g_schedopt_info.status,
-           g_schedopt_info.ap_scheduler_ready ? "schedopt: smp load balancing ready" : "schedopt: bsp scheduler tuned");
+           g_schedopt_info.ap_scheduler_ready
+               ? "schedopt: smp load balancing ready"
+               : (smp->firmware_enabled_processors > 1
+                      ? "schedopt: ap startup pending"
+                      : "schedopt: bsp scheduler tuned"));
 }
 
 void schedopt_init(void)

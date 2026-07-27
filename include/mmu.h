@@ -31,6 +31,7 @@ void reload_segments(void);
 void idt_set_handler(uint8_t vector, uint64_t handler, uint8_t type_attr);
 void tss_set_rsp0(uint64_t rsp0);
 void mmu_map_identity(uint64_t phys_base, uint64_t length);
+void mmu_map_device_identity(uint64_t phys_base, uint64_t length);
 uint64_t mmu_get_pml4_phys(void);
 int mmu_is_active(void);
 

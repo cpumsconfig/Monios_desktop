@@ -4,6 +4,7 @@
 
 #define CMOS_INDEX_PORT 0x70
 #define CMOS_DATA_PORT  0x71
+#define CMOS_LOCAL_TIME_OFFSET_HOURS 8u
 
 static uint8_t cmos_read(uint8_t index)
 {
@@ -19,6 +20,70 @@ static bool cmos_update_in_progress(void)
 static uint8_t cmos_bcd_to_bin(uint8_t value)
 {
     return (uint8_t) ((value & 0x0F) + ((value / 16u) * 10u));
+}
+
+static bool cmos_is_leap_year(uint16_t year)
+{
+    return (year % 4u == 0u && year % 100u != 0u) || year % 400u == 0u;
+}
+
+static uint8_t cmos_days_in_month(uint16_t year, uint8_t month)
+{
+    switch (month) {
+    case 1:
+    case 3:
+    case 5:
+    case 7:
+    case 8:
+    case 10:
+    case 12:
+        return 31;
+    case 4:
+    case 6:
+    case 9:
+    case 11:
+        return 30;
+    case 2:
+        return cmos_is_leap_year(year) ? 29 : 28;
+    default:
+        return 0;
+    }
+}
+
+static void cmos_add_hours(cmos_time_t *time, uint8_t hours)
+{
+    uint8_t days_in_month;
+
+    if (time == NULL) {
+        return;
+    }
+
+    while (hours-- > 0u) {
+        time->hour++;
+        if (time->hour < 24u) {
+            continue;
+        }
+
+        time->hour = 0;
+        days_in_month = cmos_days_in_month(time->year, time->month);
+        if (days_in_month == 0u || time->day == 0u || time->day > days_in_month) {
+            return;
+        }
+
+        time->day++;
+        if (time->day <= days_in_month) {
+            continue;
+        }
+
+        time->day = 1;
+        time->month++;
+        if (time->month <= 12u) {
+            continue;
+        }
+
+        time->month = 1;
+        time->year++;
+    }
 }
 
 void cmos_read_time(cmos_time_t *out_time)
@@ -64,6 +129,7 @@ void cmos_read_time(cmos_time_t *out_time)
     out_time->day = day;
     out_time->month = month;
     out_time->year = (uint16_t) (century * 100u + year);
+    cmos_add_hours(out_time, CMOS_LOCAL_TIME_OFFSET_HOURS);
 }
 
 void cmos_log_time(void)

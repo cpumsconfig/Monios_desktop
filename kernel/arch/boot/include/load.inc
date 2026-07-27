@@ -5,5 +5,4 @@ BaseOfLoaderPhyAddr     equ BaseOfLoader * 10h ; Loader physical address
 BaseOfKernelFile        equ 01000h ; Real-mode 512-byte kernel bounce buffer
 OffsetOfKernelFile      equ 0h     ; Kernel offset
 BaseOfKernelLoadPhyAddr equ BaseOfKernelFile * 10h ; Bounce buffer physical address
-BaseOfKernelFilePhyAddr equ 0200000h ; Kernel runtime physical address (2 MiB)
-KernelEntryPointPhyAddr equ BaseOfKernelFilePhyAddr ; Kernel entry point
+BaseOfKernelFilePhyAddr equ 02000000h ; Kernel runtime physical address (32 MiB)

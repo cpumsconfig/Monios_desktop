@@ -11,6 +11,7 @@ typedef enum {
 } shell_privilege_t;
 
 void shell_init(void);
+void shell_set_boot_complete(bool complete);
 void shell_handle_key_event(const key_event_t *event);
 void shell_handle_navigation_key(key_event_type_t type);
 void shell_handle_special_key(key_event_type_t type);

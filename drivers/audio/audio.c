@@ -358,14 +358,23 @@ static bool audio_resample_stereo_s16(const int16_t *src, uint32_t src_frames, u
     }
 
     for (uint32_t i = 0; i < *out_frames; i++) {
-        uint64_t src_index64 = ((uint64_t) i * (uint64_t) src_rate) / (uint64_t) dst_rate;
-        uint32_t src_index = (uint32_t) src_index64;
+        uint64_t src_pos = (((uint64_t) i * (uint64_t) src_rate) << 16) / (uint64_t) dst_rate;
+        uint32_t src_index = (uint32_t) (src_pos >> 16);
+        uint32_t frac = (uint32_t) (src_pos & 0xFFFFU);
 
-        if (src_index >= src_frames) {
-            src_index = src_frames - 1u;
+        if (src_index + 1U >= src_frames) {
+            src_index = src_frames - 1U;
+            dst[i * 2U] = src[src_index * 2U];
+            dst[i * 2U + 1U] = src[src_index * 2U + 1U];
+        } else {
+            int32_t left_a = src[src_index * 2U];
+            int32_t left_b = src[(src_index + 1U) * 2U];
+            int32_t right_a = src[src_index * 2U + 1U];
+            int32_t right_b = src[(src_index + 1U) * 2U + 1U];
+
+            dst[i * 2U] = (int16_t) (left_a + (int32_t) (((int64_t) (left_b - left_a) * (int64_t) frac) >> 16));
+            dst[i * 2U + 1U] = (int16_t) (right_a + (int32_t) (((int64_t) (right_b - right_a) * (int64_t) frac) >> 16));
         }
-        dst[i * 2u] = src[src_index * 2u];
-        dst[i * 2u + 1u] = src[src_index * 2u + 1u];
     }
 
     *out_pcm = dst;
@@ -723,7 +732,7 @@ void audio_init(void)
     g_audio_started = false;
     g_audio_paused = false;
     g_audio_hw_initialized = false;
-    g_audio_volume = 80;
+    g_audio_volume = 90;
     g_audio_dma_frames = 0;
     g_audio_total_samples = 0;
     g_audio_track_name[0] = '\0';

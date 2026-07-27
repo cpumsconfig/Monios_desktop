@@ -21,5 +21,6 @@ void init_mouse(void);
 void mouse_interrupt_dispatch(void);
 void mouse_redraw_cursor(void);
 void mouse_get_snapshot(mouse_snapshot_t *snapshot);
+int32_t mouse_consume_wheel_delta(void);
 
 #endif

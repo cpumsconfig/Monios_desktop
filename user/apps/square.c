@@ -13,7 +13,7 @@ int main(int argc, char **argv)
     (void) argc;
     (void) argv;
 
-    write_line("square.elf");
+    write_line("square.exe");
     app_enter_graphics_mode();
     app_graphics_fill_rect(392, 248, 240, 240, 0x000F172A);
     app_graphics_fill_rect(412, 268, 200, 200, 0x0038BDF8);

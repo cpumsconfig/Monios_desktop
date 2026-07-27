@@ -1,8 +1,18 @@
 # monios_x64
 
-`monios_x64` 是一个 x86_64 操作系统内核实验项目。项目包含 BIOS/UEFI 启动、长模式内核、内存管理、文件系统、网络栈、设备驱动、图形桌面、应用运行时和示例用户程序。
+`monios_x64` 是一个 x86_64 操作系统内核实验项目。项目包含 BIOS/UEFI 双启动、长模式内核、内存管理、多文件系统、网络协议栈、设备驱动框架、图形桌面、应用运行时和示例用户程序。
 
 ## 当前版本
+
+V0.0.4B: 稳定优化
+- 程序: 改为了exe
+- 界面优化: 添加了一些东西
+- 修复了一些bug和明显漏洞
+- 优化了开机动画
+
+(TIP:开机动画图标是AI生成的，主要是我不会画:( )
+
+总代码行数约61000+
 
 V0.0.3B: 界面优化
 - 界面优化: 添加了一些样式
@@ -31,34 +41,60 @@ V0.0.1B: 初代版本
 
 ## 当前重点
 
-- 启动加载：BIOS 路径由 `kernel/arch/boot/boot.asm` 和 `kernel/arch/boot/loader.asm` 负责，loader 将内核运行镜像复制到 `0x00200000`，即 2 MiB 位置运行；早期长模式页表映射扩展到 16 MiB，避免清 BSS 和早期栈访问踩到未映射区域。
-- UEFI 支持：`tools/build_uefi.py` 生成 `out/monios.efi`，`tools/build_uefi_iso.py` 生成 `out/monios_uefi_installer.iso`，`hd_uefi.img` 将 BIOS loader、kernel 和 `EFI/BOOT/BOOTX64.EFI` 放入同一个 FAT32 镜像。
-- 内核布局：链接脚本位于 `kernel/arch/kernel.ld`，内核运行基址保持在 2 MiB。
-- 文件系统：FAT16/FAT32 作为默认镜像读写路径；extfs 已有写入能力；NTFS 当前偏只读解析；ISO9660 已支持 PVD、目录遍历和文件读取，但不支持写入。
-- 网络：已有 IPv4、DNS、DHCP、UDP、socket、TCP shim、lwIP shim；IPv6 提供地址解析、压缩输出、前缀匹配、链路本地、ULA 和 global-unicast 工具；TLS/SSL、HTTP/HTTPS、WiFi 和浏览器为可探测/可状态输出的逐步实现。
-- 图形：framebuffer/桌面/窗口管理器保留，GUI 状态接口、GPU shim、窗口计数、焦点状态和高分辨率/色深信息已暴露。
-- 设备：IDE/AHCI/NVMe/storage inventory、ATAPI CD-ROM、xHCI/USB 扩展、HID、蓝牙 HCI、GOP/Bochs BGA、音频、SMBus、TPM 等模块已接入状态或探测入口。
-- 内核运行时：IPC 支持 create/send/recv/peek/broadcast/close；调度器保留 RR 并暴露 EEVDF/MUQSS 状态；多用户会话、ACPI/电源管理、SMP 状态和虚拟内存状态均可通过 shell 查询。
+- **启动加载**：BIOS 路径由 `kernel/arch/boot/boot.asm` 和 `kernel/arch/boot/loader.asm` 负责，loader 将内核运行镜像复制到 `0x00200000`（2 MiB）位置运行；早期长模式页表映射扩展到 16 MiB，避免清 BSS 和早期栈访问踩到未映射区域。
+- **UEFI 支持**：`tools/build_uefi.py` 生成 `out/monios.efi`，`tools/build_uefi_iso.py` 生成 `out/monios_uefi_installer.iso`，`hd_uefi.img` 将 BIOS loader、kernel 和 `EFI/BOOT/BOOTX64.EFI` 放入同一个 FAT32 镜像。
+- **内核布局**：链接脚本位于 `kernel/arch/kernel.ld`，内核运行基址保持在 2 MiB。
+- **文件系统**：FAT16/FAT32 作为默认镜像读写路径；extfs 已有写入能力；NTFS 当前偏只读解析；ISO9660 已支持 PVD、目录遍历和文件读取，但不支持写入。
+- **网络**：已有 IPv4、DNS、DHCP、UDP、socket、TCP shim、lwIP shim；IPv6 提供地址解析、压缩输出、前缀匹配、链路本地、ULA 和 global-unicast 工具；网卡驱动覆盖 pcnet 与 e1000；TLS/SSL、HTTP/HTTPS、WiFi 和浏览器为可探测/可状态输出的逐步实现。
+- **图形**：framebuffer/桌面/窗口管理器保留，GUI 状态接口、GPU shim、窗口计数、焦点状态和高分辨率/色深信息已暴露；字体使用 stb_truetype 渲染。
+- **音频**：HDA 框架、ES1371 驱动、AAC 解码支持，播放器应用可播放 WAV/AAC。
+- **存储**：IDE/AHCI/NVMe 三栈并存，ATAPI CD-ROM 只读支持，storage inventory 统一枚举。
+- **总线与外设**：xHCI/USB 扩展、HID、蓝牙 HCI、I2C/I3C/SPI、SMBus、TPM 等模块已接入状态或探测入口。
+- **内核运行时**：IPC 支持 create/send/recv/peek/broadcast/close；调度器保留 RR 并暴露 EEVDF/MUQSS 状态；多用户会话、ACPI/电源管理、SMP 状态和虚拟内存状态均可通过 shell 查询。
+- **虚拟化**：SVM（AMD-V）基础框架已接入 platform 层，为后续嵌套虚拟化做准备。
+- **安装器**：提供 installer 模块，支持 UEFI 环境下的系统部署流程。
 
 ## 项目结构
 
 ```text
-drivers/                 PCI、存储、网络、USB、GPU、音频、SMBus、I2C/I3C/SPI、TPM 等驱动
-fs/                      FAT16/FAT32/ISO9660/NTFS/extfs 文件系统模块
+drivers/                 驱动子系统
+├── audio/               HDA、ES1371、AAC 解码、音频核心
+├── dma/                 DMA 框架
+├── gpu/                 GPU shim 层
+├── i2c/                 I2C 总线驱动
+├── i3c/                 I3C 总线驱动
+├── input/               输入设备框架
+├── mcb/                 内存控制器/DRAM 信息
+├── md/                  软件 RAID
+├── monios/              Monios 平台专用驱动
+├── music/               音乐播放相关驱动
+├── net/                 网卡驱动（pcnet、e1000）
+├── pci/                 PCI 枚举与配置
+├── smbus/               SMBus 驱动
+├── spi/                 SPI 总线驱动
+├── storage/             存储驱动（IDE、AHCI、NVMe、CD-ROM）
+├── tpm/                 TPM 1.2/2.0 接口
+└── usb/                 xHCI、USB 扩展、HID、蓝牙 HCI
+
+fs/                      文件系统模块（FAT16、FAT32、extfs、NTFS、ISO9660）
 include/                 公共头文件
-kernel/arch/             长模式入口、内核主入口、MMU、链接脚本、中断和 BIOS bootloader
-kernel/mm/               heap、frame、buddy、bitmap、VMA、lazyalloc、page、hugetlb、CMA、GUP、zsmalloc
-kernel/sched/            task、scheduler、EEVDF、MUQSS、PCB、futex、signal、BSOD
-kernel/ipc/              IPC 队列和进程/系统状态
-kernel/syscall/          syscall 和用户程序执行入口
-kernel/ui/               图形、字体、窗口管理、shell、GUI、浏览器状态、会话
-kernel/net/              IPv4/IPv6、DNS、socket、TCP、TLS、HTTP、WiFi、密码学后端
-kernel/platform/         ACPI、BIOS、GOP、RTC、CPU、SMP、power、device、driver manager、OPP/OD
-kernel/debug/            registry、GDB stub、crash dump、ftrace
-lib/                     内核/公共工具库
-user/apps/               用户态示例程序：demo、explorar、monilogon、player、notepad、taskmgr、square、cube3d、rzdrv、setup
-user/lib/                用户态运行时和 syscall wrapper
-tools/                   镜像、UEFI、ISO、字体、音频和 RZS 打包脚本
+kernel/
+├── arch/                长模式入口、内核主入口、MMU、中断、BIOS bootloader
+├── mm/                  heap、frame、buddy、bitmap、VMA、lazyalloc、page、hugetlb、CMA、GUP、zsmalloc
+├── sched/               task、scheduler、EEVDF、MUQSS、PCB、futex、signal、BSOD
+├── ipc/                 IPC 队列和进程/系统状态
+├── syscall/             syscall 和用户程序执行入口
+├── ui/                  图形、字体（stb_truetype）、窗口管理、shell、GUI、浏览器状态、会话
+├── net/                 IPv4/IPv6、DNS、socket、TCP、TLS、HTTP、WiFi、密码学后端
+├── platform/            ACPI、BIOS、GOP、RTC、CMOS、CPU、SMP、SVM、power、device、driver manager、OPP/OD、installer
+└── debug/               registry、GDB stub、crash dump、ftrace
+lib/                     内核/公共工具库（字符串、哈希、路径、fs_cache、base64 等）
+user/
+├── apps/                用户态示例程序：登录器、文件管理器、终端、播放器、记事本、任务管理器、设置、3D 示例等
+└── lib/                 用户态运行时和 syscall wrapper
+docs/                    开发文档（app_api.md、console_sdk.md）
+tools/                   镜像、UEFI、ISO、字体、音频、RZS 打包等构建脚本
+examples/                示例代码
 Makefile                 构建、打包和运行入口
 ```
 
@@ -70,6 +106,9 @@ Makefile                 构建、打包和运行入口
 x86_64-elf-gcc
 x86_64-elf-ld
 x86_64-elf-objcopy
+x86_64-w64-mingw32-gcc
+x86_64-w64-mingw32-ld
+x86_64-w64-mingw32-objcopy
 nasm
 python
 make
@@ -114,7 +153,7 @@ make run_vmware
 ```text
 BLJRFP
 mmu: _text_start_pa=0x00200000
-[R3] / $
+[R3] C:\ $
 graphics: desktop drawn
 ```
 
@@ -122,7 +161,7 @@ graphics: desktop drawn
 
 内核 shell 中可以使用以下命令查看或操作模块。
 
-基础和文本处理：
+### 基础和文本处理
 
 ```text
 help
@@ -142,7 +181,7 @@ head [-n <count>] [file]
 tail [-n <count>] [file]
 ```
 
-文件、权限和用户：
+### 文件、权限和用户
 
 ```text
 mkdir <path>
@@ -166,7 +205,7 @@ exit
 shutdown poweroff
 ```
 
-网络和协议：
+### 网络和协议
 
 ```text
 net
@@ -186,7 +225,7 @@ bluetooth
 browser [url]
 ```
 
-文件系统、设备和驱动状态：
+### 文件系统、设备和驱动状态
 
 ```text
 ide
@@ -197,6 +236,7 @@ storagex
 hda
 aac
 pcnet
+e1000
 lwip
 xhci
 usbext
@@ -228,6 +268,7 @@ browser
 power
 term
 smp
+svm
 dev list
 dev read \\.\fscache
 dev read \\.\tls
@@ -252,7 +293,7 @@ dev read \\.\power
 dev read \\.\browser
 ```
 
-内存、调度和 IPC：
+### 内存、调度和 IPC
 
 ```text
 heap
@@ -284,7 +325,7 @@ signal send <pid> <signo>
 signal take <pid>
 ```
 
-默认用户包括：
+### 默认用户
 
 ```text
 root
@@ -300,16 +341,14 @@ dev
 
 ### TLS/SSL
 
-已具备：
-
+**已具备：**
 - TLS 1.0/1.1/1.2 常量、record 类型、handshake 类型和状态机结构。
 - ClientHello 构造、record 构造/解析、ServerHello/Certificate/ServerHelloDone 解析骨架。
 - AES、RSA、HMAC、SHA 系列和 X.509 证书链解析/验证接口。
 - PRF、master secret/key block 派生、基础 socket 集成 API：`tls_connect`、`tls_write`、`tls_read`、`tls_poll`。
 - shell 状态命令：`tls`、`ssl`、`dev read \\.\tls`。
 
-仍待完善：
-
+**仍待完善：**
 - ChangeCipherSpec/Finished 的完整发送、校验和加密状态切换。
 - 更完整的证书信任库、主机名校验、证书吊销和错误报告。
 - 现代 cipher suites、AEAD、TLS 1.3、重传/超时和更稳健的会话管理。
@@ -317,78 +356,78 @@ dev
 
 ### HTTP/HTTPS
 
-已具备：
-
+**已具备：**
 - URL 解析、GET/POST 请求构造、HTTP 响应状态行/响应头解析。
 - `Content-Length`、`Transfer-Encoding: chunked`、`Connection` 等基础字段识别。
 - 基于 TCP socket 的 `http_get`，以及通过 TLS 上层封装的 `https_get` 入口。
 - shell 状态命令：`http get <host> [path]`、`https <url>`、`browser [url]`、`dev read \\.\http`、`dev read \\.\browser`。
 
-仍待完善：
-
+**仍待完善：**
 - HTTPS 的稳定性仍受 TLS 完整握手能力限制。
 - chunked 响应、长连接、重定向、压缩、流式读取和大响应缓存还需要增强。
 - 浏览器当前是 URL/HTML/HTTP 状态框架，不是完整渲染器。
 
 ### WiFi/蓝牙
 
-已具备：
-
+**已具备：**
 - WiFi 通过 PCI class/subclass 探测无线控制器并记录 vendor/device/bus/slot/function/irq。
 - 蓝牙暴露 USB transport/HCI 框架状态，能判断是否具备 USB native/xHCI 传输基础。
 - shell 状态命令：`wifi`、`bluetooth`、`dev read \\.\wifi`、`dev read \\.\bth`。
 
-仍待完善：
-
+**仍待完善：**
 - WiFi 尚未实现扫描、认证、关联、加密和数据面收发。
 - 蓝牙尚未实现控制器枚举、HCI command/event 流、配对、GATT/音频等协议层。
 
 ### GPU/图形
 
-已具备：
-
-- framebuffer 桌面、窗口管理器、鼠标光标、任务栏、登录/文件/终端/关于/播放器/记事本/任务管理器/Cube3D 等窗口。
+**已具备：**
+- framebuffer 桌面、窗口管理器、鼠标光标、任务栏、登录/文件/终端/播放器/记事本/任务管理器/Cube3D 等窗口。
 - GOP/BGA/VMware SVGA 相关状态和 framebuffer 后端信息。
 - GPU shim 暴露 width/height/bpp/pitch、submit/present 计数和 backend 名称。
+- stb_truetype 字体渲染，支持 TrueType 矢量字体。
 - shell 状态命令：`gui`、`wm`、`gpu`、`dev read \\.\gpu`、`dev read \\.\gui`。
 
-仍待完善：
-
+**仍待完善：**
 - 当前 GPU 是 framebuffer/BGA/SVGA shim，不是完整厂商显卡驱动。
 - 硬件队列、DMA command buffer、显存管理、2D/3D 加速和多显示器支持仍待实现。
 - GUI 控件系统仍偏演示性质，布局、输入法、字体回退和应用间通信还需要继续完善。
 
 ### xHCI/HID/USB
 
-已具备：
-
+**已具备：**
 - xHCI PCI 探测、MMIO BAR 映射、capability register 读取、root port/max slot 状态输出。
 - USB legacy/native host 状态、USB 扩展状态、HID 连接到 PS/2 键盘鼠标和 xHCI/legacy 桥接状态。
 - shell 状态命令：`xhci`、`usbext`、`hid`、`dev read \\.\usbext`。
 
-仍待完善：
-
+**仍待完善：**
 - xHCI 还没有完整 command ring/event ring/transfer ring 调度。
 - USB 设备枚举、配置描述符解析、endpoint 调度、热插拔和通用类驱动仍待实现。
 - HID 目前以键盘鼠标状态桥接为主，尚未完成 USB HID report descriptor 解析。
 
 ### ACPI/电源管理
 
-已具备：
-
+**已具备：**
 - ACPI 状态、SCI IRQ、PM1 控制寄存器、S5 poweroff 和 power button hook 状态。
 - `power` 模块整合 ACPI、CPU 频率检测和设备电源管理状态。
 - shell 状态命令：`power`、`shutdown poweroff`、`dev read \\.\power`。
 
-仍待完善：
-
+**仍待完善：**
 - ACPI 依赖固件表能否在早期映射范围内被正确解析；QEMU 或部分真机可能退回 fallback 电源路径。
 - AML 解释器、完整设备电源状态、睡眠/唤醒、热管理、电池和更细粒度的 CPU 电源策略仍待实现。
 
+### SVM 虚拟化
+
+**已具备：**
+- SVM（AMD-V）基础框架接入 platform 层，包含特性检测和状态查询接口。
+- shell 状态命令：`svm`。
+
+**仍待完善：**
+- 尚未实现完整的 VM 切换、NPT 嵌套页表、vCPU 调度和客户机中断注入。
+- 当前为框架级准备，距离可运行嵌套客户机还有较大距离。
+
 ### I2C/I3C/SPI/TPM/MCB/MD/OPP/OD
 
-已具备：
-
+**已具备：**
 - I2C：bus/speed/transfer/scan/read/write API 和状态统计。
 - I3C：CCC、DAA、设备信息、scan/read/write API 和状态统计。
 - SPI：mode/speed/chip-select/transfer/read/write API。
@@ -398,49 +437,43 @@ dev
 - OPP/OD：性能点、频率/电压、governor、功耗/温度/超频限制接口。
 - shell 直接命令和 `dev read` 状态入口已经补齐，便于快速查看和探测。
 
-仍待完善：
-
+**仍待完善：**
 - 这些模块目前多为框架级或有限探测级实现，真实硬件覆盖面还需要逐设备补齐。
 - 需要继续完善 PCI/ACPI/SMBus/固件表绑定、错误恢复、中断/DMA、并发访问和长期稳定性测试。
-- shell 当前主要通过设备状态和相关子系统命令间接观察这些模块，后续可补独立管理命令。
 
 ### ISO9660/CD-ROM
 
-已具备：
-
+**已具备：**
 - ATAPI CD-ROM `TEST UNIT READY`、`INQUIRY`、`READ CAPACITY`、`READ` 基础流程。
 - ISO9660 Primary Volume Descriptor 解析、卷标/发布者/应用信息、root extent/root size。
 - 目录遍历、路径解析、文件存在判断、文件大小查询、文件读取和 root 列表。
 
-仍待完善：
-
+**仍待完善：**
 - ISO9660 是只读文件系统，`write/delete/mkdir/rmdir` 当前返回失败。
 - Joliet、Rock Ridge、多区段、多盘、复杂文件名、权限/时间戳等扩展尚未实现。
 - CD-ROM 路径仍需要更多 QEMU/真机环境验证。
 
 ### NTFS/extfs/FAT
 
-已具备：
-
+**已具备：**
 - FAT16/FAT32 是默认磁盘镜像的主要读写路径。
 - extfs 已支持文件/目录创建、删除、写入、inode/块分配和符号链接。
 - NTFS 已支持 boot metadata、MFT record、index root/allocation、路径解析、目录列出和文件读取。
 
-仍待完善：
-
+**仍待完善：**
 - NTFS 当前保持只读，`write/delete/mkdir/rmdir` 返回失败。
 - extfs 仍需更多一致性、崩溃恢复、fsck 和边界场景测试。
 - 统一 VFS、缓存一致性、权限和跨文件系统挂载模型仍需继续推进。
 
 ### 权限、会话和用户态
 
-已具备：
-
+**已具备：**
 - 默认用户 `root`、`guest`、`dev`，密码文件来自 `pwd.txt`。
 - shell 支持 `login`、`su`、`sudo`，并显示 R3/R2/R0 状态。
 - 用户程序可通过 `run` 或直接执行 `.elf`、`.exe`、`.rzs`，镜像内包含桌面示例应用和 RZS 驱动示例。
+- 提供应用开发 SDK 文档（`docs/app_api.md`、`docs/console_sdk.md`）。
 
-仍待完善：
-
+**仍待完善：**
 - 权限模型仍偏演示性质，不是完整多用户隔离。
 - 用户态 ABI、进程隔离、信号/IPC 与 GUI 应用生命周期还需要继续收敛。
+- 动态链接器与共享库机制尚未实现，用户程序以静态链接为主。

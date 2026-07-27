@@ -581,7 +581,7 @@ static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len
             break;
         }
         len = *opt++;
-        if (opt + len > end) {
+        if ((uint32_t) (end - opt) < len) {
             break;
         }
         if (code == 53 && len >= 1) {

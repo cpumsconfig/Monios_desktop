@@ -495,31 +495,53 @@ static bool ntfs_read_non_resident_data(uint8_t *mft_record, ntfs_attr_header_t 
                 for (uint64_t c = 0; c < read_clusters && bytes_left > 0; c++) {
                     uint64_t cluster_lba = lba + c * g_ntfs_info.sectors_per_cluster;
                     uint8_t sector_buffer[512];
+                    uint32_t s = 0;
+                    uint32_t first_byte = 0;
 
-                    for (uint32_t s = 0; s < g_ntfs_info.sectors_per_cluster && bytes_left > 0; s++) {
-                        uint64_t sector_offset = (uint64_t) s * 512;
-                        if (c == 0 && sector_offset < read_offset) {
-                            continue;
+                    if (c == 0 && read_offset > 0) {
+                        s = (uint32_t) (read_offset / 512u);
+                        first_byte = (uint32_t) (read_offset % 512u);
+                    }
+
+                    for (; s < g_ntfs_info.sectors_per_cluster && bytes_left > 0; ) {
+                        if (first_byte == 0 && bytes_left >= 512u) {
+                            uint32_t whole_sectors = (uint32_t) (bytes_left / 512u);
+
+                            if (whole_sectors > g_ntfs_info.sectors_per_cluster - s) {
+                                whole_sectors = g_ntfs_info.sectors_per_cluster - s;
+                            }
+                            if (whole_sectors > 255u) {
+                                whole_sectors = 255u;
+                            }
+                            if (whole_sectors > 1u) {
+                                if (cluster_lba + s + whole_sectors - 1u > 0x0FFFFFFFULL) {
+                                    return false;
+                                }
+                                ata_read_sectors((uint32_t) (cluster_lba + s), (uint8_t) whole_sectors, dst);
+                                dst += whole_sectors * 512u;
+                                bytes_left -= whole_sectors * 512u;
+                                s += whole_sectors;
+                                continue;
+                            }
                         }
 
                         uint32_t chunk = 512;
-                        if (c == 0 && s == 0 && read_offset > 0) {
-                            chunk = (uint32_t) (512 - (read_offset % 512));
+                        if (first_byte > 0) {
+                            chunk = 512u - first_byte;
                         }
                         if (chunk > bytes_left) {
                             chunk = (uint32_t) bytes_left;
                         }
 
-                        ata_read_sector((uint32_t) (cluster_lba + s), sector_buffer);
-
-                        uint32_t src_offset = 0;
-                        if (c == 0 && s == 0 && read_offset > 0) {
-                            src_offset = (uint32_t) (read_offset % 512);
+                        if (cluster_lba + s > 0x0FFFFFFFULL) {
+                            return false;
                         }
-
-                        memcpy(dst, sector_buffer + src_offset, chunk);
+                        ata_read_sector((uint32_t) (cluster_lba + s), sector_buffer);
+                        memcpy(dst, sector_buffer + first_byte, chunk);
                         dst += chunk;
                         bytes_left -= chunk;
+                        first_byte = 0;
+                        s++;
                     }
                 }
             }
@@ -613,28 +635,100 @@ static bool ntfs_compare_name(const char *name, const uint16_t *utf16_name, uint
     return name[i] == '\0' && utf8_name[i] == '\0';
 }
 
-static bool ntfs_find_in_index(const uint8_t *index_data, uint32_t index_size, const char *name, uint64_t *mft_ref_out)
+static bool ntfs_index_bounds(const uint8_t *index_data, uint32_t index_size,
+                              uint32_t *entries_offset_out, uint32_t *entries_end_out)
 {
     ntfs_index_header_t *index_header;
     uint32_t entries_offset;
-    uint32_t entries_size;
-    uint32_t offset;
+    uint32_t entries_end;
+
+    if (index_data == NULL || index_size < sizeof(ntfs_index_header_t) ||
+        entries_offset_out == NULL || entries_end_out == NULL) {
+        return false;
+    }
 
     index_header = (ntfs_index_header_t *) index_data;
     entries_offset = index_header->entries_offset;
-    entries_size = index_header->total_entries_size;
+    entries_end = index_header->total_entries_size;
+
+    if (entries_offset < sizeof(ntfs_index_header_t) ||
+        entries_offset > entries_end ||
+        entries_end > index_size) {
+        return false;
+    }
+
+    *entries_offset_out = entries_offset;
+    *entries_end_out = entries_end;
+    return true;
+}
+
+static bool ntfs_index_entry_len(const ntfs_index_entry_t *entry,
+                                 uint32_t available, uint32_t *entry_len_out)
+{
+    uint64_t len;
+
+    if (entry == NULL || entry_len_out == NULL) {
+        return false;
+    }
+    len = entry->index_entry_length;
+    if (len == 0 || len > available || len > 0xFFFFFFFFu ||
+        (uint32_t) len < sizeof(ntfs_index_entry_t)) {
+        return false;
+    }
+    *entry_len_out = (uint32_t) len;
+    return true;
+}
+
+static bool ntfs_index_entry_file_name(ntfs_index_entry_t *entry,
+                                       uint32_t entry_len,
+                                       ntfs_file_name_attr_t **file_name_out)
+{
+    uint32_t key_offset;
+    uint32_t name_offset;
+    ntfs_file_name_attr_t *file_name;
+
+    if (entry == NULL || file_name_out == NULL) {
+        return false;
+    }
+    key_offset = (uint32_t) ((uint8_t *) entry->key - (uint8_t *) entry);
+    if (key_offset >= entry_len || entry->key_length > entry_len - key_offset) {
+        return false;
+    }
+    file_name = (ntfs_file_name_attr_t *) entry->key;
+    name_offset = (uint32_t) ((uint8_t *) file_name->name - (uint8_t *) file_name);
+    if (name_offset > entry->key_length ||
+        (uint32_t) file_name->name_length > (entry->key_length - name_offset) / 2u) {
+        return false;
+    }
+    *file_name_out = file_name;
+    return true;
+}
+
+static bool ntfs_find_in_index(const uint8_t *index_data, uint32_t index_size, const char *name, uint64_t *mft_ref_out)
+{
+    uint32_t entries_offset;
+    uint32_t entries_end;
+    uint32_t offset;
+
+    if (!ntfs_index_bounds(index_data, index_size, &entries_offset, &entries_end)) {
+        return false;
+    }
 
     offset = entries_offset;
-    while (offset + sizeof(ntfs_index_entry_t) <= entries_size) {
+    while (offset + sizeof(ntfs_index_entry_t) <= entries_end) {
         ntfs_index_entry_t *entry = (ntfs_index_entry_t *) (index_data + offset);
+        uint32_t entry_len;
 
-        if (entry->index_entry_length == 0) {
+        if (!ntfs_index_entry_len(entry, entries_end - offset, &entry_len)) {
             break;
         }
 
         if ((entry->flags & NTFS_INDEX_ENTRY_FLAG_END) == 0) {
-            ntfs_file_name_attr_t *file_name = (ntfs_file_name_attr_t *) entry->key;
+            ntfs_file_name_attr_t *file_name;
 
+            if (!ntfs_index_entry_file_name(entry, entry_len, &file_name)) {
+                return false;
+            }
             if (ntfs_compare_name(name, (const uint16_t *) file_name->name, file_name->name_length)) {
                 *mft_ref_out = entry->file_reference & 0xFFFFFFFFFFFF;
                 return true;
@@ -645,7 +739,7 @@ static bool ntfs_find_in_index(const uint8_t *index_data, uint32_t index_size, c
             break;
         }
 
-        offset += entry->index_entry_length;
+        offset += entry_len;
     }
 
     return false;
@@ -668,6 +762,9 @@ static bool ntfs_find_file_in_dir(uint64_t dir_mft_ref, const char *name, uint64
     }
 
     if (!ntfs_get_attribute_data(mft_record, attr, 0, &index_data, &index_size)) {
+        return false;
+    }
+    if (index_size < 16) {
         return false;
     }
 
@@ -695,11 +792,9 @@ static bool ntfs_find_file_in_dir(uint64_t dir_mft_ref, const char *name, uint64
 
             if (memcmp(g_index_buffer, "INDX", 4) == 0) {
                 uint32_t offset = 24;
-                ntfs_index_header_t *idx_header = (ntfs_index_header_t *) (g_index_buffer + offset);
-                uint32_t entries_offset = idx_header->entries_offset;
-                uint32_t entries_size = idx_header->total_entries_size;
 
-                if (ntfs_find_in_index(g_index_buffer + offset, entries_size + entries_offset, name, mft_ref_out)) {
+                if (index_record_size > offset &&
+                    ntfs_find_in_index(g_index_buffer + offset, index_record_size - offset, name, mft_ref_out)) {
                     return true;
                 }
             }
@@ -1021,34 +1116,37 @@ bool ntfs_rmdir(const char *path)
 
 static bool ntfs_list_index_entries(const uint8_t *index_data, uint32_t index_size, char *buffer, uint32_t buffer_size, uint32_t *used_out)
 {
-    ntfs_index_header_t *index_header;
     uint32_t entries_offset;
-    uint32_t entries_size;
+    uint32_t entries_end;
     uint32_t offset;
     uint32_t used = *used_out;
 
-    index_header = (ntfs_index_header_t *) index_data;
-    entries_offset = index_header->entries_offset;
-    entries_size = index_header->total_entries_size;
+    if (!ntfs_index_bounds(index_data, index_size, &entries_offset, &entries_end)) {
+        return false;
+    }
 
     offset = entries_offset;
-    while (offset + sizeof(ntfs_index_entry_t) <= entries_size) {
+    while (offset + sizeof(ntfs_index_entry_t) <= entries_end) {
         ntfs_index_entry_t *entry = (ntfs_index_entry_t *) (index_data + offset);
+        uint32_t entry_len;
 
-        if (entry->index_entry_length == 0) {
+        if (!ntfs_index_entry_len(entry, entries_end - offset, &entry_len)) {
             break;
         }
 
         if ((entry->flags & NTFS_INDEX_ENTRY_FLAG_END) == 0) {
-            ntfs_file_name_attr_t *file_name = (ntfs_file_name_attr_t *) entry->key;
+            ntfs_file_name_attr_t *file_name;
             char name[NTFS_MAX_NAME_LEN + 1];
             uint32_t name_len;
 
+            if (!ntfs_index_entry_file_name(entry, entry_len, &file_name)) {
+                return false;
+            }
             ntfs_utf16_to_utf8((const uint16_t *) file_name->name, file_name->name_length, name, sizeof(name));
             name_len = (uint32_t) strlen(name);
 
             if (name_len == 0 || (name[0] == '$' && name[1] != '\0')) {
-                offset += entry->index_entry_length;
+                offset += entry_len;
                 continue;
             }
 
@@ -1072,7 +1170,7 @@ static bool ntfs_list_index_entries(const uint8_t *index_data, uint32_t index_si
             break;
         }
 
-        offset += entry->index_entry_length;
+        offset += entry_len;
     }
 
     *used_out = used;
@@ -1118,6 +1216,9 @@ bool ntfs_list_dir(const char *path, char *buffer, uint32_t buffer_size)
     if (!ntfs_get_attribute_data(mft_record, attr, 0, &index_data, &index_size)) {
         return false;
     }
+    if (index_size < 16) {
+        return false;
+    }
 
     if (!ntfs_list_index_entries(index_data + 16, index_size - 16, buffer, buffer_size, &used)) {
         return false;
@@ -1143,10 +1244,13 @@ bool ntfs_list_dir(const char *path, char *buffer, uint32_t buffer_size)
 
             if (memcmp(g_index_buffer, "INDX", 4) == 0) {
                 uint32_t offset = 24;
-                ntfs_index_header_t *idx_header = (ntfs_index_header_t *) (g_index_buffer + offset);
-                uint32_t entries_size = idx_header->total_entries_size;
 
-                if (!ntfs_list_index_entries(g_index_buffer + offset, entries_size + idx_header->entries_offset, buffer, buffer_size, &used)) {
+                if (index_record_size <= offset ||
+                    !ntfs_list_index_entries(g_index_buffer + offset,
+                                             index_record_size - offset,
+                                             buffer,
+                                             buffer_size,
+                                             &used)) {
                     return false;
                 }
             }

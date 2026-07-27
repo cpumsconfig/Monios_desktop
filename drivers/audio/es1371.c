@@ -28,7 +28,7 @@
 #define ES1371_CONTROL_SYNCRES        0x00004000
 #define ES1371_CONTROL_DAC2_EN        0x00000020
 #define ES1371_DMA_BYTES              (1024U * 1024U)
-#define ES1371_SAMPLE_RATE            8000U
+#define ES1371_SAMPLE_RATE            44100U
 #define ES1371_STEREO_CHANNELS        2U
 #define ES1371_CODEC_READY            0x80000000U
 #define ES1371_CODEC_BUSY             0x40000000U

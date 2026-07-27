@@ -11,7 +11,7 @@ int main(int argc, char **argv)
 {
     const app_launch_info_t *info = app_launch_info();
 
-    write_line("rzdrv.rzs");
+    write_line("rzdrv.sys");
     if (argc >= 2 && argv[1] != 0) {
         fputs("package: ");
         write_line(argv[1]);

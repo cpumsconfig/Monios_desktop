@@ -4,6 +4,8 @@
 
 #define IDE_PRIMARY_IO       0x1F0
 #define IDE_PRIMARY_CTRL     0x3F6
+#define IDE_SECONDARY_IO     0x170
+#define IDE_SECONDARY_CTRL   0x376
 #define IDE_REG_DATA         0
 #define IDE_REG_ERROR        1
 #define IDE_REG_SECCOUNT0    2
@@ -27,6 +29,13 @@ static uint8_t ide_read8(uint16_t io_base, uint8_t reg)
 static void ide_write8(uint16_t io_base, uint8_t reg, uint8_t value)
 {
     outb((uint16_t) (io_base + reg), value);
+}
+
+static void ide_delay_400ns(uint16_t control_base)
+{
+    for (uint32_t i = 0; i < 4; i++) {
+        (void) inb(control_base);
+    }
 }
 
 static bool ide_wait_not_busy(uint16_t io_base)
@@ -73,54 +82,76 @@ static void ide_decode_model(char out[41], const uint16_t identify[256])
     }
 }
 
-static bool ide_identify_primary_master(void)
+static bool ide_identify_drive(uint16_t io_base,
+                               uint16_t control_base,
+                               uint8_t drive,
+                               const char *ready_status)
 {
     uint16_t identify[256];
     uint8_t status;
 
-    memset(&g_ide_info, 0, sizeof(g_ide_info));
-    g_ide_info.io_base = IDE_PRIMARY_IO;
-    g_ide_info.control_base = IDE_PRIMARY_CTRL;
-    g_ide_info.drive = 0xA0;
-    strcpy(g_ide_info.status, "ide: probing primary master");
-
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_HDDEVSEL, 0xA0);
-    for (uint32_t i = 0; i < 4; i++) {
-        (void) inb(IDE_PRIMARY_CTRL);
-    }
-    status = ide_read8(IDE_PRIMARY_IO, IDE_REG_COMMAND);
-    g_ide_info.status_reg = status;
+    ide_write8(io_base, IDE_REG_HDDEVSEL, drive);
+    ide_delay_400ns(control_base);
+    status = ide_read8(io_base, IDE_REG_COMMAND);
     if (status == 0x00 || status == 0xFF) {
-        strcpy(g_ide_info.status, "ide: no primary master");
         return false;
     }
 
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_SECCOUNT0, 0);
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_LBA0, 0);
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_LBA1, 0);
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_LBA2, 0);
-    ide_write8(IDE_PRIMARY_IO, IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
-    if (!ide_wait_not_busy(IDE_PRIMARY_IO) || !ide_wait_drq(IDE_PRIMARY_IO)) {
-        g_ide_info.status_reg = ide_read8(IDE_PRIMARY_IO, IDE_REG_COMMAND);
-        strcpy(g_ide_info.status, "ide: identify failed");
+    ide_write8(io_base, IDE_REG_SECCOUNT0, 0);
+    ide_write8(io_base, IDE_REG_LBA0, 0);
+    ide_write8(io_base, IDE_REG_LBA1, 0);
+    ide_write8(io_base, IDE_REG_LBA2, 0);
+    ide_write8(io_base, IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
+    status = ide_read8(io_base, IDE_REG_COMMAND);
+    if (status == 0x00 ||
+        !ide_wait_not_busy(io_base) ||
+        ide_read8(io_base, IDE_REG_LBA1) != 0 ||
+        ide_read8(io_base, IDE_REG_LBA2) != 0 ||
+        !ide_wait_drq(io_base)) {
         return false;
     }
 
     for (uint32_t i = 0; i < 256; i++) {
-        identify[i] = inw(IDE_PRIMARY_IO + IDE_REG_DATA);
+        identify[i] = inw(io_base + IDE_REG_DATA);
     }
+    memset(&g_ide_info, 0, sizeof(g_ide_info));
     g_ide_info.present = true;
-    g_ide_info.status_reg = ide_read8(IDE_PRIMARY_IO, IDE_REG_COMMAND);
+    g_ide_info.io_base = io_base;
+    g_ide_info.control_base = control_base;
+    g_ide_info.drive = drive;
+    g_ide_info.status_reg = ide_read8(io_base, IDE_REG_COMMAND);
     g_ide_info.sectors = ((uint32_t) identify[61] << 16) | identify[60];
     ide_decode_model(g_ide_info.model, identify);
-    strcpy(g_ide_info.status, "ide: primary master ready");
+    strcpy(g_ide_info.status, ready_status);
     return true;
 }
 
 bool ide_driver_init(void)
 {
-    bool ready = ide_identify_primary_master();
+    bool ready;
 
+    memset(&g_ide_info, 0, sizeof(g_ide_info));
+    strcpy(g_ide_info.status, "ide: probing ATA disks");
+    ready = ide_identify_drive(IDE_PRIMARY_IO,
+                               IDE_PRIMARY_CTRL,
+                               0xA0,
+                               "ide: primary master ready") ||
+            ide_identify_drive(IDE_PRIMARY_IO,
+                               IDE_PRIMARY_CTRL,
+                               0xB0,
+                               "ide: primary slave ready") ||
+            ide_identify_drive(IDE_SECONDARY_IO,
+                               IDE_SECONDARY_CTRL,
+                               0xA0,
+                               "ide: secondary master ready") ||
+            ide_identify_drive(IDE_SECONDARY_IO,
+                               IDE_SECONDARY_CTRL,
+                               0xB0,
+                               "ide: secondary slave ready");
+
+    if (!ready) {
+        strcpy(g_ide_info.status, "ide: no ATA disk");
+    }
     log_write(g_ide_info.status);
     return ready;
 }
