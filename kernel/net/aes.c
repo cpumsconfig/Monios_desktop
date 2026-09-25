@@ -247,7 +247,7 @@ static void aes_add_round_key(uint8_t state[4][4], const uint32_t *round_key)
 static void aes_key_expansion(const uint8_t *key, uint32_t key_len,
                                uint32_t *round_keys, uint32_t rounds)
 {
-    uint32_t i, j;
+    uint32_t i;
     uint32_t temp;
     uint32_t nk = key_len / 4;
     uint32_t nr = rounds;

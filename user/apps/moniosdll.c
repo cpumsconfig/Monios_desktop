@@ -1,4 +1,5 @@
 #define MONIOS_DLL_BUILD 1
+#include "audio.h"
 #include "monios_dll.h"
 #include "futex.h"
 #include "ipc.h"
@@ -7,6 +8,7 @@
 #include "stddef.h"
 #include "string.h"
 #include "syscall.h"
+#include "icons_data.h"
 
 #define MONIOS_DLL_EXPORT __attribute__((dllexport))
 
@@ -95,6 +97,15 @@ int32_t monios_get_system_status(app_system_status_t *status)
 }
 
 MONIOS_DLL_EXPORT
+int32_t monios_http_get_url(const char *url, char *buffer, uint32_t buffer_size)
+{
+    return (int32_t) syscall3(SYS_HTTP_GET_URL,
+                              (uint64_t) url,
+                              (uint64_t) buffer,
+                              buffer_size);
+}
+
+MONIOS_DLL_EXPORT
 int32_t monios_handle_write(uint64_t handle, const void *buffer, uint32_t size)
 {
     return (int32_t) syscall3(SYS_HANDLE_WRITE, handle, (uint64_t) buffer, size);
@@ -161,9 +172,18 @@ int32_t monios_file_list_dir(const char *path, char *buffer, uint32_t size)
 }
 
 MONIOS_DLL_EXPORT
-int32_t monios_audio_play_file(const char *path)
+int32_t monios_audio_play_pcm(const void *data, uint32_t byte_count,
+                              uint32_t sample_rate, uint16_t channels,
+                              uint16_t bits_per_sample)
 {
-    return (int32_t) syscall1(SYS_AUDIO_PLAY_FILE, (uint64_t) path);
+    audio_pcm_submit_request_t request;
+
+    request.data = data;
+    request.byte_count = byte_count;
+    request.sample_rate = sample_rate;
+    request.channels = channels;
+    request.bits_per_sample = bits_per_sample;
+    return (int32_t) syscall1(SYS_AUDIO_PLAY_PCM, (uint64_t) &request);
 }
 
 MONIOS_DLL_EXPORT
@@ -226,6 +246,67 @@ int32_t monios_socket_recvfrom(int32_t handle, char *src_ip,
         }
     }
     return result;
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_open(uint16_t local_port)
+{
+    socket_open_request_t request;
+
+    request.local_port = local_port;
+    request.handle = -1;
+    if (syscall3(SYS_SOCKET_CALL, SOCKET_CALL_TCP_OPEN, (uint64_t) &request, sizeof(request)) != 0) {
+        return -1;
+    }
+    return request.handle;
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_connect(int32_t handle, const char *dst_host, uint16_t dst_port)
+{
+    socket_tcp_connect_request_t request;
+
+    request.handle = handle;
+    memset(request.dst_host, 0, sizeof(request.dst_host));
+    if (dst_host != NULL && strlen(dst_host) < sizeof(request.dst_host)) {
+        strcpy(request.dst_host, dst_host);
+    }
+    request.dst_port = dst_port;
+    return (int32_t) syscall3(SYS_SOCKET_CALL, SOCKET_CALL_TCP_CONNECT, (uint64_t) &request, sizeof(request));
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_send(int32_t handle, const void *data, uint16_t len)
+{
+    socket_tcp_send_request_t request;
+
+    request.handle = handle;
+    request.data = (const uint8_t *) data;
+    request.len = len;
+    return (int32_t) syscall3(SYS_SOCKET_CALL, SOCKET_CALL_TCP_SEND, (uint64_t) &request, sizeof(request));
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_recv(int32_t handle, void *buffer, uint16_t buffer_size)
+{
+    socket_tcp_recv_request_t request;
+
+    request.handle = handle;
+    request.buffer = (uint8_t *) buffer;
+    request.buffer_size = buffer_size;
+    return (int32_t) syscall3(SYS_SOCKET_CALL, SOCKET_CALL_TCP_RECV, (uint64_t) &request, sizeof(request));
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_has_data(int32_t handle)
+{
+    return (int32_t) syscall2(SYS_SOCKET_CALL, SOCKET_CALL_TCP_HAS_DATA, (uint64_t) handle);
+}
+
+MONIOS_DLL_EXPORT
+int32_t monios_socket_tcp_connected(int32_t handle)
+{
+    return (int32_t) syscall2(SYS_SOCKET_CALL, SOCKET_CALL_TCP_CONNECTED, (uint64_t) handle);
 }
 
 MONIOS_DLL_EXPORT
@@ -534,7 +615,80 @@ void monios_installer_reboot(void)
 }
 
 MONIOS_DLL_EXPORT
+uint64_t monios_backup_ctl(uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return syscall5(SYS_BACKUP_CTL, (uint64_t) op, a, b, c, d);
+}
+
+MONIOS_DLL_EXPORT
 void monios_exit_process(int32_t code)
 {
     (void) syscall1(SYS_EXIT_PROCESS, (uint64_t) code);
+}
+
+
+MONIOS_DLL_EXPORT
+int32_t monios_draw_icon(uint32_t icon_id, uint16_t x, uint16_t y, uint16_t size)
+{
+    /* 256x256x4 = 256 KB static scratch; avoids blowing the stack and lets us
+     * reuse the buffer across calls. Freestanding: plain loops only. */
+    static uint8_t s_icon_scratch[256u * 256u * 4u];
+    uint64_t packed;
+
+    if (icon_id >= MONIOS_ICON_COUNT) {
+        return -1;
+    }
+    if (size == 0u || size > 256u) {
+        return -1;
+    }
+
+    packed = ((uint64_t)x << 48) | ((uint64_t)y << 32) |
+             ((uint64_t)size << 16) | (uint64_t)size;
+
+    if (size == MONIOS_ICON_SIZE) {
+        /* Fast path: the bundled asset is already 64x64, blit it directly. */
+        return (int32_t) syscall3(SYS_GRAPHICS_BLIT,
+                                  (uint64_t) g_icon_data[icon_id],
+                                  packed, 1u);
+    }
+
+    /* Slow path: nearest-neighbor resample the 64x64 source into scratch,
+     * then blit the scaled buffer. */
+    {
+        uint32_t oy;
+
+        /* Edge-complete nearest-neighbour: destination [0,size-1] maps onto the
+         * 64x64 source [0,63] inclusive (divide by size-1, guard size==1), so
+         * every requested size (16/24/32/48) reproduces the whole icon instead
+         * of truncating its right/bottom edge. */
+        for (oy = 0; oy < (uint32_t)size; oy++) {
+            uint32_t sy = (size <= 1u) ? 0u :
+                          (oy * (MONIOS_ICON_SIZE - 1u)) / ((uint32_t)size - 1u);
+            uint8_t *dst_row = &s_icon_scratch[(oy * (uint32_t)size) * 4u];
+            uint32_t ox;
+
+            for (ox = 0; ox < (uint32_t)size; ox++) {
+                uint32_t sx = (size <= 1u) ? 0u :
+                              (ox * (MONIOS_ICON_SIZE - 1u)) / ((uint32_t)size - 1u);
+                const uint8_t *sp =
+                    &g_icon_data[icon_id][((sy * MONIOS_ICON_SIZE) + sx) * 4u];
+                uint8_t *dp = &dst_row[ox * 4u];
+
+                dp[0] = sp[0];
+                dp[1] = sp[1];
+                dp[2] = sp[2];
+                dp[3] = sp[3];
+            }
+        }
+    }
+
+    return (int32_t) syscall3(SYS_GRAPHICS_BLIT,
+                              (uint64_t) s_icon_scratch,
+                              packed, 1u);
+}
+
+MONIOS_DLL_EXPORT
+uint32_t monios_icon_count(void)
+{
+    return MONIOS_ICON_COUNT;
 }

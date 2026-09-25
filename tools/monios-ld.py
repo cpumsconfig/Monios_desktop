@@ -118,6 +118,7 @@ def main() -> int:
         command.extend([
             "-L" + str(library_dir),
             "-lconsole",
+            "-losui",
             "-lwindows",
             "-lmonios",
         ])

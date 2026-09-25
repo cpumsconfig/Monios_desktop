@@ -67,7 +67,11 @@ typedef uint64_t size_t;
 #define STBTT_strlen(x) strlen((x))
 #define STBTT_memcpy memcpy
 #define STBTT_memset memset
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
 #include "stb_truetype.h"
+#pragma GCC diagnostic pop
 
 #define FONT_GLYPH_CACHE_SIZE 512
 #define FONT_BITMAP_BYTES (UI_FONT_WIDTH * UI_FONT_HEIGHT)
@@ -226,6 +230,24 @@ static bool font_activate(uint8_t *data, uint32_t size, const char *loaded_prefi
     font_cache_clear();
     g_font_ready = true;
     font_log_size(loaded_prefix, g_font_size);
+    return true;
+}
+
+static bool font_activate_builtin_fallback(void)
+{
+    /*
+     * Keep the desktop usable when the filesystem font cannot be read. The
+     * renderer already has a compact ASCII bitmap font for this path.
+     */
+    g_font_data = NULL;
+    g_font_size = 0;
+    memset(&g_font_info, 0, sizeof(g_font_info));
+    g_font_scale = 0.0f;
+    g_font_has_ascii = false;
+    font_cache_clear();
+    g_font_load_failed = false;
+    g_font_ready = true;
+    log_write("font: using built-in ASCII fallback");
     return true;
 }
 
@@ -568,15 +590,13 @@ bool font_init_step(uint32_t budget_bytes)
             size = file_size(path);
         }
         if (size <= 0) {
-            log_write("font: msyh.ttc not found");
-            g_font_load_failed = true;
-            return false;
+            log_write("font: msyh.ttc not found; using fallback");
+            return font_activate_builtin_fallback();
         }
         g_font_data = (uint8_t *) kmalloc((uint32_t) size);
         if (g_font_data == NULL) {
-            log_write("font: alloc failed");
-            g_font_load_failed = true;
-            return false;
+            log_write("font: alloc failed; using fallback");
+            return font_activate_builtin_fallback();
         }
         g_font_load_path = path;
         g_font_load_size = (uint32_t) size;
@@ -596,9 +616,8 @@ bool font_init_step(uint32_t budget_bytes)
         if (read_size <= 0) {
             kfree(g_font_data);
             g_font_data = NULL;
-            g_font_load_failed = true;
-            log_write("font: read failed");
-            return false;
+            log_write("font: read failed; using fallback");
+            return font_activate_builtin_fallback();
         }
         g_font_load_offset += (uint32_t) read_size;
         budget_bytes -= (uint32_t) read_size;
@@ -612,9 +631,8 @@ bool font_init_step(uint32_t budget_bytes)
     if (!font_activate(g_font_data, g_font_load_size, "font: loaded msyh.ttc bytes=")) {
         kfree(g_font_data);
         g_font_data = NULL;
-        g_font_load_failed = true;
-        log_write("font: parse failed");
-        return false;
+        log_write("font: parse failed; using fallback");
+        return font_activate_builtin_fallback();
     }
     return true;
 }

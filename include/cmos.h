@@ -13,6 +13,7 @@ typedef struct {
 } cmos_time_t;
 
 void cmos_read_time(cmos_time_t *out_time);
+void cmos_write_time(const cmos_time_t *in_time);
 void cmos_log_time(void);
 
 #endif

@@ -4,6 +4,7 @@
 #include "string.h"
 #include "memory.h"
 #include "net.h"
+#include "trust_store.h"
 
 static tls_info_t g_tls_info;
 
@@ -138,6 +139,7 @@ static void tls_generate_random(uint8_t *random)
     }
 }
 
+__attribute__((unused))
 static uint32_t tls_min_u32(uint32_t a, uint32_t b)
 {
     return a < b ? a : b;
@@ -465,9 +467,10 @@ int32_t tls_process_record(tls_ctx_t *ctx, const uint8_t *data, uint32_t len)
 
     type = data[0];
     version = tls_read_uint16(&data[1]);
+    (void)version;
     record_len = tls_read_uint16(&data[3]);
 
-    if (5 + record_len > len) {
+    if ((uint32_t)(5 + record_len) > len) {
         return -1;
     }
 
@@ -824,7 +827,13 @@ int32_t tls_derive_keys(tls_ctx_t *ctx, const uint8_t *pre_master_secret, uint32
 
 int32_t tls_verify_certificate(tls_ctx_t *ctx, const x509_trust_store_t *trust_store)
 {
-    if (ctx == NULL || trust_store == NULL) {
+    if (ctx == NULL) {
+        return -1;
+    }
+    if (trust_store == NULL) {
+        trust_store = trust_store_get();
+    }
+    if (trust_store == NULL) {
         return -1;
     }
 
@@ -942,7 +951,7 @@ int32_t tls_decrypt_record(tls_ctx_t *ctx, const uint8_t *input, uint32_t input_
         return -1;
     }
 
-    if (5 + record_len > input_len) {
+    if ((uint32_t)(5 + record_len) > input_len) {
         return -1;
     }
 
@@ -955,7 +964,7 @@ int32_t tls_decrypt_record(tls_ctx_t *ctx, const uint8_t *input, uint32_t input_
     }
 
     if (record_len < AES_BLOCK_SIZE * 2 || (record_len - AES_BLOCK_SIZE) % AES_BLOCK_SIZE != 0 ||
-        record_len - AES_BLOCK_SIZE > sizeof(plain)) {
+        (uint32_t)(record_len - AES_BLOCK_SIZE) > sizeof(plain)) {
         return -1;
     }
 
@@ -1173,7 +1182,7 @@ static bool tls_process_rx_data(tls_ctx_t *ctx)
         const uint8_t *record = ctx->rx_buffer + ctx->rx_read_pos;
         uint16_t record_len = ((uint16_t) record[3] << 8) | record[4];
 
-        if (ctx->rx_len - ctx->rx_read_pos < 5 + record_len) {
+        if (ctx->rx_len - ctx->rx_read_pos < (uint32_t)(5 + record_len)) {
             /* 记录不完整，等待更多数据 */
             break;
         }

@@ -3,8 +3,10 @@
 
 #include "appsys.h"
 #include "stdint.h"
+#include "icons_data.h"
 
 #define MONIOS_DLL_ABI_VERSION 1U
+#define MONIOS_HTTP_RESPONSE_MAX (32U * 1024U)
 
 #if !defined(MONIOS_DLL_BUILD) && defined(__GNUC__)
 #define MONIOS_DLL_API __attribute__((dllimport))
@@ -23,6 +25,7 @@ MONIOS_DLL_API int32_t monios_console_set_title(const char *title);
 MONIOS_DLL_API int32_t monios_getcwd(char *buffer, uint32_t size);
 MONIOS_DLL_API int32_t monios_get_mouse(app_mouse_snapshot_t *snapshot);
 MONIOS_DLL_API int32_t monios_get_system_status(app_system_status_t *status);
+MONIOS_DLL_API int32_t monios_http_get_url(const char *url, char *buffer, uint32_t buffer_size);
 MONIOS_DLL_API int32_t monios_handle_write(uint64_t handle, const void *buffer, uint32_t size);
 MONIOS_DLL_API int32_t monios_handle_read(uint64_t handle, void *buffer, uint32_t size);
 MONIOS_DLL_API int32_t monios_file_read(const char *path, void *buffer, uint32_t size);
@@ -34,7 +37,9 @@ MONIOS_DLL_API int32_t monios_file_delete(const char *path);
 MONIOS_DLL_API int32_t monios_file_mkdir(const char *path);
 MONIOS_DLL_API int32_t monios_file_rmdir(const char *path);
 MONIOS_DLL_API int32_t monios_file_list_dir(const char *path, char *buffer, uint32_t size);
-MONIOS_DLL_API int32_t monios_audio_play_file(const char *path);
+MONIOS_DLL_API int32_t monios_audio_play_pcm(const void *data, uint32_t byte_count,
+                                             uint32_t sample_rate, uint16_t channels,
+                                             uint16_t bits_per_sample);
 MONIOS_DLL_API int32_t monios_socket_udp_open(uint16_t local_port);
 MONIOS_DLL_API int32_t monios_socket_close(int32_t handle);
 MONIOS_DLL_API int32_t monios_socket_sendto(int32_t handle, const char *dst_host,
@@ -43,6 +48,13 @@ MONIOS_DLL_API int32_t monios_socket_sendto(int32_t handle, const char *dst_host
 MONIOS_DLL_API int32_t monios_socket_recvfrom(int32_t handle, char *src_ip,
                                               uint16_t *src_port, void *buffer,
                                               uint16_t buffer_size);
+MONIOS_DLL_API int32_t monios_socket_tcp_open(uint16_t local_port);
+MONIOS_DLL_API int32_t monios_socket_tcp_connect(int32_t handle, const char *dst_host,
+                                                uint16_t dst_port);
+MONIOS_DLL_API int32_t monios_socket_tcp_send(int32_t handle, const void *data, uint16_t len);
+MONIOS_DLL_API int32_t monios_socket_tcp_recv(int32_t handle, void *buffer, uint16_t buffer_size);
+MONIOS_DLL_API int32_t monios_socket_tcp_has_data(int32_t handle);
+MONIOS_DLL_API int32_t monios_socket_tcp_connected(int32_t handle);
 MONIOS_DLL_API int32_t monios_futex_wait(uint64_t address, uint32_t expected, uint32_t timeout_ticks);
 MONIOS_DLL_API int32_t monios_futex_wake(uint64_t address, uint32_t count);
 MONIOS_DLL_API int32_t monios_ipc_create(const char *name);
@@ -83,6 +95,9 @@ MONIOS_DLL_API int32_t monios_installer_read_media(const char *source_path,
                                                    uint32_t byte_count);
 MONIOS_DLL_API int32_t monios_installer_media_size(const char *source_path);
 MONIOS_DLL_API void monios_installer_reboot(void);
+MONIOS_DLL_API uint64_t monios_backup_ctl(uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 MONIOS_DLL_API void monios_exit_process(int32_t code);
+MONIOS_DLL_API int32_t monios_draw_icon(uint32_t icon_id, uint16_t x, uint16_t y, uint16_t size);
+MONIOS_DLL_API uint32_t monios_icon_count(void);
 
 #endif

@@ -68,6 +68,48 @@ static uint64_t pd3b[512] __attribute__((section(".pml4"), aligned(4096)));
 static uint64_t pd7[512] __attribute__((section(".pml4"), aligned(4096)));
 static uint64_t pd7b[512] __attribute__((section(".pml4"), aligned(4096)));
 
+/* ── On-demand page tables for device MMIO above 9 GiB ──────────────
+ *
+ * The tables above cover 0..9 GiB only. Firmware is free to place a 64-bit BAR
+ * anywhere, and it does: OVMF on q35 hands the xHCI controller
+ * 0xC000000000 (768 GiB). Refusing those BARs is what made the entire USB
+ * stack dead on every UEFI boot, so keep a small pool of page-table pages and
+ * lay them down when a driver asks for such a range.
+ *
+ * The pool is identity-mapped like everything else, so a driver can keep using
+ * the BAR value itself as its base pointer.
+ *
+ * MMU_HIGH_PDPT_MAX 512 GiB regions and MMU_HIGH_PD_MAX 1 GiB regions is far
+ * more than any machine needs for device BARs. The pools are in .bss and must
+ * be page-aligned; init_page_tables() verifies that (the linker script once had
+ * a SUBALIGN() that silently overrode aligned() attributes). */
+#define MMU_HIGH_PDPT_MAX 8u
+#define MMU_HIGH_PD_MAX   16u
+
+static uint64_t g_high_pdpt[MMU_HIGH_PDPT_MAX][512] __attribute__((aligned(4096)));
+static uint64_t g_high_pd[MMU_HIGH_PD_MAX][512] __attribute__((aligned(4096)));
+
+/* Which pool slot backs which address range. Keeping the virtual address of
+ * each table means the mapping code never has to turn a page-table entry
+ * (which holds a physical address) back into a dereferenceable pointer. */
+typedef struct {
+    uint64_t base;      /* PML4 slot base (512 GiB) or PDPT slot base (1 GiB) */
+    uint64_t *table;
+} mmu_high_table_t;
+
+static mmu_high_table_t g_high_pdpt_map[MMU_HIGH_PDPT_MAX];
+static mmu_high_table_t g_high_pd_map[MMU_HIGH_PD_MAX];
+static uint8_t g_high_pdpt_count;
+static uint8_t g_high_pd_count;
+static bool g_high_pool_ok;
+
+/* Kernel image VA/PA bias, copied out of init_page_tables() so the mapping
+ * helpers can convert a table's virtual address into the physical address a
+ * page-table entry must hold. Named "bias" to stay distinct from the locals of
+ * the same purpose inside init_page_tables(). */
+static uint64_t g_kernel_bias_va;
+static uint64_t g_kernel_bias_pa;
+
 /* Published kernel PML4 physical address for runtime checks. */
 static uint64_t mmu_pml4_phys = 0;
 
@@ -278,6 +320,20 @@ void init_page_tables(void)
     memset(pd3b, 0, sizeof(pd3b));
     memset(pd7, 0, sizeof(pd7));
     memset(pd7b, 0, sizeof(pd7b));
+    memset(g_high_pdpt, 0, sizeof(g_high_pdpt));
+    memset(g_high_pd, 0, sizeof(g_high_pd));
+    g_high_pdpt_count = 0u;
+    g_high_pd_count = 0u;
+
+    /* The BAR pool entries are installed as page-table entries, which hold
+     * physical addresses; a non-zero low 12 bits would send the CPU to a
+     * garbage table. Verify alignment instead of trusting the linker. */
+    g_high_pool_ok =
+        (((uint64_t) (uintptr_t) g_high_pdpt & 0xFFFULL) == 0u) &&
+        (((uint64_t) (uintptr_t) g_high_pd     & 0xFFFULL) == 0u);
+    if (!g_high_pool_ok) {
+        log_write("mmu: device BAR pool misaligned - BARs above 9GiB unavailable");
+    }
 
     pml4[0] = (uint64_t) pdpt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
     pdpt[0] = (uint64_t) pd0 | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
@@ -305,12 +361,17 @@ void init_page_tables(void)
     /* pml4 is a virtual address in the kernel's higher-half VA region.
      * CR3 requires the physical address of the PML4. Convert using the
      * kernel link base addresses stored in the kconfig section (written
-     * by kernel_main). Layout at _kconfig_start: [0]=kernel_base_pa, [1]=kernel_base_va
+     * by kernel_main). Layout at _kconfig_start: [0]=kernel_base_pa,
+     * [1]=kernel_base_va, [3]=kernel_heap_base, [4]=kernel_heap_size.
      */
     extern uint64_t _kconfig_start;
     volatile uint64_t *kcfg = (volatile uint64_t *)&_kconfig_start;
     uint64_t kernel_base_pa = kcfg[0];
     uint64_t kernel_base_va = kcfg[1];
+
+    /* Publish the bias for the runtime device-BAR mapping helpers. */
+    g_kernel_bias_pa = kernel_base_pa;
+    g_kernel_bias_va = kernel_base_va;
 
     /* Print key kernel symbol VAs and expected PAs for verification. */
     extern uint64_t _text_start;
@@ -424,65 +485,222 @@ void init_page_tables(void)
     log_write("mmu: post-cr3 continue");
 }
 
+/* Physical address of one of our page tables, for storing into an entry. */
+static uint64_t mmu_table_phys(const void *table)
+{
+    uint64_t va = (uint64_t) (uintptr_t) table;
+
+    if (g_kernel_bias_va != 0u && va >= g_kernel_bias_va) {
+        return va - g_kernel_bias_va + g_kernel_bias_pa;
+    }
+    return va;
+}
+
+/* Find (or allocate) the 512 GiB region table holding `addr`. */
+static uint64_t *mmu_high_pdpt_for(uint64_t addr)
+{
+    uint64_t base = addr & ~((1ULL << 39) - 1ULL);
+
+    for (uint8_t i = 0; i < g_high_pdpt_count; i++) {
+        if (g_high_pdpt_map[i].base == base) {
+            return g_high_pdpt_map[i].table;
+        }
+    }
+    if (g_high_pdpt_count >= MMU_HIGH_PDPT_MAX) {
+        return NULL;
+    }
+    g_high_pdpt_map[g_high_pdpt_count].base = base;
+    g_high_pdpt_map[g_high_pdpt_count].table = g_high_pdpt[g_high_pdpt_count];
+    return g_high_pdpt[g_high_pdpt_count++];
+}
+
+/* Find (or allocate) the 1 GiB region table holding `addr`. */
+static uint64_t *mmu_high_pd_for(uint64_t addr)
+{
+    uint64_t base = addr & ~((1ULL << 30) - 1ULL);
+
+    for (uint8_t i = 0; i < g_high_pd_count; i++) {
+        if (g_high_pd_map[i].base == base) {
+            return g_high_pd_map[i].table;
+        }
+    }
+    if (g_high_pd_count >= MMU_HIGH_PD_MAX) {
+        return NULL;
+    }
+    g_high_pd_map[g_high_pd_count].base = base;
+    g_high_pd_map[g_high_pd_count].table = g_high_pd[g_high_pd_count];
+    return g_high_pd[g_high_pd_count++];
+}
+
+/* Identity-map one 2MiB page at `addr` using the high table pool. Returns false
+ * when the pool is exhausted, misaligned or the address is not in the kernel
+ * half of the address space. */
+static bool mmu_map_high_identity(uint64_t addr, uint64_t flags)
+{
+    uint64_t pml4_index = addr >> 39;
+    uint64_t pdpt_index = (addr >> 30) & 0x1FFULL;
+    uint64_t pd_index   = (addr >> 21) & 0x1FFULL;
+    uint64_t *pdpt_tbl;
+    uint64_t *pd_tbl;
+    uint64_t entry;
+
+    /* This is an *identity* map (VA == PA), so a device BAR above 9 GiB lands
+     * in the low half of the address space - the same half the kernel already
+     * uses for its 0..9 GiB identity map rooted at pml4[0]. Refuse the high
+     * half instead: pml4[256..511] belong to the kernel's own VA region and
+     * overwriting one with an identity map would unmap the kernel itself.
+     *
+     * (The check was the other way round, which rejected exactly the case this
+     * function exists for: OVMF on q35 hands xHCI BAR = 0xC000000000, whose
+     * PML4 index is 1.) */
+    if (!g_high_pool_ok || pml4_index >= 256ULL) {
+        return false;
+    }
+
+    if (pml4_index == 0ULL) {
+        /* pml4[0] -> pdpt already exists and describes 0..512 GiB. Its PDPT
+         * entries 0..8 are the tables built by init_page_tables(); entries
+         * 9..511 are free, which is precisely the 9..512 GiB range this
+         * function is asked to cover. Reuse that table rather than allocating a
+         * second PDPT for the same PML4 slot. */
+        pdpt_tbl = pdpt;
+    } else {
+        entry = pml4[pml4_index];
+        if ((entry & PAGE_PRESENT) == 0u) {
+            pdpt_tbl = mmu_high_pdpt_for(addr);
+            if (pdpt_tbl == NULL) {
+                return false;
+            }
+            memset(pdpt_tbl, 0, 4096u);
+            pml4[pml4_index] = mmu_table_phys(pdpt_tbl) | PAGE_PRESENT | PAGE_WRITABLE;
+        } else if ((entry & PAGE_LARGE_2M) != 0u) {
+            return false;   /* a 1GiB page already covers it */
+        } else {
+            pdpt_tbl = mmu_high_pdpt_for(addr);
+            if (pdpt_tbl == NULL) {
+                return false;
+            }
+            /* The PML4 entry may point at a table someone else installed
+             * (none exist above 9 GiB today, but do not assume). */
+            if (pdpt_tbl != (uint64_t *) (uintptr_t) (entry & ~0xFFFULL)) {
+                return false;
+            }
+        }
+    }
+
+    entry = pdpt_tbl[pdpt_index];
+    if ((entry & PAGE_PRESENT) == 0u) {
+        pd_tbl = mmu_high_pd_for(addr);
+        if (pd_tbl == NULL) {
+            return false;
+        }
+        memset(pd_tbl, 0, 4096u);
+        pdpt_tbl[pdpt_index] = mmu_table_phys(pd_tbl) | PAGE_PRESENT | PAGE_WRITABLE;
+    } else if ((entry & PAGE_LARGE_2M) != 0u) {
+        return (entry & ~0x1FFFFFULL) == (addr & ~0x1FFFFFULL);
+    } else {
+        pd_tbl = mmu_high_pd_for(addr);
+        if (pd_tbl == NULL) {
+            return false;
+        }
+        if (pd_tbl != (uint64_t *) (uintptr_t) (entry & ~0xFFFULL)) {
+            return false;
+        }
+    }
+
+    pd_tbl[pd_index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
+    return true;
+}
+
 /* Map a physical range into the kernel page-tables using 2MiB large pages.
  * This helper is intended for early use (before writing CR3) so the kernel
  * can ensure device MMIO / framebuffer physical regions are present when
  * switching to its own page tables.
- */
-static void mmu_map_identity_flags(uint64_t phys_base, uint64_t length, uint64_t flags)
+ *
+ * The pd* tables below cover 0..9 GiB and nothing above that. Every branch is
+ * therefore bounds-checked, and the function reports whether the whole range
+ * was covered. This matters for device BARs: firmware places 64-bit BARs
+ * arbitrarily high (OVMF on q35 puts the xHCI BAR at 0xC000000000), and the
+ * previous unbounded "8 GiB and up" branch computed an index of ~400k into a
+ * 512-entry table, writing megabytes past the end of it and corrupting memory
+ * instead of failing. Callers that cannot tolerate a partial mapping must check
+ * the result; drivers should refuse to touch a BAR that was not mapped. */
+static bool mmu_map_identity_flags(uint64_t phys_base, uint64_t length, uint64_t flags)
 {
     const uint64_t page_size = 0x200000ULL; /* 2MiB */
     uint64_t start = phys_base & ~(page_size - 1);
     uint64_t end = ((phys_base + length + page_size - 1) & ~(page_size - 1));
+    uint64_t addr;
+    uint64_t mapped_end = start;
+    bool complete = true;
 
-    for (uint64_t addr = start; addr < end; addr += page_size) {
+    for (addr = start; addr < end; addr += page_size) {
+        uint64_t index;
+
         /* map into appropriate PD array depending on physical address */
-        if (addr < (uint64_t)512 * page_size) {
+        if (addr < 512ULL * page_size) {
             /* 0..1GiB -> pd0 */
-            uint64_t index = addr / page_size;
+            index = addr / page_size;
             pd0[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
-        } else if (addr < (uint64_t)1024 * page_size) {
+        } else if (addr < 1024ULL * page_size) {
             /* 1GiB..2GiB -> pd1 */
-            uint64_t index = (addr / page_size) - 512;
+            index = (addr / page_size) - 512;
             pd1[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
-        } else if (addr < (uint64_t)1536 * page_size) {
+        } else if (addr < 1536ULL * page_size) {
             /* 2GiB..3GiB -> pd2 */
-            uint64_t index = (addr / page_size) - 1024;
+            index = (addr / page_size) - 1024;
             pd2[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0xC0000000ULL && addr < 0x100000000ULL) {
             /* 3GiB..4GiB -> pd3 */
-            uint64_t index = (addr - 0xC0000000ULL) / page_size;
+            index = (addr - 0xC0000000ULL) / page_size;
             pd3[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0x100000000ULL && addr < 0x1C0000000ULL) {
             /* 4GiB..7GiB -> pd3b (1:1 layout used earlier) */
-            uint64_t index = (addr - 0x100000000ULL) / page_size;
+            index = (addr - 0x100000000ULL) / page_size;
             pd3b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
         } else if (addr >= 0x1C0000000ULL && addr < 0x200000000ULL) {
             /* 7GiB..8GiB -> pd7 */
-            uint64_t index = (addr - 0x1C0000000ULL) / page_size;
+            index = (addr - 0x1C0000000ULL) / page_size;
             pd7[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
-        } else if (addr >= 0x200000000ULL) {
-            /* 8GiB+ -> pd7b */
-            uint64_t index = (addr - 0x200000000ULL) / page_size;
+        } else if (addr >= 0x200000000ULL &&
+                   (addr - 0x200000000ULL) / page_size < 512ULL) {
+            /* 8GiB..9GiB -> pd7b (1:1 layout used earlier) */
+            index = (addr - 0x200000000ULL) / page_size;
             pd7b[index] = addr | PAGE_PRESENT | PAGE_WRITABLE | PAGE_LARGE_2M | flags;
+        } else if (addr >= 0x200000000ULL) {
+            /* 9GiB and up -> the on-demand high table pool. Firmware places
+             * 64-bit device BARs wherever it likes; OVMF on q35 uses
+             * 0xC000000000 for xHCI. Refusing to map those is what left the
+             * USB stack dead on every UEFI boot. */
+            if (!mmu_map_high_identity(addr, flags)) {
+                complete = false;
+                break;
+            }
+        } else {
+            /* 3GiB..4GiB is covered above; this is unreachable. */
+            complete = false;
+            break;
         }
+        mapped_end = addr + page_size;
     }
 
     if (flags != 0 && mmu_pml4_phys != 0 && mmu_is_active()) {
-        for (uint64_t addr = start; addr < end; addr += page_size) {
+        for (addr = start; addr < mapped_end; addr += page_size) {
             asm volatile ("invlpg (%0)" : : "r" ((void *) (uintptr_t) addr) : "memory");
         }
     }
+    return complete;
 }
 
-void mmu_map_identity(uint64_t phys_base, uint64_t length)
+bool mmu_map_identity(uint64_t phys_base, uint64_t length)
 {
-    mmu_map_identity_flags(phys_base, length, 0);
+    return mmu_map_identity_flags(phys_base, length, 0);
 }
 
-void mmu_map_device_identity(uint64_t phys_base, uint64_t length)
+bool mmu_map_device_identity(uint64_t phys_base, uint64_t length)
 {
-    mmu_map_identity_flags(phys_base, length, PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE);
+    return mmu_map_identity_flags(phys_base, length,
+                                  PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE);
 }
 
 /* Expose current kernel PML4 physical and activation check. */
@@ -496,4 +714,27 @@ int mmu_is_active(void)
     uint64_t cur;
     asm volatile ("mov %%cr3, %0" : "=r" (cur));
     return cur == mmu_pml4_phys;
+}
+
+/* ── Per-process address-space support ─────────────────────────────── */
+
+void mmu_clone_pdpt(uint64_t *dst_pdpt)
+{
+    if (dst_pdpt == NULL) {
+        return;
+    }
+    memcpy(dst_pdpt, pdpt, sizeof(pdpt));
+    /* Caller sets dst_pdpt[0] to its own PD0. */
+    dst_pdpt[0] = 0;
+}
+
+void mmu_clone_pd0(uint64_t *dst_pd0)
+{
+    if (dst_pd0 == NULL) {
+        return;
+    }
+    memcpy(dst_pd0, pd0, sizeof(pd0));
+    /* Caller overrides entries 32 and 33 (the 4 MiB user window). */
+    dst_pd0[32] = 0;
+    dst_pd0[33] = 0;
 }

@@ -22,7 +22,7 @@ static zs_info_t g_zs_info;
 static char g_zs_status[64];
 static uint32_t g_zs_pool_count = 0;
 
-static uint32_t zs_next_power_of_two(uint32_t size)
+static __attribute__((unused)) uint32_t zs_next_power_of_two(uint32_t size)
 {
     uint32_t result = ZS_MIN_SIZE;
     while (result < size && result < ZS_MAX_SIZE) {
@@ -54,7 +54,7 @@ static void zs_init_size_classes(zs_pool_t *pool)
 }
 
 /* 简化的压缩函数（实际实现中应该使用 LZ4 等算法） */
-static uint32_t zs_compress(const uint8_t *src, uint32_t src_len,
+static __attribute__((unused)) uint32_t zs_compress(const uint8_t *src, uint32_t src_len,
                             uint8_t *dst, uint32_t dst_len)
 {
     /* 简化实现：直接复制，不压缩 */
@@ -67,7 +67,7 @@ static uint32_t zs_compress(const uint8_t *src, uint32_t src_len,
 }
 
 /* 简化的解压函数 */
-static uint32_t zs_decompress(const uint8_t *src, uint32_t src_len,
+static __attribute__((unused)) uint32_t zs_decompress(const uint8_t *src, uint32_t src_len,
                               uint8_t *dst, uint32_t dst_len)
 {
     /* 简化实现：直接复制，不解压 */

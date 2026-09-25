@@ -15,11 +15,44 @@
 #define SOCKET_CALL_TCP_CONNECT 6
 #define SOCKET_CALL_TCP_SEND   7
 #define SOCKET_CALL_TCP_RECV   8
+#define SOCKET_CALL_TCP_HAS_DATA 9
+#define SOCKET_CALL_TCP_CONNECTED 10
+#define SOCKET_CALL_TCP_LISTEN   11
+#define SOCKET_CALL_TCP_ACCEPT   12
 
 typedef struct {
     uint16_t local_port;
     int32_t handle;
 } socket_open_request_t;
+
+typedef struct {
+    int32_t handle;
+    char dst_host[64];
+    uint16_t dst_port;
+} socket_tcp_connect_request_t;
+
+typedef struct {
+    int32_t handle;
+    const uint8_t *data;
+    uint16_t len;
+} socket_tcp_send_request_t;
+
+typedef struct {
+    int32_t handle;
+    uint8_t *buffer;
+    uint16_t buffer_size;
+} socket_tcp_recv_request_t;
+
+typedef struct {
+    int32_t handle;
+} socket_simple_request_t;
+
+typedef struct {
+    int32_t handle;        /* in: listen socket created by TCP_OPEN */
+    int32_t client;        /* out: new connected client socket handle */
+    char client_ip[16];    /* out: dotted source IPv4 */
+    uint16_t client_port;  /* out */
+} socket_tcp_accept_request_t;
 
 typedef struct {
     int32_t handle;
@@ -50,6 +83,11 @@ int32_t socket_tcp_send(int32_t handle, const uint8_t *data, uint16_t len);
 int32_t socket_tcp_recv(int32_t handle, uint8_t *buffer, uint16_t buffer_size);
 bool socket_tcp_is_connected(int32_t handle);
 bool socket_tcp_has_data(int32_t handle);
+
+/* Server side: listen on the bound local_port, and poll for a newly
+ * established inbound connection (returns a fresh client socket, or -1). */
+int32_t socket_tcp_listen(int32_t handle);
+int32_t socket_tcp_accept(int32_t handle, char *client_ip_text, uint16_t *client_port);
 
 uint32_t socket_count(void);
 const char *socket_status(void);

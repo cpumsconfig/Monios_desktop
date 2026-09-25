@@ -24,7 +24,16 @@ typedef struct {
     uint64_t gs_base;
     uint64_t kernel_rip;    /* kernel entry / _start */
     uint64_t uptime_ticks;  /* timer ticks at crash */
-    uint8_t  reserved[96];  /* padding / future use */
+    /* General-purpose register snapshot taken inside crash_dump_capture():
+     *   0=rax 1=rbx 2=rcx 3=rdx 4=rsi 5=rdi 6=rbp 7=rsp
+     *   8..15 = r8..r15
+     */
+    uint64_t gpr[16];
+    /* Best-effort frame-pointer walk (return addresses), up to 16 frames. */
+    uint64_t backtrace[16];
+    uint32_t backtrace_frames;
+    uint32_t log_len;        /* bytes of kernel log copied after header */
+    uint8_t  reserved[60];   /* padding / future use */
     uint8_t  data_start;    /* variable dump data begins here */
 } __attribute__((packed)) crash_dump_header_t;
 

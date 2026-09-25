@@ -1,4 +1,5 @@
 #include "appsys.h"
+#include "syscall.h"
 #include "monios_dll.h"
 #include "string.h"
 #include "windows_dll.h"
@@ -47,6 +48,11 @@ int app_get_mouse(app_mouse_snapshot_t *snapshot)
 int app_get_system_status(app_system_status_t *status)
 {
     return (int) monios_get_system_status(status);
+}
+
+int app_http_get_url(const char *url, char *buffer, uint32_t buffer_size)
+{
+    return (int) monios_http_get_url(url, buffer, buffer_size);
 }
 
 int app_file_read(const char *path, void *buffer, uint32_t size)
@@ -99,9 +105,10 @@ void app_enter_graphics_mode(void)
     windows_enter_graphics_mode();
 }
 
-int app_audio_play_file(const char *path)
+int app_audio_play_pcm(const void *data, uint32_t byte_count, uint32_t sample_rate,
+                       uint16_t channels, uint16_t bits_per_sample)
 {
-    return (int) monios_audio_play_file(path);
+    return (int) monios_audio_play_pcm(data, byte_count, sample_rate, channels, bits_per_sample);
 }
 
 int app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
@@ -219,6 +226,26 @@ bool app_defer_exec(const char *path)
     return monios_defer_exec(path) == 0;
 }
 
+bool app_driver_load(const char *path)
+{
+    return syscall1(SYS_DRIVER_LOAD, (uint64_t) path) == 0;
+}
+
+bool app_driver_unload(const char *name, bool force)
+{
+    return syscall2(SYS_DRIVER_UNLOAD,
+                    (uint64_t) name,
+                    force ? 1U : 0U) == 0;
+}
+
+bool app_driver_query(driver_status_snapshot_t *snapshot)
+{
+    return syscall3(SYS_DRIVER_QUERY,
+                    (uint64_t) snapshot,
+                    sizeof(*snapshot),
+                    0) == 0;
+}
+
 bool app_installer_boot_media(void)
 {
     return monios_installer_boot_media() != 0;
@@ -262,6 +289,11 @@ int app_installer_media_size(const char *source_path)
 void app_installer_reboot(void)
 {
     monios_installer_reboot();
+}
+
+uint64_t app_backup_ctl(uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    return monios_backup_ctl(op, a, b, c, d);
 }
 
 void app_exit(int code)

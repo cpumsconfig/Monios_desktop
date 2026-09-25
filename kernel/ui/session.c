@@ -8,7 +8,7 @@
 #include "ui.h"
 
 #define SESSION_AUTH_PATH UI_AUTH_PATH
-#define SESSION_AUTH_FILE_MAX 160
+#define SESSION_AUTH_FILE_MAX 512
 #define SESSION_HASH_OUTPUT_MAX 96
 #define SESSION_COMBINED_SECRET_MAX 96
 #define SESSION_DEFAULT_SALT "monios"
@@ -24,6 +24,8 @@ static char g_default_logon_app[32];
 static uint32_t g_auth_failed_attempts;
 static bool g_auth_locked;
 static uint64_t g_auth_lock_until_tick;
+
+static bool session_verify_password_for_user(const char *username, const char *password);
 
 static bool session_copy_string(char *dst, uint32_t dst_size, const char *src)
 {
@@ -69,7 +71,10 @@ static void session_trim_in_place(char *text)
         return;
     }
 
-    if ((uint8_t) text[0] == 0xEF && (uint8_t) text[1] == 0xBB && (uint8_t) text[2] == 0xBF) {
+    if (strlen(text) >= 3U &&
+        (uint8_t) text[0] == 0xEF &&
+        (uint8_t) text[1] == 0xBB &&
+        (uint8_t) text[2] == 0xBF) {
         start = 3;
     }
     while (text[start] == ' ' || text[start] == '\r' || text[start] == '\n' || text[start] == '\t') {
@@ -113,6 +118,32 @@ static bool session_compute_salted_password_hash(const char *salt, const char *p
     combined[salt_len + password_len] = '\0';
     hash_sha256((const uint8_t *) combined, salt_len + password_len, digest);
     return base64_encode(digest, sizeof(digest), output, output_size) >= 0;
+}
+
+static bool session_constant_time_equal(const char *left, const char *right)
+{
+    uint32_t left_len;
+    uint32_t right_len;
+    uint32_t limit;
+    uint8_t difference = 0;
+
+    if (left == NULL || right == NULL) {
+        return false;
+    }
+    left_len = (uint32_t) strlen(left);
+    right_len = (uint32_t) strlen(right);
+    limit = left_len > right_len ? left_len : right_len;
+    if (limit >= SESSION_HASH_OUTPUT_MAX) {
+        return false;
+    }
+    difference = (uint8_t) (left_len ^ right_len);
+    for (uint32_t i = 0; i < limit; i++) {
+        uint8_t left_byte = i < left_len ? (uint8_t) left[i] : 0;
+        uint8_t right_byte = i < right_len ? (uint8_t) right[i] : 0;
+
+        difference |= (uint8_t) (left_byte ^ right_byte);
+    }
+    return difference == 0;
 }
 
 static void session_clear_auth_lock(void)
@@ -241,7 +272,7 @@ bool session_validate_credentials(const char *username, const char *password)
     if (session_find_user_index(username) < 0) {
         return false;
     }
-    if (!session_verify_password(password)) {
+    if (!session_verify_password_for_user(username, password)) {
         return false;
     }
     return session_login_name(username);
@@ -249,14 +280,25 @@ bool session_validate_credentials(const char *username, const char *password)
 
 bool session_verify_password(const char *password)
 {
+    const session_user_t *user = session_current_user();
+
+    return session_verify_password_for_user(user != NULL ? user->name : "root", password);
+}
+
+static bool session_verify_password_for_user(const char *username, const char *password)
+{
     char entry[SESSION_AUTH_FILE_MAX];
+    char line[SESSION_AUTH_FILE_MAX];
+    char *credential;
     char computed[SESSION_HASH_OUTPUT_MAX];
     char *delimiter;
     char *salt;
     char *expected_hash;
     int32_t size;
+    uint32_t cursor = 0;
+    bool candidate_seen = false;
 
-    if (password == NULL) {
+    if (username == NULL || password == NULL || username[0] == '\0') {
         return false;
     }
     if (session_auth_lock_active(true)) {
@@ -270,47 +312,76 @@ bool session_verify_password(const char *password)
     }
 
     entry[size] = '\0';
-    session_trim_in_place(entry);
-    if (entry[0] == '\0') {
+    while (cursor < (uint32_t) size) {
+        uint32_t line_length = 0;
+
+        while (cursor + line_length < (uint32_t) size &&
+               entry[cursor + line_length] != '\n') {
+            line_length++;
+        }
+        if (line_length >= sizeof(line)) {
+            while (cursor + line_length < (uint32_t) size &&
+                   entry[cursor + line_length] != '\n') {
+                line_length++;
+            }
+            cursor = cursor + line_length < (uint32_t) size ?
+                     cursor + line_length + 1U :
+                     (uint32_t) size;
+            continue;
+        }
+        memcpy(line, entry + cursor, line_length);
+        line[line_length] = '\0';
+        session_trim_in_place(line);
+        if (cursor + line_length < (uint32_t) size &&
+            entry[cursor + line_length] == '\n') {
+            cursor += line_length + 1;
+        } else {
+            cursor = (uint32_t) size;
+        }
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        credential = line;
+        delimiter = strchr(line, '|');
+        if (delimiter != NULL) {
+            *delimiter = '\0';
+            session_trim_in_place(line);
+            if (strcmp(line, username) != 0) {
+                continue;
+            }
+            credential = delimiter + 1;
+            session_trim_in_place(credential);
+        }
+        candidate_seen = true;
+        delimiter = strchr(credential, '$');
+        if (delimiter == NULL) {
+            delimiter = strchr(credential, ':');
+        }
+        if (delimiter == NULL) {
+            continue;
+        }
+        salt = credential;
+        expected_hash = delimiter + 1;
+        *delimiter = '\0';
+        session_trim_in_place(salt);
+        session_trim_in_place(expected_hash);
+        if (salt[0] == '\0' || expected_hash[0] == '\0' ||
+            !session_compute_salted_password_hash(salt, password, computed, sizeof(computed))) {
+            continue;
+        }
+        if (session_constant_time_equal(expected_hash, computed)) {
+            session_clear_auth_lock();
+            return true;
+        }
+    }
+    if (!candidate_seen) {
         log_write("auth: pwd.txt empty");
         return false;
     }
-
-    delimiter = strchr(entry, '$');
-    if (delimiter == NULL) {
-        delimiter = strchr(entry, ':');
-    }
-
-    salt = entry;
-    expected_hash = entry;
-    if (delimiter != NULL) {
-        *delimiter = '\0';
-        expected_hash = delimiter + 1;
-    } else {
-        salt = "";
-    }
-
-    session_trim_in_place(salt);
-    session_trim_in_place(expected_hash);
-    if (expected_hash[0] == '\0') {
-        log_write("auth: pwd.txt hash empty");
-        return false;
-    }
-    if (delimiter == NULL) {
-        log_write("auth: pwd.txt format invalid");
-        return false;
-    }
-    if (!session_compute_salted_password_hash(salt, password, computed, sizeof(computed))) {
-        log_write("auth: hash compute failed");
-        return false;
-    }
-    if (strcmp(expected_hash, computed) != 0) {
-        session_note_auth_failure();
-        log_write("auth: password rejected");
-        return false;
-    }
-    session_clear_auth_lock();
-    return true;
+    session_note_auth_failure();
+    log_write("auth: password rejected");
+    return false;
 }
 
 bool session_auth_locked(void)

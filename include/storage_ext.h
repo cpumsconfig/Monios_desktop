@@ -9,6 +9,7 @@ typedef struct {
     uint32_t ide_controllers;
     uint32_t sata_controllers;
     uint32_t nvme_controllers;
+    uint32_t virtio_block_devices;
     uint32_t scsi_controllers;
     uint32_t raid_controllers;
     uint32_t other_storage;

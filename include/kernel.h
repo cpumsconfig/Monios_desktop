@@ -16,6 +16,10 @@ bool kernel_shutdown_requested(void);
 bool kernel_reboot_requested(void);
 bool kernel_sleep_requested(void);
 void kernel_log_hex_u32(const char *label, uint32_t value);
+/* Read-only accessor for the in-memory kernel log ring buffer.
+ * Returns the buffer start and, through *out_len, its current length.
+ * Safe to call from panic context. */
+const char *kernel_log_tail(uint32_t *out_len);
 void kernel_request_graphics_mode(void);
 void kernel_run_periodic_work(void);
 void kernel_run_exec_periodic_work(void);

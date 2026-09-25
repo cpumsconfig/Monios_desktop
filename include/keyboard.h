@@ -47,7 +47,9 @@ typedef enum {
     KEY_EVENT_END,
     KEY_EVENT_DELETE,
     KEY_EVENT_ESC,
-    KEY_EVENT_POWER
+    KEY_EVENT_POWER,
+    KEY_EVENT_PAGE_UP,
+    KEY_EVENT_PAGE_DOWN
 } key_event_type_t;
 
 typedef struct {
@@ -60,6 +62,18 @@ void init_keyboard(void);
 void keyboard_interrupt_dispatch(void);
 const keyboard_status_t *keyboard_status(void);
 bool keyboard_poll_event(key_event_t *event_out);
+/* USB HID boot-protocol keyboard report injection (drivers/usb/hid.c). */
+void keyboard_inject_usb_boot(const uint8_t *report, uint32_t len);
 bool keyboard_read_char(char *ch_out);
+
+/* Probe / control / generic read-write interface */
+bool keyboard_probe(void);
+bool keyboard_present(void);
+bool keyboard_set_scancode_set(uint8_t set);
+bool keyboard_send_command(uint8_t command);
+void keyboard_set_leds(bool caps_lock, bool num_lock, bool scroll_lock);
+int  keyboard_read(char *buf, uint32_t max_len);
+bool keyboard_ctrl_alt_del_pending(void);
+const char *keyboard_status_text(void);
 
 #endif

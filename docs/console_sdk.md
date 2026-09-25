@@ -26,8 +26,8 @@ From the repository root:
 
 ```text
 make app-runtime
-python tools/monios-gcc.py -c examples/hello.c -o out/hello.o
-python tools/monios-ld.py --subsystem console -o out/hello.exe out/hello.o
+python3 tools/monios-gcc.py -c examples/hello.c -o out/hello.o
+python3 tools/monios-ld.py --subsystem console -o out/hello.exe out/hello.o
 ```
 
 Or use the integrated target:
@@ -67,3 +67,35 @@ tools/monios-ld.cmd
 
 The linker also accepts `--subsystem windows` and `--subsystem native` for
 future GUI and native images.
+
+## MinGW Workspace
+
+The first three-stage MoniOS toolchain sample is kept in
+`user/apps/mingw/`. It compiles `hello.c` with GCC using `-nostdinc`, assembles
+`hello.S` with `as`, and links the final PE32+ image with `ld`.
+
+```text
+make mingw-sample
+```
+
+The sample links only the MoniOS runtime objects and the
+`console.dll`/`windows.dll`/`osui.dll`/`monios.dll` import libraries. It does
+not use the host C library, MinGW headers, Windows SDK libraries, `libgcc`, or
+any other default toolchain library. The generated program is
+`out/mingw_hello.exe`; `make hd.img` copies it and the source files to
+`C:\Monios\Apps\mingw\`.
+
+The directory also ships MoniOS-native first-stage replacements for the three
+toolchain commands:
+
+```text
+make mingw-tools
+```
+
+This builds `out/mingw_gcc.exe`, `out/mingw_as.exe`, and `out/mingw_ld.exe`.
+They are regular MoniOS console applications. Their pipeline is
+`C -> .mas -> .mobj -> PE32+`, where `MOBJ` is a small MoniOS object format and
+the generated executable has no DLL imports. The current C front-end supports
+ordered `puts("...")`, `printf("...")`, and `putchar('x')` calls plus an
+integer `return`; output calls are optional. It is the freestanding bootstrap
+stage for a larger compiler, not GNU GCC compatibility.

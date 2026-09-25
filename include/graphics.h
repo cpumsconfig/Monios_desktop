@@ -23,6 +23,10 @@ void graphics_clear(uint8_t color);
 bool graphics_user_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
 bool graphics_user_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
 void graphics_user_present(void);
+uint32_t graphics_user_read_framebuffer(void *user_dst, uint16_t x, uint16_t y,
+                                        uint16_t width, uint16_t height);
+uint32_t graphics_user_blit(const void *src, uint16_t x, uint16_t y,
+                             uint16_t width, uint16_t height, uint32_t flags);
 void graphics_draw_bsod(const char *process, const char *code, const char *text, uint32_t progress);
 void graphics_draw_shell(void);
 void graphics_mouse_redraw(uint16_t x, uint16_t y);
@@ -66,5 +70,17 @@ void graphics_set_vsync(bool enabled);
 bool graphics_get_double_buffer(void);
 bool graphics_get_vsync(void);
 uint32_t graphics_get_fps(void);
+
+/* Desktop Experience (UI/UX group) entry points. Kernel-side handlers for
+ * syscalls 44-50; syscall.c dispatch is wired separately at integration. */
+void graphics_clipboard_set_text(const char *text);
+uint32_t graphics_clipboard_get_text(char *buf, uint32_t cap);
+uint32_t graphics_clipboard_history_pack(char *buf, uint32_t cap);
+uint32_t graphics_clipboard_history_count(void);
+const char *graphics_clipboard_history_at(uint32_t index);
+void graphics_notification_post(const char *title, const char *body);
+void graphics_theme_set(bool dark, uint32_t accent);
+void graphics_wallpaper_set(const char *path);
+bool graphics_display_mode_set(uint16_t width, uint16_t height);
 
 #endif

@@ -39,6 +39,7 @@ static bool g_smbus_present;
 static char g_smbus_status[64];
 static uint16_t g_smbus_io_base;
 static bool g_is_intel;
+static uint32_t g_smbus_errors;
 
 /* AMD legacy probe */
 bool amd_legacy_probe(void)
@@ -290,7 +291,7 @@ bool smbus_driver_init(void)
     bool found = pci_find_first(0x0C, 0x05, &info);
 
     if (!found) {
-        strcpy(g_smbus_status, "smbus: no controller detected");
+        strcpy(g_smbus_status, "smbus: not found");
         g_smbus_present = false;
         g_smbus_io_base = 0;
         log_write(g_smbus_status);
@@ -359,4 +360,85 @@ bool smbus_available(void)
 const char *smbus_status(void)
 {
     return g_smbus_status;
+}
+
+/* =========================================================================
+ * New unified SMBus driver interface.
+ * ========================================================================= */
+
+bool smbus_probe(void)
+{
+    bool ok = smbus_driver_init();
+    if (!g_smbus_present) {
+        strcpy(g_smbus_status, "smbus: not found");
+        log_write("smbus: not found");
+        return false;
+    }
+    (void) ok;
+    return true;
+}
+
+void smbus_shutdown(void)
+{
+    smbus_driver_shutdown();
+}
+
+int32_t smbus_read(uint8_t dev, uint8_t reg)
+{
+    uint8_t value = 0;
+    if (!smbus_read_byte(dev, reg, &value)) {
+        g_smbus_errors++;
+        return -1;
+    }
+    return (int32_t) value;
+}
+
+int32_t smbus_write(uint8_t dev, uint8_t reg, uint8_t value)
+{
+    if (!smbus_write_byte(dev, reg, value)) {
+        g_smbus_errors++;
+        return -1;
+    }
+    return 0;
+}
+
+bool smbus_read_block(uint8_t dev, uint8_t reg, uint8_t *buf, uint8_t *len)
+{
+    uint8_t count;
+    if (buf == NULL || len == NULL || *len == 0u) {
+        return false;
+    }
+    /* Read one byte at a time via byte-data reads (hardware block support
+     * varies across PCH generations; this is the portable fallback). */
+    count = *len;
+    for (uint8_t i = 0; i < count; i++) {
+        uint8_t v = 0;
+        if (!smbus_read_byte(dev, (uint8_t) (reg + i), &v)) {
+            g_smbus_errors++;
+            *len = i;
+            return false;
+        }
+        buf[i] = v;
+    }
+    *len = count;
+    return true;
+}
+
+bool smbus_write_block(uint8_t dev, uint8_t reg, const uint8_t *buf, uint8_t len)
+{
+    if (buf == NULL || len == 0u) {
+        return false;
+    }
+    for (uint8_t i = 0; i < len; i++) {
+        if (!smbus_write_byte(dev, (uint8_t) (reg + i), buf[i])) {
+            g_smbus_errors++;
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t smbus_error_count(void)
+{
+    return g_smbus_errors;
 }

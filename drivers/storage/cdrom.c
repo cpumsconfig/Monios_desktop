@@ -1,5 +1,6 @@
 #include "cdrom.h"
 #include "common.h"
+#include "kernel.h"
 #include "string.h"
 
 #define ATA_PRIMARY_IO_BASE   0x1F0
@@ -254,21 +255,56 @@ static bool cdrom_probe_drive(uint16_t io_base, uint8_t drive, const char *ready
     return true;
 }
 
+bool cdrom_check_media(void)
+{
+    if (!g_cdrom_info.present) {
+        return false;
+    }
+    g_cdrom_info.ready = cdrom_test_unit_ready();
+    if (g_cdrom_info.ready) {
+        (void) cdrom_read_capacity();
+        strcpy(g_cdrom_info.status, "cdrom: media ready");
+    } else {
+        strcpy(g_cdrom_info.status, "cdrom: no media");
+    }
+    return g_cdrom_info.ready;
+}
+
+bool cdrom_probe(void)
+{
+    if (cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: primary master ready") ||
+        cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: primary slave ready") ||
+        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: secondary master ready") ||
+        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: secondary slave ready")) {
+        g_cdrom_info.ready = cdrom_check_media();
+        return true;
+    }
+    return false;
+}
+
 void cdrom_init(void)
 {
     memset(&g_cdrom_info, 0, sizeof(g_cdrom_info));
     g_cdrom_info.sector_size = CDROM_SECTOR_SIZE;
     strcpy(g_cdrom_info.status, "cdrom: detecting...");
 
-    if (cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: primary master ready") ||
-        cdrom_probe_drive(ATA_PRIMARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: primary slave ready") ||
-        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_MASTER, "cdrom: secondary master ready") ||
-        cdrom_probe_drive(ATA_SECONDARY_IO_BASE, ATA_DRIVE_SLAVE, "cdrom: secondary slave ready")) {
+    if (cdrom_probe()) {
+        log_write(g_cdrom_info.status);
         return;
     }
     memset(&g_cdrom_info, 0, sizeof(g_cdrom_info));
     g_cdrom_info.sector_size = CDROM_SECTOR_SIZE;
     strcpy(g_cdrom_info.status, "cdrom: not found");
+    log_write(g_cdrom_info.status);
+}
+
+void cdrom_shutdown(void)
+{
+    if (g_cdrom_info.present) {
+        g_cdrom_info.ready = false;
+        strcpy(g_cdrom_info.status, "cdrom: shutdown");
+        log_write(g_cdrom_info.status);
+    }
 }
 
 bool cdrom_is_present(void)

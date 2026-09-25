@@ -24,7 +24,8 @@ typedef struct {
 } extfs_info_t;
 
 bool extfs_init(void);
-void extfs_sync(void);
+/* False preserves dirty cache state and must prevent clean unmount. */
+bool extfs_sync(void);
 uint16_t extfs_root_entry_count(void);
 bool extfs_exists(const char *path);
 bool extfs_is_dir(const char *path);
@@ -41,5 +42,20 @@ bool extfs_list_dir(const char *path, char *buffer, uint32_t buffer_size);
 bool extfs_list_root(char *buffer, uint32_t buffer_size);
 const extfs_info_t *extfs_info(void);
 const char *extfs_status(void);
+
+/* 文件状态：时间戳为 Unix 秒级时间戳，由 VFS 层转换。 */
+typedef struct {
+    uint64_t file_size;
+    uint16_t mode;        /* inode mode（权限位 + 文件类型） */
+    uint16_t uid;
+    uint16_t gid;
+    bool     is_dir;
+    uint32_t create_time; /* i_ctime */
+    uint32_t modify_time; /* i_mtime */
+    uint32_t access_time;  /* i_atime */
+} extfs_stat_t;
+
+bool extfs_stat(const char *path, extfs_stat_t *stat_out);
+bool extfs_rename(const char *oldpath, const char *newpath);
 
 #endif

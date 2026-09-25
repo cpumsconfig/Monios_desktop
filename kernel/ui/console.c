@@ -7,6 +7,27 @@
 #define VGA_ATTR 0x07
 #define VGA_TEXT_BUFFER ((volatile uint16_t *) 0xB8000)
 #define CONSOLE_DEFAULT_PID (-1)
+#define CONSOLE_HISTORY_ROWS 1024U
+#define CONSOLE_SCHEME_COUNT 5U
+
+typedef struct {
+    uint32_t bg;
+    uint32_t fg;
+} console_scheme_def_t;
+
+/* Color schemes: default / solarized-dark / dracula / monokai / light */
+static const console_scheme_def_t g_console_schemes[CONSOLE_SCHEME_COUNT] = {
+    { 0x00161D27u, 0x00E8EEF5u },
+    { 0x00002B36u, 0x00EEE8D5u },
+    { 0x00282A36u, 0x00F8F8F2u },
+    { 0x00272822u, 0x00F8F8E0u },
+    { 0x00FFFFFFu, 0x0017232Eu }
+};
+static uint32_t g_console_scheme_idx;
+/* scrollback ring buffer for the built-in shell console (g_consoles[0]) */
+static uint32_t g_shell_history[CONSOLE_HISTORY_ROWS][CONSOLE_COLUMNS];
+static uint32_t g_shell_history_count;
+static uint32_t g_shell_history_oldest;
 
 typedef struct {
     bool used;
@@ -86,8 +107,19 @@ static void console_clear_state(console_state_t *console)
 
 static void console_scroll(console_state_t *console)
 {
+    uint32_t slot;
+
     if (console == NULL) {
         return;
+    }
+    if (console == &g_consoles[0]) {
+        slot = (g_shell_history_oldest + g_shell_history_count) % CONSOLE_HISTORY_ROWS;
+        memcpy(g_shell_history[slot], console->cells, CONSOLE_COLUMNS * sizeof(uint32_t));
+        if (g_shell_history_count < CONSOLE_HISTORY_ROWS) {
+            g_shell_history_count++;
+        } else {
+            g_shell_history_oldest = (g_shell_history_oldest + 1U) % CONSOLE_HISTORY_ROWS;
+        }
     }
     for (uint16_t row = 1; row < CONSOLE_ROWS; row++) {
         for (uint16_t col = 0; col < CONSOLE_COLUMNS; col++) {
@@ -404,6 +436,20 @@ const uint32_t *console_buffer(void)
     return g_consoles[0].cells;
 }
 
+void console_snapshot_take(uint32_t *out_cells, uint16_t *row, uint16_t *col)
+{
+    memcpy(out_cells, g_consoles[0].cells, sizeof(g_consoles[0].cells));
+    if (row != NULL) { *row = g_consoles[0].row; }
+    if (col != NULL) { *col = g_consoles[0].col; }
+}
+
+void console_snapshot_restore(const uint32_t *cells, uint16_t row, uint16_t col)
+{
+    memcpy(g_consoles[0].cells, cells, sizeof(g_consoles[0].cells));
+    g_consoles[0].row = row;
+    g_consoles[0].col = col;
+}
+
 const uint32_t *console_buffer_for_pid(int32_t pid)
 {
     return console_find(pid)->cells;
@@ -423,3 +469,61 @@ uint32_t console_lines_for_pid(int32_t pid)
 {
     return console_find(pid)->lines_written;
 }
+
+uint32_t console_history_rows_for_pid(int32_t pid)
+{
+    if (pid < 0) {
+        return g_shell_history_count;
+    }
+    return 0;
+}
+
+uint32_t console_history_cell_for_pid(int32_t pid, uint32_t row, uint32_t col)
+{
+    uint32_t idx;
+
+    if (pid < 0 && row < g_shell_history_count && col < CONSOLE_COLUMNS) {
+        idx = (g_shell_history_oldest + row) % CONSOLE_HISTORY_ROWS;
+        return g_shell_history[idx][col];
+    }
+    return ' ';
+}
+
+uint32_t console_scheme_bg(void)
+{
+    return g_console_schemes[g_console_scheme_idx].bg;
+}
+
+uint32_t console_scheme_fg(void)
+{
+    return g_console_schemes[g_console_scheme_idx].fg;
+}
+
+int console_scheme(void)
+{
+    return (int)g_console_scheme_idx;
+}
+
+void console_set_scheme(int idx)
+{
+    if (idx >= 0 && (uint32_t)idx < CONSOLE_SCHEME_COUNT) {
+        g_console_scheme_idx = (uint32_t)idx;
+    }
+}
+
+int console_scheme_count(void)
+{
+    return (int)CONSOLE_SCHEME_COUNT;
+}
+
+const char *console_scheme_name(int idx)
+{
+    static const char *names[CONSOLE_SCHEME_COUNT] = {
+        "default", "solarized", "dracula", "monokai", "light"
+    };
+    if (idx >= 0 && (uint32_t)idx < CONSOLE_SCHEME_COUNT) {
+        return names[idx];
+    }
+    return "default";
+}
+

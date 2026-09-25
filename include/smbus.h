@@ -19,6 +19,23 @@ bool smbus_quick_command(uint8_t addr);
 bool smbus_probe_device(uint8_t addr);
 bool smbus_is_intel(void);
 
+/* ── New unified SMBus driver interface ─────────────────────────── */
+/* Detect/initialize the SMBus controller. Returns false and prints
+ * "smbus: not found" when no controller is present. */
+bool smbus_probe(void);
+void smbus_shutdown(void);
+
+/* Simple accessors: smbus_read(dev, reg) returns the byte or -1. */
+int32_t smbus_read(uint8_t dev, uint8_t reg);
+int32_t smbus_write(uint8_t dev, uint8_t reg, uint8_t value);
+
+/* Block transfers (framework). */
+bool smbus_read_block(uint8_t dev, uint8_t reg, uint8_t *buf, uint8_t *len);
+bool smbus_write_block(uint8_t dev, uint8_t reg, const uint8_t *buf, uint8_t len);
+
+/* Statistics */
+uint32_t smbus_error_count(void);
+
 /* Intel SMBus Functions */
 bool intelbus1_probe(const pci_device_info_t *info);
 bool intelbus1_wait_ready(uint32_t timeout_ms);

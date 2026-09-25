@@ -16,6 +16,7 @@ int8_t strncmp(const char *a, const char *b, uint64_t n);
 int8_t strcasecmp(const char *a, const char *b);
 char *strchr(const char *str, const uint8_t ch);
 char *strrchr(const char *str, int ch);
+char *strstr(const char *haystack, const char *needle);
 char *strcat(char *dst_, const char *src_);
 
 #endif

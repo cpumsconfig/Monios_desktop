@@ -3,6 +3,7 @@
 
 #include "stdbool.h"
 #include "stdint.h"
+#include "driver_status.h"
 
 #define APP_ABI_VERSION      5U
 #define STDIN_FILENO         0U
@@ -183,6 +184,7 @@ void app_log(const char *text);
 int app_getcwd(char *buffer, uint32_t size);
 int app_get_mouse(app_mouse_snapshot_t *snapshot);
 int app_get_system_status(app_system_status_t *status);
+int app_http_get_url(const char *url, char *buffer, uint32_t buffer_size);
 int app_file_read(const char *path, void *buffer, uint32_t size);
 int app_file_write(const char *path, const void *buffer, uint32_t size);
 int app_file_size(const char *path);
@@ -193,7 +195,8 @@ bool app_file_mkdir(const char *path);
 bool app_file_rmdir(const char *path);
 int app_file_list_dir(const char *path, char *buffer, uint32_t size);
 void app_enter_graphics_mode(void);
-int app_audio_play_file(const char *path);
+int app_audio_play_pcm(const void *data, uint32_t byte_count, uint32_t sample_rate,
+                       uint16_t channels, uint16_t bits_per_sample);
 int app_graphics_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color);
 int app_graphics_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);
 void app_graphics_present(void);
@@ -217,6 +220,9 @@ bool app_registry_set(const char *key, const char *value);
 bool app_default_app_get(const char *extension, char *app_path, uint32_t app_path_size);
 bool app_default_app_set(const char *extension, const char *app_path);
 bool app_defer_exec(const char *path);
+bool app_driver_load(const char *path);
+bool app_driver_unload(const char *name, bool force);
+bool app_driver_query(driver_status_snapshot_t *snapshot);
 bool app_installer_boot_media(void);
 int app_installer_list_targets(app_installer_target_list_t *list);
 int app_installer_write_disk(const char *source_path, uint32_t source_offset, uint32_t disk_lba, uint32_t byte_count);
@@ -226,6 +232,7 @@ int app_installer_copy_target_file(const char *source_path, uint32_t source_offs
 int app_installer_read_media(const char *source_path, uint32_t source_offset, void *data, uint32_t byte_count);
 int app_installer_media_size(const char *source_path);
 void app_installer_reboot(void);
+uint64_t app_backup_ctl(uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 void app_exit(int code);
 
 #endif

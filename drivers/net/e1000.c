@@ -7,6 +7,10 @@
 #define PCI_VENDOR_INTEL              0x8086
 #define PCI_DEVICE_E1000_82540EM      0x100E
 #define PCI_DEVICE_E1000_82545EM      0x100F
+#define PCI_DEVICE_E1000_82543GC      0x1004
+#define PCI_DEVICE_E1000_82546GB      0x1010
+#define PCI_DEVICE_E1000_82574L       0x10D3
+#define PCI_DEVICE_E1000_82541         0x101C
 
 #define PCI_COMMAND_OFFSET            0x04
 #define PCI_COMMAND_IO                0x0001
@@ -14,6 +18,8 @@
 #define PCI_COMMAND_BUS_MASTER        0x0004
 
 #define E1000_REG_STATUS              0x00008
+#define E1000_REG_ICR                 0x0000C
+#define E1000_REG_IMS                 0x00150
 #define E1000_REG_IMC                 0x000D8
 #define E1000_REG_CTRL                0x00000
 #define E1000_REG_RCTL                0x00100
@@ -40,8 +46,16 @@
 #define E1000_RCTL_SBP                0x00000004
 #define E1000_RCTL_UPE                0x00000008
 #define E1000_RCTL_MPE                0x00000010
+#define E1000_RCTL_MULTE              0x00000020
 #define E1000_RCTL_BAM                0x00008000
 #define E1000_RCTL_SECRC              0x04000000
+#define E1000_RCTL_BSIZE_2048         0x00000000
+#define E1000_ICR_TXDW                0x00000001
+#define E1000_ICR_TXQE                0x00000002
+#define E1000_ICR_LSC                 0x00000004
+#define E1000_ICR_RXSEQ               0x00000008
+#define E1000_ICR_RXDMT0              0x00000010
+#define E1000_ICR_RXDW                0x00000080
 #define E1000_TCTL_EN                 0x00000002
 #define E1000_TCTL_PSP                0x00000008
 #define E1000_TCTL_CT_SHIFT           4
@@ -84,6 +98,7 @@ static uint32_t g_rx_tail;
 static uint32_t g_tx_tail;
 static bool g_ready;
 static bool g_rx_enabled;
+static bool g_link_changed;
 
 static void e1000_append_dec(char *out, uint32_t value)
 {
@@ -162,8 +177,20 @@ void e1000_debug_state(const char *reason)
 
 bool e1000_supported(const pci_device_info_t *info)
 {
-    return info != NULL && info->vendor_id == PCI_VENDOR_INTEL &&
-           (info->device_id == PCI_DEVICE_E1000_82540EM || info->device_id == PCI_DEVICE_E1000_82545EM);
+    if (info == NULL || info->vendor_id != PCI_VENDOR_INTEL) {
+        return false;
+    }
+    switch (info->device_id) {
+    case PCI_DEVICE_E1000_82540EM:
+    case PCI_DEVICE_E1000_82545EM:
+    case PCI_DEVICE_E1000_82543GC:
+    case PCI_DEVICE_E1000_82546GB:
+    case PCI_DEVICE_E1000_82574L:
+    case PCI_DEVICE_E1000_82541:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static uint32_t e1000_bar_base(uint32_t bar)
@@ -239,10 +266,12 @@ bool e1000_link_up(void)
 
 static bool e1000_init_rings(void)
 {
+    uint64_t dma_mark = dma_checkpoint();
+
     if (!dma_alloc(sizeof(e1000_rx_desc_t) * E1000_RING_SIZE, 4096, 0xFFFFFFFFu, &g_rx_desc_dma) ||
         !dma_alloc(sizeof(e1000_tx_desc_t) * E1000_RING_SIZE, 4096, 0xFFFFFFFFu, &g_tx_desc_dma)) {
         log_write("e1000: desc dma alloc failed");
-        return false;
+        goto fail;
     }
     g_rx_desc = (volatile e1000_rx_desc_t *) g_rx_desc_dma.virtual_address;
     g_tx_desc = (volatile e1000_tx_desc_t *) g_tx_desc_dma.virtual_address;
@@ -255,7 +284,7 @@ static bool e1000_init_rings(void)
         if (!dma_alloc(E1000_BUFFER_SIZE, E1000_BUFFER_SIZE, 0xFFFFFFFFu, &g_rx_buffer_dma[i]) ||
             !dma_alloc(E1000_BUFFER_SIZE, E1000_BUFFER_SIZE, 0xFFFFFFFFu, &g_tx_buffer_dma[i])) {
             log_write("e1000: buffer dma alloc failed");
-            return false;
+            goto fail;
         }
         memset((void *) &g_rx_desc[i], 0, sizeof(g_rx_desc[i]));
         memset((void *) &g_tx_desc[i], 0, sizeof(g_tx_desc[i]));
@@ -286,6 +315,19 @@ static bool e1000_init_rings(void)
     e1000_write32(E1000_REG_TIPG, 0x0060200Au);
     e1000_debug_state("ring initialized");
     return true;
+
+fail:
+    dma_rewind(dma_mark);
+    memset(&g_rx_desc_dma, 0, sizeof(g_rx_desc_dma));
+    memset(&g_tx_desc_dma, 0, sizeof(g_tx_desc_dma));
+    memset(g_rx_buffer_dma, 0, sizeof(g_rx_buffer_dma));
+    memset(g_tx_buffer_dma, 0, sizeof(g_tx_buffer_dma));
+    g_rx_desc = NULL;
+    g_tx_desc = NULL;
+    g_rx_tail = 0;
+    g_tx_tail = 0;
+    g_rx_enabled = false;
+    return false;
 }
 
 bool e1000_init(const pci_device_info_t *info, net_info_t *net, uint8_t mac[6])
@@ -303,7 +345,7 @@ bool e1000_init(const pci_device_info_t *info, net_info_t *net, uint8_t mac[6])
     net->io_base = e1000_bar_base(info->bar1);
     memcpy(mac, fallback_mac, 6);
     if (net->mmio_base == 0) {
-        net->connected = true;
+        net->connected = false;
         log_write("e1000: mmio bar missing");
         return false;
     }
@@ -459,6 +501,170 @@ void e1000_shutdown(void)
     }
     e1000_write32(E1000_REG_RCTL, 0);
     e1000_write32(E1000_REG_TCTL, 0);
+    e1000_write32(E1000_REG_IMC, 0xFFFFFFFFu);
     g_rx_enabled = false;
     g_ready = false;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Probe / read / write / info / status / interrupt plumbing          */
+/* ------------------------------------------------------------------ */
+
+static bool e1000_probe_collect(const pci_device_info_t *info, void *ctx)
+{
+    pci_device_info_t *found = (pci_device_info_t *) ctx;
+
+    if (e1000_supported(info)) {
+        *found = *info;
+        return false; /* stop enumerating after first hit */
+    }
+    return true;
+}
+
+bool e1000_probe(pci_device_info_t *out_info)
+{
+    pci_device_info_t found;
+
+    memset(&found, 0, sizeof(found));
+    if (out_info == NULL) {
+        out_info = &found;
+    }
+    pci_enumerate(e1000_probe_collect, out_info);
+    if (!e1000_supported(out_info)) {
+        log_write("e1000: not found");
+        return false;
+    }
+    log_write("e1000: device found");
+    return true;
+}
+
+/* Non-blocking receive: copy the next pending RX frame into buffer.
+ * Returns the frame length (0..max_len), or 0 if no frame is ready. */
+int e1000_read(uint8_t *buffer, uint32_t max_len)
+{
+    uint32_t tail;
+    uint16_t length;
+    uint8_t errors;
+    uint8_t *packet;
+
+    if (!g_ready || !g_rx_enabled || buffer == NULL || max_len == 0) {
+        return 0;
+    }
+    tail = g_rx_tail;
+    if ((g_rx_desc[tail].status & E1000_DESC_STATUS_DD) == 0) {
+        return 0;
+    }
+    length = g_rx_desc[tail].length;
+    errors = g_rx_desc[tail].errors;
+    if (length == 0 || errors != 0 || length > E1000_BUFFER_SIZE) {
+        /* recycle the bad descriptor */
+        g_rx_desc[tail].address = g_rx_buffer_dma[tail].physical_address;
+        g_rx_desc[tail].status = 0;
+        g_rx_tail = (tail + 1) % E1000_RING_SIZE;
+        e1000_write32(E1000_REG_RDT, tail);
+        return 0;
+    }
+    packet = (uint8_t *) g_rx_buffer_dma[tail].virtual_address;
+    if (length > max_len) {
+        length = (uint16_t) max_len;
+    }
+    memcpy(buffer, packet, length);
+    g_net->rx_packets++;
+    g_rx_desc[tail].address = g_rx_buffer_dma[tail].physical_address;
+    g_rx_desc[tail].status = 0;
+    g_rx_tail = (tail + 1) % E1000_RING_SIZE;
+    e1000_write32(E1000_REG_RDT, tail);
+    return (int) length;
+}
+
+bool e1000_write(const uint8_t *packet, uint32_t length)
+{
+    if (length > 0xFFFFu) {
+        return false;
+    }
+    return e1000_send_frame(packet, (uint16_t) length);
+}
+
+/* Enable/disable multicast + broadcast promiscuous filtering framework.
+ * promisc=true  -> accept broadcast + multicast + unicast-to-us
+ * promisc=false -> accept broadcast + unicast-to-us only */
+void e1000_set_promisc(bool promisc)
+{
+    if (!g_ready) {
+        return;
+    }
+    uint32_t rctl = e1000_read32(E1000_REG_RCTL) &
+                    ~(E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM);
+    if (promisc) {
+        rctl |= E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM;
+    } else {
+        rctl |= E1000_RCTL_BAM;
+    }
+    e1000_write32(E1000_REG_RCTL, rctl);
+}
+
+/* Read the (currently programmed) station MAC into out[6]. */
+bool e1000_read_mac(uint8_t out[6])
+{
+    if (!g_ready || out == NULL) {
+        return false;
+    }
+    return e1000_read_receive_address(out);
+}
+
+/* Read/clear the interrupt cause register. Returns the raw ICR value
+ * (reading ICR automatically clears it). IMS is left masked off because
+ * the stack currently polls; the mask can be raised when IRQs are wired. */
+uint32_t e1000_interrupt_handler(void)
+{
+    uint32_t cause;
+
+    if (!g_ready) {
+        return 0;
+    }
+    cause = e1000_read32(E1000_REG_ICR); /* read-to-clear */
+    if (cause & E1000_ICR_RXDW) {
+        /* caller may invoke e1000_poll() to drain the ring */
+    }
+    if (cause & E1000_ICR_LSC) {
+        g_link_changed = true;
+    }
+    return cause;
+}
+
+/* Raise the interrupt mask for RX-done / TX-done / link-status-change. */
+void e1000_irq_enable(void)
+{
+    if (!g_ready) {
+        return;
+    }
+    e1000_write32(E1000_REG_IMS,
+                  E1000_ICR_RXDW | E1000_ICR_TXDW | E1000_ICR_LSC);
+}
+
+static char g_e1000_status[48];
+
+const char *e1000_status(void)
+{
+    if (!g_ready) {
+        return "e1000: not initialized";
+    }
+    strcpy(g_e1000_status, "e1000: ");
+    strcat(g_e1000_status, e1000_link_up() ? "link up" : "link down");
+    return g_e1000_status;
+}
+
+void e1000_info(char *buffer, uint32_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    if (!g_ready) {
+        strncpy(buffer, "e1000: not found", size);
+        buffer[size - 1] = '\0';
+        return;
+    }
+    strncpy(buffer, "e1000: Intel gigabit ethernet", size);
+    buffer[size - 1] = '\0';
 }

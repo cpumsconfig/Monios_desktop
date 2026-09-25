@@ -25,4 +25,10 @@ bool frame_reserve(uint64_t base, uint32_t frame_count);
 const frame_info_t *frame_info(void);
 const char *frame_status(void);
 
+/* Crash-dump helpers: read-only access to the physical frame bitmap.
+ * Safe to call from panic (no-heap, interrupts-off) context. */
+uint64_t frame_base_phys(void);
+uint32_t frame_total_frames(void);
+bool frame_is_used(uint64_t phys);
+
 #endif

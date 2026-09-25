@@ -31,4 +31,19 @@ uint16_t console_cursor_row_for_pid(int32_t pid);
 uint16_t console_cursor_col_for_pid(int32_t pid);
 uint32_t console_lines_for_pid(int32_t pid);
 
+/* scrollback history */
+uint32_t console_history_rows_for_pid(int32_t pid);
+uint32_t console_history_cell_for_pid(int32_t pid, uint32_t row, uint32_t col);
+
+/* color schemes */
+uint32_t console_scheme_bg(void);
+uint32_t console_scheme_fg(void);
+int console_scheme(void);
+int console_scheme_count(void);
+const char *console_scheme_name(int idx);
+void console_set_scheme(int idx);
+
+void console_snapshot_take(uint32_t *out_cells, uint16_t *row, uint16_t *col);
+void console_snapshot_restore(const uint32_t *cells, uint16_t row, uint16_t col);
+
 #endif

@@ -68,4 +68,15 @@ int32_t tpm_get_capability(uint32_t cap, uint32_t property, uint32_t count, uint
 const tpm_info_t *tpm_info(void);
 const char *tpm_status(void);
 
+/* ── New unified TPM driver interface ────────────────────────────── */
+/* Detect TPM 1.2 / 2.0 (CRB/FIFO/MMIO). Returns false and prints
+ * "tpm: not found" when no TPM is present. */
+bool tpm_probe(void);
+void tpm_shutdown(void);
+/* Send a command blob / read the response. */
+int32_t tpm_write(const void *cmd, uint32_t len);
+int32_t tpm_read(void *buf, uint32_t len);
+/* Version: TPM_VERSION_12 or TPM_VERSION_20, 0 if absent. */
+uint8_t tpm_version(void);
+
 #endif

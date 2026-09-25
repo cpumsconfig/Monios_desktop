@@ -70,7 +70,7 @@ static uint32_t tpm_read_reg(uint32_t offset)
 }
 
 /* Write TPM register (MMIO) */
-static void tpm_write_reg(uint32_t offset, uint32_t value)
+static void __attribute__((unused)) tpm_write_reg(uint32_t offset, uint32_t value)
 {
     volatile uint32_t *reg = (volatile uint32_t *)(uintptr_t)(TPM_BASE_ADDR + offset);
     *reg = value;
@@ -216,9 +216,16 @@ void tpm_init(void)
         if (intf_id & (1 << 17)) { /* CRB interface bit */
             g_tpm_info.interface_type = TPM_INTERFACE_CRB;
             g_tpm_info.version_major = 2; /* TPM 2.0 typically uses CRB */
-        } else {
+            g_tpm_info.version_minor = 0;
+        } else if (intf_id != 0xFFFFFFFFu && intf_id != 0u) {
             g_tpm_info.interface_type = TPM_INTERFACE_TIS;
-            g_tpm_info.version_major = 2; /* Assume TPM 2.0 */
+            g_tpm_info.version_major = 2; /* TPM 2.0 FIFO/TIS */
+            g_tpm_info.version_minor = 0;
+        } else {
+            /* TPM 1.2 legacy TIS (no interface ID register semantics) */
+            g_tpm_info.interface_type = TPM_INTERFACE_TIS;
+            g_tpm_info.version_major = 1;
+            g_tpm_info.version_minor = 2;
         }
 
         g_tpm_info.present = true;
@@ -240,10 +247,9 @@ void tpm_init(void)
         /*
          * No TPM found at standard address.
          * Check for TPM 1.2 or other locations.
-         * For now, mark as unavailable.
          */
-        strcpy(g_tpm_info.status, "tpm: no device found");
-        log_write("tpm: no TPM device found");
+        strcpy(g_tpm_info.status, "tpm: not found");
+        log_write("tpm: not found");
     }
 }
 
@@ -426,4 +432,56 @@ const tpm_info_t *tpm_info(void)
 const char *tpm_status(void)
 {
     return g_tpm_info.status;
+}
+
+/* =========================================================================
+ * New unified TPM driver interface.
+ * ========================================================================= */
+
+bool tpm_probe(void)
+{
+    tpm_init();
+    if (!g_tpm_info.present) {
+        strcpy(g_tpm_info.status, "tpm: not found");
+        log_write("tpm: not found");
+        return false;
+    }
+    return true;
+}
+
+void tpm_shutdown(void)
+{
+    g_tpm_info.ready = false;
+    strcpy(g_tpm_info.status, "tpm: shutdown");
+}
+
+int32_t tpm_write(const void *cmd, uint32_t len)
+{
+    uint8_t dummy_resp[4];
+    uint32_t resp_len = sizeof(dummy_resp);
+
+    if (cmd == NULL || len == 0u) {
+        return -1;
+    }
+    return tpm_send_command((const uint8_t *) cmd, len, dummy_resp, &resp_len);
+}
+
+int32_t tpm_read(void *buf, uint32_t len)
+{
+    /* Responses are always fetched together with a command; this front-end
+     * returns 0 if no command has been staged. Real callers should use
+     * tpm_send_command() directly. */
+    if (buf == NULL || len == 0u) {
+        return -1;
+    }
+    memset(buf, 0, len);
+    return 0;
+}
+
+uint8_t tpm_version(void)
+{
+    if (!g_tpm_info.present) {
+        return 0u;
+    }
+    return (g_tpm_info.version_major == 2u) ? TPM_VERSION_20 : TPM_VERSION_12;
 }

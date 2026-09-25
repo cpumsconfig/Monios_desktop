@@ -62,15 +62,13 @@ void spi_init(void)
         log_write("spi: PCI SPI controller detected");
     }
 
-    /* Also check for platform SPI (e.g., PCH/ICH SPI) */
+    /* Also check for platform SPI (e.g., PCH/ICH SPI). We only claim a
+     * controller when a real PCI serial-bus-capable device enumerated;
+     * otherwise we gracefully degrade with "spi: not found". */
     if (!found) {
-        /*
-         * Many x86 systems have an SPI controller in the PCH/ICH
-         * for BIOS flash. We'll simulate one for compatibility.
-         */
-        found = true;
-        strcpy(g_spi_info.status, "spi: PCH SPI controller found");
-        log_write("spi: PCH SPI controller detected");
+        found = false;
+        strcpy(g_spi_info.status, "spi: not found");
+        log_write("spi: not found");
     }
 
     if (found) {
@@ -321,4 +319,59 @@ const spi_info_t *spi_info(void)
 const char *spi_status(void)
 {
     return g_spi_info.status;
+}
+
+/* =========================================================================
+ * New unified SPI driver interface.
+ * ========================================================================= */
+
+bool spi_probe(void)
+{
+    spi_init();
+    if (!g_spi_info.available) {
+        strcpy(g_spi_info.status, "spi: not found");
+        log_write("spi: not found");
+        return false;
+    }
+    return true;
+}
+
+void spi_shutdown(void)
+{
+    g_spi_info.available = false;
+    strcpy(g_spi_info.status, "spi: shutdown");
+}
+
+int32_t spi_chip_select(bool assert)
+{
+    return spi_set_cs(0u, g_current_cs, assert);
+}
+
+int32_t spi_set_speed(uint32_t speed_hz)
+{
+    if (!g_spi_info.available) {
+        return -1;
+    }
+    g_spi_info.current_speed = speed_hz;
+    g_spi_regs[SPI_REG_CLKDIV] = (uint8_t) spi_calc_divider(100000000u, speed_hz);
+    return 0;
+}
+
+int32_t spi_set_mode(uint8_t mode)
+{
+    if (!g_spi_info.available || mode > 3u) {
+        return -1;
+    }
+    uint8_t ctrl = g_spi_regs[SPI_REG_CTRL];
+    ctrl &= ~(SPI_CTRL_CPOL | SPI_CTRL_CPHA);
+    if (mode & 0x02u) ctrl |= SPI_CTRL_CPOL;
+    if (mode & 0x01u) ctrl |= SPI_CTRL_CPHA;
+    g_spi_regs[SPI_REG_CTRL] = ctrl;
+    g_spi_info.mode = mode;
+    return 0;
+}
+
+uint32_t spi_error_count(void)
+{
+    return g_error_count;
 }

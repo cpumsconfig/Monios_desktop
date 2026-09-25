@@ -4,7 +4,9 @@
 #include "graphics.h"
 #include "kernel.h"
 #include "crash_dump.h"
+#include "memdump.h"
 #include "ftrace.h"
+#include "leak_track.h"
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -90,10 +92,8 @@ static const char *bsod_exception_text(uint8_t vector)
 
 static const char *bsod_current_process_name(void)
 {
-    const exec_launch_info_t *info = exec_current_launch_info();
-
-    if (info != NULL && info->program_path != NULL && info->program_path[0] != '\0') {
-        return info->program_path;
+    if (exec_active() && exec_current_program_path()[0] != '\0') {
+        return exec_current_program_path();
     }
     return "kernel";
 }
@@ -165,8 +165,15 @@ void bsod_panic(const char *title, const char *detail)
         uint64_t cr2; asm volatile ("mov %%cr2, %0" : "=r"(cr2));
         crash_dump_capture(process, 0, 0, (uint64_t)detail, 0, 0, 0);
         ftrace_dump_serial();
+        leak_track_report();
         crash_dump_flush_serial();
         crash_dump_write_disk();
+        /* Binary memory dump after the text PANIC.LOG, with on-screen hint. */
+        if (graphics_active()) {
+            graphics_draw_bsod(process, code, "writing memory dump...", 40);
+        }
+        serial_write("BSOD: writing panic.dmp\r\n");
+        memdump_write(title, 0, 0, (uint64_t)detail, 0, 0, 0);
     }
     bsod_collect_and_reboot(process, code, text);
 }
@@ -216,8 +223,21 @@ void bsod_exception_panic(const bsod_exception_info_t *info)
     serial_write(text);
     serial_write("\r\n");
     ftrace_dump_serial();
+    leak_track_report();
     crash_dump_flush_serial();
     crash_dump_write_disk();
+    /* Binary memory dump after the text PANIC.LOG. */
+    if (graphics_active()) {
+        graphics_draw_bsod(process, code, "writing memory dump...", 40);
+    }
+    serial_write("BSOD: writing panic.dmp\r\n");
+    memdump_write(text,
+                  info ? (uint64_t)info->vector : 0,
+                  info ? info->error_code : 0,
+                  info ? info->rip : 0,
+                  info ? info->rsp : 0,
+                  0,
+                  info ? info->rflags : 0);
     bsod_collect_and_reboot(process, code, text);
 }
 

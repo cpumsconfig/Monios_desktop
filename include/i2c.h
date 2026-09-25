@@ -40,4 +40,22 @@ int32_t i2c_set_speed(uint8_t bus, uint32_t speed_hz);
 const i2c_info_t *i2c_info(void);
 const char *i2c_status(void);
 
+/* ── New unified I2C driver interface ────────────────────────────── */
+/* Initialize the I2C bus controller. Prints "i2c: not found" and
+ * returns false when no adapter is present. */
+bool i2c_probe_bus(void);
+void i2c_shutdown(void);
+
+/* Register-level accessors. */
+int32_t i2c_read_reg(uint8_t bus, uint8_t dev, uint8_t reg);
+int32_t i2c_write_reg(uint8_t bus, uint8_t dev, uint8_t reg, uint8_t value);
+int32_t i2c_read_bytes(uint8_t bus, uint8_t dev, uint8_t reg, uint8_t *buf, uint32_t len);
+int32_t i2c_write_bytes(uint8_t bus, uint8_t dev, uint8_t reg, const uint8_t *buf, uint32_t len);
+
+/* Low-level bit-bang primitives (framework). */
+void i2c_start(void);
+void i2c_stop(void);
+uint8_t i2c_read_byte(bool ack);
+bool i2c_write_byte(uint8_t b);
+
 #endif

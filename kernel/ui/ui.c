@@ -37,6 +37,10 @@ bool ui_ensure_system_layout(void)
     ok = ui_mkdir_if_missing(UI_SYSTEM_FONTS_DIR) && ok;
     ok = ui_mkdir_if_missing(UI_SYSTEM_LIB_DIR) && ok;
     ok = ui_mkdir_if_missing(UI_SYSTEM_MEDIA_DIR) && ok;
+    ok = ui_mkdir_if_missing(UI_SYSTEM_SECURITY_DIR) && ok;
+    ok = ui_mkdir_if_missing(UI_TRUST_ROOT_DIR) && ok;
+    ok = ui_mkdir_if_missing(UI_CUSTOM_COMPONENT_DIR) && ok;
+    ok = ui_mkdir_if_missing(UI_OSLOG_DIR) && ok;
     ok = ui_mkdir_if_missing(UI_USERS_DIR) && ok;
     ok = ui_mkdir_if_missing(UI_ROOT_HOME) && ok;
     ok = ui_mkdir_if_missing(UI_GUEST_HOME) && ok;

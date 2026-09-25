@@ -3,11 +3,13 @@
 #include "common.h"
 #include "dma.h"
 #include "es1371.h"
+#include "hda.h"
 #include "file.h"
 #include "hda.h"
 #include "interrupt.h"
 #include "kernel.h"
 #include "memory.h"
+#include "mp3_dec.h"
 #include "pci.h"
 
 #define PCI_CLASS_MULTIMEDIA 0x04
@@ -133,8 +135,26 @@ static uint32_t g_audio_es1371_ring_frames;
 static uint32_t g_audio_es1371_period_events;
 static uint32_t g_audio_es1371_last_hw_period;
 static uint32_t g_audio_es1371_last_refill_period;
+static uint8_t *g_audio_pcm_source;
+static uint32_t g_audio_pcm_source_size;
 static char g_audio_stream_path[AUDIO_TRACK_PATH_MAX];
 static char g_audio_track_name[64];
+
+/* --- ADC (microphone recording) state --- */
+#define AUDIO_REC_FIFO_BYTES (256U * 1024U)
+#define AUDIO_REC_DMA_BYTES   (256U * 1024U)
+static dma_buffer_t g_rec_dma_buffer;
+static int16_t *g_rec_dma;
+static bool g_rec_active;
+static bool g_rec_hw_ready;
+static uint32_t g_rec_ring_frames;
+static uint32_t g_rec_period_frames;
+static uint32_t g_rec_last_hw_frame;
+static uint32_t g_rec_total_frames;
+static uint8_t  g_rec_level;
+static uint8_t *g_rec_fifo;
+static uint32_t g_rec_fifo_head;
+static uint32_t g_rec_fifo_tail;
 
 static bool audio_init_ac97_hw(void);
 static void audio_apply_volume(void);
@@ -149,7 +169,13 @@ static bool audio_fill_stream_descriptor(uint32_t index);
 static bool audio_prefetch_es1371_stream_cache(uint32_t read_budget);
 static bool audio_fill_es1371_stream_period(uint32_t period_index, bool *has_audio);
 static bool audio_start_es1371_stream(void);
-bool audio_play_wav_file(const char *path);
+static bool __attribute__((unused)) audio_play_file(const char *path);
+static bool audio_play_wav_file(const char *path);
+static bool audio_read_source(uint32_t offset, void *buffer, uint32_t size);
+static void audio_stop_current_playback(void);
+static bool wav_convert_to_pcm16_stereo(const char *path, uint32_t data_offset,
+                                        const wav_pcm_fmt_t *fmt, uint8_t **out_buf,
+                                        uint32_t *out_size);
 
 static void audio_write8(uint16_t port, uint8_t value)
 {
@@ -176,7 +202,7 @@ static uint16_t audio_read16(uint16_t port)
     return inw(port);
 }
 
-static uint32_t audio_read32(uint16_t port)
+static uint32_t __attribute__((unused)) audio_read32(uint16_t port)
 {
     return inl(port);
 }
@@ -337,7 +363,7 @@ static void audio_log_es1371_period_state(uint32_t period_index, uint32_t bytes_
     log_write(line);
 }
 
-static bool audio_resample_stereo_s16(const int16_t *src, uint32_t src_frames, uint32_t src_rate, uint32_t dst_rate, int16_t **out_pcm, uint32_t *out_frames)
+static bool __attribute__((unused)) audio_resample_stereo_s16(const int16_t *src, uint32_t src_frames, uint32_t src_rate, uint32_t dst_rate, int16_t **out_pcm, uint32_t *out_frames)
 {
     int16_t *dst;
     uint64_t frame_count64;
@@ -411,7 +437,7 @@ static void audio_busy_delay(uint32_t loops)
     }
 }
 
-static void audio_pc_speaker_tone(uint32_t hz, uint32_t loops)
+static void __attribute__((unused)) audio_pc_speaker_tone(uint32_t hz, uint32_t loops)
 {
     uint32_t divisor;
     uint8_t ctrl;
@@ -526,7 +552,7 @@ static bool audio_ac97_set_output_format(uint32_t sample_rate)
     return sample_rate == AC97_TEST_SAMPLE_RATE || g_audio_device.variable_rate_audio;
 }
 
-static bool audio_ac97_prepare_pcm_out(uint32_t frame_count, uint32_t sample_rate, const char *track_name)
+static bool __attribute__((unused)) audio_ac97_prepare_pcm_out(uint32_t frame_count, uint32_t sample_rate, const char *track_name)
 {
     uint32_t samples = frame_count * AC97_STEREO_CHANNELS;
     uint32_t max_frames = audio_dma_pcm_capacity_frames();
@@ -584,6 +610,7 @@ static bool audio_detect_callback(const pci_device_info_t *info, void *ctx)
     device->mixer_base = audio_pci_bar_base(info->bar0);
     device->bus_master_base = audio_pci_bar_base(info->bar1);
     device->irq_line = info->interrupt_line;
+    device->onboard = true;
     device->ac97_ext_audio_id = 0;
     device->ac97_status = 0;
     device->variable_rate_audio = false;
@@ -642,6 +669,75 @@ static uint32_t audio_dma_pcm_capacity_frames(void)
         return 0;
     }
     return ((uint32_t) g_dma_buffer.size - AC97_BDL_BYTES) / 4u;
+}
+
+static void audio_release_pcm_source(void)
+{
+    if (g_audio_pcm_source != NULL) {
+        kfree(g_audio_pcm_source);
+        g_audio_pcm_source = NULL;
+    }
+    g_audio_pcm_source_size = 0;
+}
+
+static bool audio_read_source(uint32_t offset, void *buffer, uint32_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return false;
+    }
+    if (g_audio_pcm_source != NULL) {
+        if (offset > g_audio_pcm_source_size ||
+            size > g_audio_pcm_source_size - offset) {
+            return false;
+        }
+        memcpy(buffer, g_audio_pcm_source + offset, size);
+        return true;
+    }
+    if (g_audio_stream_path[0] == '\0') {
+        return false;
+    }
+    return file_read_at(g_audio_stream_path, g_audio_data_offset + offset,
+                        buffer, size) == (int32_t) size;
+}
+
+static void audio_stop_current_playback(void)
+{
+    if (g_audio_device.present && g_audio_hw_initialized) {
+        if (g_audio_device.kind == AUDIO_DEVICE_ES1371) {
+            es1371_stop(&g_audio_device);
+        } else if (g_audio_device.kind == AUDIO_DEVICE_AC97) {
+            audio_ac97_stop_pcm_out();
+        }
+    }
+    audio_release_pcm_source();
+    if (g_audio_es1371_src_buffer != NULL) {
+        kfree(g_audio_es1371_src_buffer);
+        g_audio_es1371_src_buffer = NULL;
+    }
+    g_audio_es1371_src_buffer_size = 0;
+    g_audio_started = false;
+    g_audio_paused = false;
+    g_audio_streaming = false;
+    g_audio_stream_eof = false;
+    g_audio_stream_path[0] = '\0';
+    g_audio_stream_pos = 0;
+    g_audio_data_offset = 0;
+    g_audio_data_size = 0;
+    g_audio_stream_rate = 0;
+    g_audio_es1371_cache_start = 0;
+    g_audio_es1371_cache_size = 0;
+    g_audio_es1371_stop_tick = 0;
+    g_audio_es1371_chunk_start_tick = 0;
+    g_audio_es1371_chunk_ticks = 0;
+    g_audio_es1371_period_frames = 0;
+    g_audio_es1371_ring_frames = 0;
+    g_audio_dma_frames = 0;
+    g_audio_total_samples = 0;
+    g_audio_track_name[0] = '\0';
+    g_track.channels = 0;
+    g_track.sample_rate = 0;
+    g_track.bits_per_sample = 0;
+    g_track.data_size = 0;
 }
 
 static bool audio_prime_ac97_stream_ring(void)
@@ -738,6 +834,8 @@ void audio_init(void)
     g_audio_track_name[0] = '\0';
     g_audio_es1371_src_buffer = NULL;
     g_audio_es1371_src_buffer_size = 0;
+    g_audio_pcm_source = NULL;
+    g_audio_pcm_source_size = 0;
     g_audio_es1371_irq_pending = 0;
     g_audio_es1371_irq_total = 0;
     g_audio_es1371_chunk_start_tick = 0;
@@ -750,6 +848,8 @@ void audio_init(void)
                 (void) interrupt_register_irq_handler(g_audio_device.irq_line, audio_irq_handler, NULL);
             }
         }
+    } else if (g_audio_device.present && g_audio_device.kind == AUDIO_DEVICE_HDA) {
+        g_audio_hw_initialized = hda_driver_init();
     } else if (g_audio_device.present && g_audio_device.kind == AUDIO_DEVICE_ES1371) {
         if (es1371_init(&g_audio_device, &g_dma_buffer, &g_audio_dma)) {
             g_audio_hw_initialized = true;
@@ -780,7 +880,7 @@ void audio_log_state(void)
         strcpy(line + 7, "ac97 detected");
         break;
     case AUDIO_DEVICE_HDA:
-        strcpy(line + 7, "hda detected");
+        strcpy(line + 7, g_audio_hw_initialized ? "hda onboard ready" : "hda detected");
         break;
     case AUDIO_DEVICE_SB16:
         strcpy(line + 7, "legacy/sb16-style detected");
@@ -867,7 +967,147 @@ static bool audio_read_wav_header(const uint8_t *data, uint32_t size, wav_pcm_fm
     return false;
 }
 
-bool audio_play_file(const char *path)
+/* Convert an arbitrary PCM WAV data chunk to 16-bit signed stereo interleaved.
+ * Supports: 8-bit unsigned mono/stereo, 16-bit signed mono/stereo.
+ * The converted buffer is kmalloc'd; caller frees with kfree. */
+static bool wav_convert_to_pcm16_stereo(const char *path, uint32_t data_offset,
+                                        const wav_pcm_fmt_t *fmt, uint8_t **out_buf,
+                                        uint32_t *out_size)
+{
+    uint32_t raw_bytes;
+    uint32_t frames;
+    uint32_t out_bytes;
+    uint8_t *raw;
+    int16_t *out;
+    uint32_t i;
+
+    if (path == NULL || fmt == NULL || out_buf == NULL || out_size == NULL) {
+        return false;
+    }
+    raw_bytes = (uint32_t) file_size(path) - data_offset;
+    if (raw_bytes == 0 || fmt->channels == 0 || fmt->block_align == 0) {
+        return false;
+    }
+    frames = raw_bytes / fmt->block_align;
+    out_bytes = frames * 2u * (uint32_t) sizeof(int16_t);
+    if (out_bytes == 0 || out_bytes > AUDIO_PCM_MAX_BYTES) {
+        return false;
+    }
+    raw = (uint8_t *) kmalloc(raw_bytes);
+    out = (int16_t *) kmalloc(out_bytes);
+    if (raw == NULL || out == NULL) {
+        kfree(raw);
+        kfree(out);
+        return false;
+    }
+    if (file_read_at(path, data_offset, raw, raw_bytes) != (int32_t) raw_bytes) {
+        kfree(raw);
+        kfree(out);
+        return false;
+    }
+
+    if (fmt->bits_per_sample == 16 && fmt->channels == 2) {
+        memcpy(out, raw, raw_bytes);
+    } else if (fmt->bits_per_sample == 16 && fmt->channels == 1) {
+        for (i = 0; i < frames; i++) {
+            int16_t s = ((const int16_t *) raw)[i];
+            out[i * 2u] = s;
+            out[i * 2u + 1u] = s;
+        }
+    } else if (fmt->bits_per_sample == 8 && fmt->channels == 2) {
+        for (i = 0; i < frames; i++) {
+            out[i * 2u] = (int16_t) (raw[i * 2u] << 8) - 32768;
+            out[i * 2u + 1u] = (int16_t) (raw[i * 2u + 1u] << 8) - 32768;
+        }
+    } else if (fmt->bits_per_sample == 8 && fmt->channels == 1) {
+        for (i = 0; i < frames; i++) {
+            int16_t s = (int16_t) (raw[i] << 8) - 32768;
+            out[i * 2u] = s;
+            out[i * 2u + 1u] = s;
+        }
+    } else {
+        kfree(raw);
+        kfree(out);
+        return false;
+    }
+
+    kfree(raw);
+    *out_buf = (uint8_t *) out;
+    *out_size = out_bytes;
+    return true;
+}
+
+bool audio_play_pcm(const void *data, uint32_t byte_count, uint32_t sample_rate,
+                    uint16_t channels, uint16_t bits_per_sample)
+{
+    if (!g_audio_device.present || !g_audio_hw_initialized || g_audio_dma == NULL ||
+        data == NULL || byte_count == 0 || byte_count > AUDIO_PCM_MAX_BYTES ||
+        channels != 2 || bits_per_sample != 16 || sample_rate == 0 ||
+        (byte_count & 3u) != 0) {
+        log_write("audio: pcm buffer rejected");
+        return false;
+    }
+    if (g_audio_device.kind == AUDIO_DEVICE_AC97 &&
+        !audio_ac97_set_output_format(sample_rate)) {
+        log_write("audio: pcm ac97 rate unsupported");
+        return false;
+    }
+    if (g_audio_device.kind == AUDIO_DEVICE_ES1371 &&
+        sample_rate != es1371_sample_rate()) {
+        log_write("audio: pcm es1371 rate unsupported");
+        return false;
+    }
+    if (g_audio_device.kind != AUDIO_DEVICE_AC97 &&
+        g_audio_device.kind != AUDIO_DEVICE_ES1371) {
+        log_write("audio: pcm device unsupported");
+        return false;
+    }
+
+    audio_stop_current_playback();
+    g_audio_pcm_source = (uint8_t *) kmalloc(byte_count);
+    if (g_audio_pcm_source == NULL) {
+        log_write("audio: pcm source alloc failed");
+        return false;
+    }
+    memcpy(g_audio_pcm_source, data, byte_count);
+    g_audio_pcm_source_size = byte_count;
+    g_audio_dma_frames = audio_dma_pcm_capacity_frames();
+    g_audio_total_samples = byte_count / sizeof(int16_t);
+    g_audio_data_offset = 0;
+    g_audio_data_size = byte_count;
+    g_audio_stream_pos = 0;
+    g_audio_stream_rate = sample_rate;
+    g_audio_streaming = true;
+    g_audio_stream_eof = false;
+    g_audio_stream_last_log_pos = 0;
+    g_audio_stream_recovery_count = 0;
+    g_track.channels = (uint8_t) channels;
+    g_track.sample_rate = sample_rate;
+    g_track.bits_per_sample = bits_per_sample;
+    g_track.data_size = byte_count;
+    strcpy(g_audio_track_name, "PCM buffer");
+
+    if (g_audio_device.kind == AUDIO_DEVICE_AC97) {
+        if (!audio_start_ac97_stream()) {
+            audio_stop_current_playback();
+            log_write("audio: pcm ac97 stream start failed");
+            return false;
+        }
+    } else if (g_audio_device.kind == AUDIO_DEVICE_ES1371) {
+        if (!audio_start_es1371_stream()) {
+            audio_stop_current_playback();
+            log_write("audio: pcm es1371 stream start failed");
+            return false;
+        }
+    } else {
+        audio_stop_current_playback();
+        return false;
+    }
+    log_write("audio: pcm buffer stream started");
+    return true;
+}
+
+static bool __attribute__((unused)) audio_play_file(const char *path)
 {
     aac_info_t info;
     char wav_path[96];
@@ -879,6 +1119,9 @@ bool audio_play_file(const char *path)
     len = (uint32_t) strlen(path);
     if (len >= 4 && strcasecmp(path + len - 4, ".wav") == 0) {
         return audio_play_wav_file(path);
+    }
+    if (len >= 4 && strcasecmp(path + len - 4, ".mp3") == 0) {
+        return mp3_play_file(path);
     }
     if (len >= 4 && strcasecmp(path + len - 4, ".m4a") == 0) {
         if (len + 1 >= sizeof(wav_path)) {
@@ -948,7 +1191,8 @@ static bool audio_prefetch_es1371_stream_cache(uint32_t read_budget)
     uint32_t drop;
     uint32_t total_read = 0;
 
-    if (g_audio_es1371_src_buffer == NULL || g_audio_es1371_src_buffer_size == 0 || g_audio_stream_path[0] == '\0') {
+    if (g_audio_es1371_src_buffer == NULL || g_audio_es1371_src_buffer_size == 0 ||
+        (g_audio_pcm_source == NULL && g_audio_stream_path[0] == '\0')) {
         return false;
     }
     if (read_budget == 0) {
@@ -987,10 +1231,9 @@ static bool audio_prefetch_es1371_stream_cache(uint32_t read_budget)
         if (bytes_to_read == 0) {
             break;
         }
-        if (file_read_at(g_audio_stream_path,
-                         g_audio_data_offset + cache_end,
-                         g_audio_es1371_src_buffer + g_audio_es1371_cache_size,
-                         bytes_to_read) != (int32_t) bytes_to_read) {
+        if (!audio_read_source(cache_end,
+                               g_audio_es1371_src_buffer + g_audio_es1371_cache_size,
+                               bytes_to_read)) {
             log_write("audio: es1371 cache read failed");
             return false;
         }
@@ -1020,7 +1263,9 @@ static bool audio_fill_es1371_stream_period(uint32_t period_index, bool *has_aud
     if (has_audio != NULL) {
         *has_audio = false;
     }
-    if (period_index >= ES1371_STREAM_PERIODS || g_audio_stream_path[0] == '\0' || g_audio_stream_rate == 0 ||
+    if (period_index >= ES1371_STREAM_PERIODS ||
+        (g_audio_pcm_source == NULL && g_audio_stream_path[0] == '\0') ||
+        g_audio_stream_rate == 0 ||
         max_dst_frames == 0 || g_audio_es1371_src_buffer == NULL || g_audio_dma == NULL) {
         log_write("audio: es1371 stream invalid");
         g_audio_started = false;
@@ -1123,7 +1368,8 @@ static bool audio_start_es1371_stream(void)
     uint32_t cache_bytes;
     bool has_audio = false;
 
-    if (g_audio_stream_path[0] == '\0' || g_audio_stream_rate == 0 || max_dst_frames == 0) {
+    if ((g_audio_pcm_source == NULL && g_audio_stream_path[0] == '\0') ||
+        g_audio_stream_rate == 0 || max_dst_frames == 0) {
         return false;
     }
     if (max_dst_frames > ES1371_STREAM_FRAMES) {
@@ -1200,7 +1446,7 @@ static bool audio_start_es1371_stream(void)
     return true;
 }
 
-bool audio_play_wav_file(const char *path)
+static bool audio_play_wav_file(const char *path)
 {
     uint8_t header[512];
     int32_t wav_file_size;
@@ -1271,8 +1517,16 @@ bool audio_play_wav_file(const char *path)
         log_write("audio: wav header invalid");
         return false;
     }
-    if (fmt.format_tag != 1 || fmt.channels != 2 || fmt.bits_per_sample != 16) {
-        log_write("audio: wav format unsupported");
+    if (fmt.format_tag != 1) {
+        log_write("audio: wav format unsupported (not PCM)");
+        return false;
+    }
+    if (fmt.channels != 1 && fmt.channels != 2) {
+        log_write("audio: wav channel count unsupported");
+        return false;
+    }
+    if (fmt.bits_per_sample != 8 && fmt.bits_per_sample != 16) {
+        log_write("audio: wav bits per sample unsupported");
         return false;
     }
     if (g_audio_device.kind == AUDIO_DEVICE_AC97 && fmt.samples_per_sec != 44100 && !g_audio_device.variable_rate_audio) {
@@ -1284,12 +1538,28 @@ bool audio_play_wav_file(const char *path)
         return false;
     }
     track_rate = fmt.samples_per_sec;
-    stream_size = (uint32_t) wav_file_size - data_offset;
-    g_track.channels = (uint8_t) fmt.channels;
+    if (fmt.channels == 2 && fmt.bits_per_sample == 16) {
+        stream_size = (uint32_t) wav_file_size - data_offset;
+        g_audio_pcm_source = NULL;
+        g_audio_pcm_source_size = 0;
+        g_audio_data_offset = data_offset;
+    } else {
+        uint8_t *converted = NULL;
+        uint32_t converted_size = 0;
+        if (!wav_convert_to_pcm16_stereo(path, data_offset, &fmt, &converted, &converted_size)) {
+            log_write("audio: wav conversion failed");
+            return false;
+        }
+        audio_release_pcm_source();
+        g_audio_pcm_source = converted;
+        g_audio_pcm_source_size = converted_size;
+        stream_size = converted_size;
+        g_audio_data_offset = 0;
+    }
+    g_track.channels = 2;
     g_track.sample_rate = track_rate;
-    g_track.bits_per_sample = fmt.bits_per_sample;
+    g_track.bits_per_sample = 16;
     g_track.data_size = stream_size;
-    g_audio_data_offset = data_offset;
     g_audio_data_size = stream_size;
     g_audio_stream_pos = 0;
     g_audio_stream_rate = track_rate;
@@ -1298,7 +1568,12 @@ bool audio_play_wav_file(const char *path)
     g_audio_stream_recovery_count = 0;
     g_audio_dma_frames = AC97_DMA_BYTES / 4u;
     g_audio_total_samples = stream_size / 2u;
-    strcpy(g_audio_stream_path, path);
+    if (g_audio_pcm_source == NULL) {
+        strcpy(g_audio_stream_path, path);
+    } else {
+        g_audio_stream_path[0] = 0;
+    }
+    strcpy(g_audio_track_name, path);
     strcpy(g_audio_track_name, path);
     if (g_audio_device.kind == AUDIO_DEVICE_AC97) {
         if (!audio_start_ac97_stream()) {
@@ -1324,6 +1599,138 @@ bool audio_play_wav_file(const char *path)
     return true;
 }
 
+
+/* Public media playback interfaces (audio.h). */
+bool wav_play_file(const char *path)
+{
+    return audio_play_wav_file(path);
+}
+
+/* --- Minimal MP3 decoder scaffold ------------------------------------- */
+/* MPEG1 Layer3 frame header layout (32-bit big-endian sync word). */
+#define MP3H_MPEG1      0x20000000u   /* bit12: MPEG version 1      */
+#define MP3H_LAYER3    0x02000000u   /* bit11-10: layer III         */
+#define MP3H_SYNC       0xFFE00000u   /* 11 sync bits                */
+#define MP3H_BR_IDX(x) (((x) >> 12) & 0x0Fu)
+#define MP3H_SR_IDX(x) (((x) >> 10) & 0x03u)
+#define MP3H_PADDING(x) (((x) >> 9) & 0x01u)
+#define MP3H_STEREO(x) (((x) >> 6) & 0x03u)   /* 0/1 = stereo, 3 = mono */
+
+static const uint16_t mp3_bitrate_mpeg1_l3[16] = {
+    0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0
+};
+static const uint32_t mp3_srates_mpeg1[4] = { 44100u, 48000u, 32000u, 0u };
+
+/* Parse the first 4KiB of an MP3 file for a valid MPEG1 Layer3 frame header.
+ * Returns the byte offset of the first audio frame, and fills out the
+ * nominal sample-rate / bitrate / stereo flags.
+ * 实际解码在 mp3_play_file() -> mp3_decode_file()，这里只做帧几何诊断。 */
+static bool mp3_find_first_frame(const char *path, uint32_t *frame_off,
+                                  uint32_t *rate, uint32_t *bitrate, bool *stereo)
+{
+    uint8_t buf[4096];
+    int32_t n;
+    if (path == NULL || frame_off == NULL) return false;
+    n = file_read_at(path, 0, buf, sizeof(buf));
+    if (n < 4) return false;
+    /* Skip an optional ID3v2 tag if present. */
+    uint32_t pos = 0;
+    if (n >= 10 && buf[0] == (uint8_t)'I' && buf[1] == (uint8_t)'D' && buf[2] == (uint8_t)'3') {
+        uint32_t taglen = ((uint32_t)(buf[6] & 0x7F) << 21) |
+                          ((uint32_t)(buf[7] & 0x7F) << 14) |
+                          ((uint32_t)(buf[8] & 0x7F) << 7)  |
+                          ((uint32_t)(buf[9] & 0x7F));
+        pos = 10u + taglen;
+        if (pos > (uint32_t)n - 4u) pos = 0;
+    }
+    while (pos + 4u <= (uint32_t)n) {
+        uint32_t hdr = ((uint32_t)buf[pos] << 24) | ((uint32_t)buf[pos+1] << 16) |
+                       ((uint32_t)buf[pos+2] << 8)  | (uint32_t)buf[pos+3];
+        if ((hdr & MP3H_SYNC) == MP3H_SYNC &&
+            (hdr & MP3H_MPEG1) != 0 && (hdr & MP3H_LAYER3) != 0) {
+            uint32_t br = mp3_bitrate_mpeg1_l3[MP3H_BR_IDX(hdr)];
+            uint32_t sr = mp3_srates_mpeg1[MP3H_SR_IDX(hdr)];
+            if (br != 0 && sr != 0) {
+                *frame_off = pos;
+                if (rate) *rate = sr;
+                if (bitrate) *bitrate = br * 1000u;
+                if (stereo) *stereo = (MP3H_STEREO(hdr) != 3u);
+                return true;
+            }
+        }
+        pos++;
+    }
+    return false;
+}
+
+bool mp3_play_file(const char *path)
+{
+    int16_t *pcm = NULL;
+    uint32_t bytes = 0, frames = 0, rate = 0, channels = 0;
+    uint32_t dst_rate;
+    bool ok;
+
+    audio_log_path("audio: mp3 request ", path);
+    if (!g_audio_device.present || path == NULL || !g_audio_hw_initialized) {
+        log_write("audio: mp3 unavailable");
+        return false;
+    }
+
+    /* 完整解码：Huffman + 反量化 + IMDCT + 32 子带合成由
+     * drivers/audio/mp3_dec.c（基于 vendored 的公有领域解码器）完成。 */
+    if (!mp3_decode_file(path, &pcm, &bytes, &frames, &rate, &channels)) {
+        uint32_t frame_off = 0, frate = 0, bitrate = 0;
+        bool stereo = true;
+
+        /* 解码失败时至少报告帧几何，便于区分"不是 MP3"和"解码出错"。 */
+        if (mp3_find_first_frame(path, &frame_off, &frate, &bitrate, &stereo)) {
+            log_write("audio: mp3 frame located but decode failed");
+        } else {
+            log_write("audio: mp3 no valid MPEG1 L3 frame");
+        }
+        log_write(mp3_dec_status());
+        return false;
+    }
+
+    if (frames == 0 || bytes == 0 || channels != 2) {
+        kfree(pcm);
+        log_write("audio: mp3 decoded no stereo pcm");
+        return false;
+    }
+
+    /* 设备采样率对齐：ES1371 有固定速率，AC97 走 44.1kHz。 */
+    dst_rate = (g_audio_device.kind == AUDIO_DEVICE_ES1371)
+                   ? es1371_sample_rate()
+                   : AC97_TEST_SAMPLE_RATE;
+    if (dst_rate != rate) {
+        int16_t *conv = NULL;
+        uint32_t conv_frames = 0;
+
+        if (audio_resample_stereo_s16(pcm, frames, rate, dst_rate,
+                                      &conv, &conv_frames) &&
+            conv != NULL && conv_frames > 0) {
+            kfree(pcm);
+            pcm = conv;
+            frames = conv_frames;
+            bytes = conv_frames * 4u;
+            rate = dst_rate;
+        } else {
+            log_write("audio: mp3 resample unavailable, using native rate");
+        }
+    }
+
+    ok = audio_play_pcm(pcm, bytes, rate, 2, 16);
+    kfree(pcm);
+
+    if (ok) {
+        log_write(mp3_dec_status());
+        audio_log_path("audio: mp3 playing ", path);
+    } else {
+        log_write("audio: mp3 pcm submit rejected");
+    }
+    return ok;
+}
+
 static bool audio_fill_stream_descriptor(uint32_t index)
 {
     uint32_t remaining;
@@ -1331,7 +1738,9 @@ static bool audio_fill_stream_descriptor(uint32_t index)
     uint32_t samples;
     uint8_t *dst;
 
-    if (index >= AC97_BDL_COUNT || g_audio_stream_path[0] == '\0' || g_audio_stream_desc_busy[index]) {
+    if (index >= AC97_BDL_COUNT ||
+        (g_audio_pcm_source == NULL && g_audio_stream_path[0] == '\0') ||
+        g_audio_stream_desc_busy[index]) {
         return false;
     }
     dst = (uint8_t *) g_audio_dma + index * AC97_STREAM_CHUNK_BYTES;
@@ -1360,7 +1769,7 @@ static bool audio_fill_stream_descriptor(uint32_t index)
         }
     }
     memset(dst, 0, AC97_STREAM_CHUNK_BYTES);
-    if (file_read_at(g_audio_stream_path, g_audio_data_offset + g_audio_stream_pos, dst, bytes_to_read) != (int32_t) bytes_to_read) {
+    if (!audio_read_source(g_audio_stream_pos, dst, bytes_to_read)) {
         log_write("audio: stream read failed");
         return false;
     }
@@ -1403,7 +1812,7 @@ static bool audio_start_ac97_stream(void)
     return true;
 }
 
-static void audio_fill_tone(int16_t *buffer, uint32_t *frame_cursor, uint32_t frames, uint32_t sample_rate, uint32_t hz)
+static void __attribute__((unused)) audio_fill_tone(int16_t *buffer, uint32_t *frame_cursor, uint32_t frames, uint32_t sample_rate, uint32_t hz)
 {
     uint32_t half_period = sample_rate / (hz * 2u);
     int16_t amplitude = 18000;
@@ -1422,7 +1831,7 @@ static void audio_fill_tone(int16_t *buffer, uint32_t *frame_cursor, uint32_t fr
     }
 }
 
-static void audio_fill_silence(int16_t *buffer, uint32_t *frame_cursor, uint32_t frames)
+static void __attribute__((unused)) audio_fill_silence(int16_t *buffer, uint32_t *frame_cursor, uint32_t frames)
 {
     for (uint32_t i = 0; i < frames; i++) {
         uint32_t frame = *frame_cursor;
@@ -1482,8 +1891,72 @@ const char *audio_current_track(void)
     return g_audio_track_name;
 }
 
+/* --- Task 19: music-player control --- */
+uint32_t audio_player_position_bytes(void)
+{
+    return g_audio_stream_pos;
+}
+
+uint32_t audio_player_total_bytes(void)
+{
+    return g_audio_data_size;
+}
+
+void audio_player_stop(void)
+{
+    audio_stop_current_playback();
+}
+
+int32_t audio_player_ctl(const audio_player_ctl_request_t *request)
+{
+    if (request == NULL) {
+        return -1;
+    }
+    switch (request->cmd) {
+        case AUDIO_PLAYER_PAUSE_TOGGLE:
+            audio_toggle_pause();
+            break;
+        case AUDIO_PLAYER_STOP:
+            audio_stop_current_playback();
+            break;
+        case AUDIO_PLAYER_GET_POSITION:
+            break;
+        case AUDIO_PLAYER_PLAY:
+            /* Resume from paused state. */
+            if (g_audio_paused) {
+                audio_toggle_pause();
+            }
+            break;
+        case AUDIO_PLAYER_SEEK: {
+            /* Jump to byte offset within the current stream.  For ES1371,
+             * we reset the stream caches and restart from the new offset. */
+            uint32_t target = request->position;
+            if (target > g_audio_data_size) {
+                target = g_audio_data_size;
+            }
+            target &= ~3u;
+            if (g_audio_device.kind == AUDIO_DEVICE_ES1371 && g_audio_streaming) {
+                g_audio_stream_pos = target;
+                g_audio_es1371_cache_start = target;
+                g_audio_es1371_cache_size = 0;
+                g_audio_es1371_stop_tick = 0;
+                g_audio_es1371_draining = false;
+                (void) audio_prefetch_es1371_stream_cache(ES1371_CACHE_READ_BYTES);
+            } else {
+                g_audio_stream_pos = target;
+                g_audio_stream_eof = false;
+            }
+            break;
+        }
+        default:
+            return -1;
+    }
+    return 0;
+}
 void audio_update(void)
 {
+    /* Microphone recording pumps independently of playback. */
+    audio_record_pump();
     if (!g_audio_started || g_audio_paused || !g_audio_device.present) {
         return;
     }
@@ -1634,6 +2107,191 @@ void audio_update(void)
     }
 }
 
+/* ============================================================
+ *  Microphone recording (ES1371 ADC capture)
+ *  - Independent DMA ring fed by the ADC (P1) channel.
+ *  - audio_record_pump() drains new ADC frames into a software FIFO;
+ *    the user app drains the FIFO via the READ request.
+ *  - Format: 16-bit signed, stereo, 44100 Hz, interleaved.
+ * ============================================================ */
+static void audio_rec_fifo_write(const uint8_t *src, uint32_t bytes)
+{
+    uint32_t used;
+    uint32_t space;
+    uint32_t i;
+
+    if (g_rec_fifo == NULL || bytes == 0U) {
+        return;
+    }
+    used = g_rec_fifo_tail - g_rec_fifo_head;
+    space = AUDIO_REC_FIFO_BYTES - used;
+    if (bytes > space) {
+        uint32_t drop = bytes - space;
+        g_rec_fifo_head += drop;
+    }
+    for (i = 0; i < bytes; i++) {
+        g_rec_fifo[(g_rec_fifo_tail + i) % AUDIO_REC_FIFO_BYTES] = src[i];
+    }
+    g_rec_fifo_tail += bytes;
+}
+
+static uint32_t audio_rec_fifo_read(uint8_t *dst, uint32_t maxbytes)
+{
+    uint32_t used;
+    uint32_t n;
+    uint32_t i;
+
+    if (g_rec_fifo == NULL || dst == NULL) {
+        return 0;
+    }
+    used = g_rec_fifo_tail - g_rec_fifo_head;
+    n = used < maxbytes ? used : maxbytes;
+    for (i = 0; i < n; i++) {
+        dst[i] = g_rec_fifo[(g_rec_fifo_head + i) % AUDIO_REC_FIFO_BYTES];
+    }
+    g_rec_fifo_head += n;
+    return n;
+}
+
+bool audio_record_active(void)
+{
+    return g_rec_active;
+}
+
+void audio_record_pump(void)
+{
+    uint32_t hw_frame;
+    uint32_t drained;
+
+    if (!g_rec_active || !g_rec_hw_ready || g_rec_dma == NULL ||
+        g_audio_device.kind != AUDIO_DEVICE_ES1371) {
+        return;
+    }
+    hw_frame = es1371_adc_position_frames(&g_audio_device, g_rec_ring_frames);
+    if (hw_frame == g_rec_last_hw_frame) {
+        return;
+    }
+    drained = (hw_frame >= g_rec_last_hw_frame)
+            ? (hw_frame - g_rec_last_hw_frame)
+            : (g_rec_ring_frames - g_rec_last_hw_frame + hw_frame);
+    if (drained == 0U || drained > g_rec_ring_frames) {
+        g_rec_last_hw_frame = hw_frame;
+        return;
+    }
+    {
+        uint32_t off = g_rec_last_hw_frame;
+        uint32_t remaining = drained;
+        uint32_t peak = 0;
+
+        while (remaining != 0U) {
+            uint32_t chunk = remaining;
+            uint32_t bytes;
+            uint32_t i;
+            const uint8_t *src;
+
+            if (off + chunk > g_rec_ring_frames) {
+                chunk = g_rec_ring_frames - off;
+            }
+            bytes = chunk * 4U;
+            src = (const uint8_t *) g_rec_dma + off * 4U;
+            for (i = 0; i < bytes; i += 2U) {
+                int16_t v = (int16_t) ((uint16_t) src[i] | ((uint16_t) src[i + 1U] << 8));
+                uint32_t av = (uint32_t) (v < 0 ? -v : v);
+                if (av > peak) {
+                    peak = av;
+                }
+            }
+            audio_rec_fifo_write(src, bytes);
+            off += chunk;
+            if (off >= g_rec_ring_frames) {
+                off = 0U;
+            }
+            remaining -= chunk;
+        }
+        g_rec_level = (uint8_t) (peak > 32767U ? 100U : (peak * 100U / 32768U));
+    }
+    g_rec_last_hw_frame = hw_frame;
+    g_rec_total_frames += drained;
+    es1371_adc_rearm(&g_audio_device);
+}
+
+int32_t audio_record_ctl(audio_record_request_t *request)
+{
+    if (request == NULL) {
+        return -1;
+    }
+    switch (request->cmd) {
+    case AUDIO_REC_CMD_START: {
+        if (g_audio_device.kind != AUDIO_DEVICE_ES1371) {
+            return -1;
+        }
+        if (!g_rec_hw_ready) {
+            if (!dma_alloc(AUDIO_REC_DMA_BYTES, 4096, 0xFFFFFFFFu, &g_rec_dma_buffer)) {
+                log_write("audio: rec dma alloc failed");
+                return -1;
+            }
+            g_rec_dma = (int16_t *) g_rec_dma_buffer.virtual_address;
+            g_rec_fifo = (uint8_t *) kmalloc(AUDIO_REC_FIFO_BYTES);
+            if (g_rec_fifo == NULL) {
+                log_write("audio: rec fifo alloc failed");
+                return -1;
+            }
+            g_rec_hw_ready = true;
+        }
+        if (g_rec_active) {
+            return 0;
+        }
+        {
+            uint32_t frames = AUDIO_REC_DMA_BYTES / 4U;
+            uint32_t period = frames / 8U;
+
+            memset(g_rec_dma, 0, AUDIO_REC_DMA_BYTES);
+            es1371_adc_set_rate(&g_audio_device, ES1371_RATE_44100);
+            if (!es1371_adc_prepare(&g_audio_device, &g_rec_dma_buffer, frames, period)) {
+                log_write("audio: rec prepare failed");
+                return -1;
+            }
+            g_rec_ring_frames = frames;
+            g_rec_period_frames = period;
+            g_rec_last_hw_frame = 0U;
+            g_rec_total_frames = 0U;
+            g_rec_level = 0U;
+            g_rec_fifo_head = 0U;
+            g_rec_fifo_tail = 0U;
+            g_rec_active = true;
+            log_write("audio: recording started");
+        }
+        return 0;
+    }
+    case AUDIO_REC_CMD_STOP: {
+        if (g_rec_active) {
+            es1371_adc_stop(&g_audio_device);
+            g_rec_active = false;
+            log_write("audio: recording stopped");
+        }
+        return 0;
+    }
+    case AUDIO_REC_CMD_READ: {
+        if (!g_rec_active || request->buffer == NULL) {
+            return -1;
+        }
+        request->bytes_copied = audio_rec_fifo_read((uint8_t *) request->buffer, request->capacity);
+        return 0;
+    }
+    case AUDIO_REC_CMD_STATUS: {
+        request->frames_total = g_rec_total_frames;
+        request->bytes_ready = g_rec_fifo_tail - g_rec_fifo_head;
+        request->level = g_rec_level;
+        request->channels = 2U;
+        request->bits = 16U;
+        request->sample_rate = ES1371_RATE_44100;
+        return 0;
+    }
+    default:
+        return -1;
+    }
+}
+
 void audio_shutdown(void)
 {
     if (g_audio_device.present && g_audio_device.kind == AUDIO_DEVICE_ES1371 && g_audio_hw_initialized) {
@@ -1642,6 +2300,7 @@ void audio_shutdown(void)
         audio_ac97_stop_pcm_out();
         audio_write16((uint16_t) (g_audio_device.bus_master_base + AC97_PO_SR), AC97_X_SR_CLEAR);
     }
+    audio_release_pcm_source();
     if (g_audio_es1371_src_buffer != NULL) {
         kfree(g_audio_es1371_src_buffer);
         g_audio_es1371_src_buffer = NULL;
@@ -1670,4 +2329,321 @@ void audio_shutdown(void)
     g_audio_stream_path[0] = '\0';
     g_audio_track_name[0] = '\0';
     log_write("audio: shutdown");
+}
+
+/* ====================================================================== */
+/* Feature 11: audio mixer                                                */
+/* ====================================================================== */
+
+static uint8_t g_app_volumes[AUDIO_MIXER_MAX_APPS];
+static int32_t g_app_volume_pids[AUDIO_MIXER_MAX_APPS];
+static bool g_audio_muted;
+static uint8_t g_audio_pre_mute_volume;
+static audio_device_kind_t g_output_device;
+
+static int32_t audio_app_volume_slot(int32_t pid)
+{
+    for (uint32_t i = 0; i < AUDIO_MIXER_MAX_APPS; i++) {
+        if (g_app_volume_pids[i] == pid) {
+            return (int32_t) i;
+        }
+    }
+    for (uint32_t i = 0; i < AUDIO_MIXER_MAX_APPS; i++) {
+        if (g_app_volume_pids[i] == 0) {
+            g_app_volume_pids[i] = pid;
+            g_app_volumes[i] = 100u;
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
+uint8_t audio_app_volume(int32_t pid)
+{
+    int32_t slot = audio_app_volume_slot(pid);
+
+    return slot < 0 ? 100u : g_app_volumes[slot];
+}
+
+void audio_set_app_volume(int32_t pid, uint8_t percent)
+{
+    int32_t slot;
+
+    if (percent > 100u) {
+        percent = 100u;
+    }
+    slot = audio_app_volume_slot(pid);
+    if (slot >= 0) {
+        g_app_volumes[slot] = percent;
+    }
+}
+
+bool audio_muted(void)
+{
+    return g_audio_muted;
+}
+
+void audio_set_muted(bool muted)
+{
+    if (muted == g_audio_muted) {
+        return;
+    }
+    g_audio_muted = muted;
+    if (muted) {
+        g_audio_pre_mute_volume = g_audio_volume;
+        audio_set_volume(0u);
+    } else {
+        audio_set_volume(g_audio_pre_mute_volume == 0u ? 50u : g_audio_pre_mute_volume);
+    }
+}
+
+audio_device_kind_t audio_output_device(void)
+{
+    return g_output_device;
+}
+
+void audio_set_output_device(audio_device_kind_t kind)
+{
+    g_output_device = kind;
+}
+
+void audio_mixer_devices(audio_device_list_t *list)
+{
+    if (list == NULL) {
+        return;
+    }
+    memset(list, 0, sizeof(*list));
+    list->count = 1;
+    list->kinds[0] = g_audio_device.kind;
+    switch (g_audio_device.kind) {
+    case AUDIO_DEVICE_AC97:
+        strcpy(list->names[0], "AC97");
+        break;
+    case AUDIO_DEVICE_HDA:
+        strcpy(list->names[0], "HDA");
+        break;
+    case AUDIO_DEVICE_ES1371:
+        strcpy(list->names[0], "ES1371");
+        break;
+    case AUDIO_DEVICE_SB16:
+        strcpy(list->names[0], "SB16");
+        break;
+    default:
+        strcpy(list->names[0], "none");
+        break;
+    }
+}
+
+int32_t audio_mixer_ctl(const audio_mixer_request_t *request)
+{
+    if (request == NULL) {
+        return -1;
+    }
+    switch (request->cmd) {
+    case AUDIO_MIXER_GET_MASTER:
+        return (int32_t) audio_volume();
+    case AUDIO_MIXER_SET_MASTER:
+        audio_set_volume((uint8_t) request->value);
+        g_audio_muted = false;
+        return 0;
+    case AUDIO_MIXER_GET_MUTE:
+        return g_audio_muted ? 1 : 0;
+    case AUDIO_MIXER_SET_MUTE:
+        audio_set_muted(request->value != 0u);
+        return 0;
+    case AUDIO_MIXER_SET_APP_VOLUME:
+        audio_set_app_volume(request->pid, (uint8_t) request->value);
+        return 0;
+    case AUDIO_MIXER_GET_APP_VOLUME:
+        return (int32_t) audio_app_volume(request->pid);
+    case AUDIO_MIXER_SET_OUTPUT_DEVICE:
+        audio_set_output_device((audio_device_kind_t) request->value);
+        return 0;
+    case AUDIO_MIXER_GET_OUTPUT_DEVICE:
+        return (int32_t) audio_output_device();
+    case AUDIO_MIXER_ENUM_DEVICES: {
+        audio_device_list_t list;
+        audio_mixer_devices(&list);
+        return (int32_t) list.count;
+    }
+    default:
+        return -1;
+    }
+}
+
+/* ====================================================================== */
+/*  Standard driver interface: probe / play / record / read / write /      */
+/*  info / status. Thin wrappers over the existing AC97/ES1371/HDA paths.  */
+/*  When no PCI audio device is present the driver degrades gracefully    */
+/*  and prints "audio: not found" instead of faulting.                    */
+/* ====================================================================== */
+
+static char g_audio_driver_status[64];
+
+bool audio_probe(void)
+{
+    if (g_audio_device.present) {
+        return true;
+    }
+    pci_enumerate(audio_detect_callback, &g_audio_device);
+    if (!g_audio_device.present) {
+        strcpy(g_audio_driver_status, "audio: not found");
+        log_write(g_audio_driver_status);
+        return false;
+    }
+    switch (g_audio_device.kind) {
+    case AUDIO_DEVICE_AC97:
+        strcpy(g_audio_driver_status, "audio: ac97 detected");
+        break;
+    case AUDIO_DEVICE_ES1371:
+        strcpy(g_audio_driver_status, "audio: es1371 detected");
+        break;
+    case AUDIO_DEVICE_HDA:
+        strcpy(g_audio_driver_status, "audio: hda detected");
+        break;
+    default:
+        strcpy(g_audio_driver_status, "audio: pci audio detected");
+        break;
+    }
+    log_write(g_audio_driver_status);
+    return true;
+}
+
+/* Submit a PCM buffer for playback. Converts non-16-bit / mono input to the
+ * 16-bit stereo interleaved format the DMA engines expect. */
+bool audio_play(const void *buffer, uint32_t size, uint32_t sample_rate,
+                uint16_t bits, uint16_t channels)
+{
+    const int16_t *src;
+    int16_t *conv;
+    uint32_t frames;
+    uint32_t i;
+    bool ok;
+
+    if (!g_audio_device.present || buffer == NULL || size == 0u) {
+        return false;
+    }
+    if (sample_rate == 0u) {
+        sample_rate = AC97_TEST_SAMPLE_RATE;
+    }
+
+    /* Fast path: already 16-bit stereo. */
+    if (bits == 16u && channels == 2u && (size & 3u) == 0u) {
+        return audio_play_pcm(buffer, size, sample_rate, 2u, 16u);
+    }
+
+    if (channels == 0u || bits == 0u) {
+        return false;
+    }
+    frames = size / ((uint32_t) channels * (bits / 8u));
+    if (frames == 0u) {
+        return false;
+    }
+    conv = (int16_t *) kmalloc((uint64_t) frames * 4u);
+    if (conv == NULL) {
+        return false;
+    }
+    src = (const int16_t *) buffer;
+    for (i = 0; i < frames; i++) {
+        int16_t s_l;
+        int16_t s_r;
+
+        if (bits == 8u) {
+            s_l = (int16_t) ((((const uint8_t *) buffer)[i * channels] - 128) << 8);
+            s_r = channels == 2u
+                    ? (int16_t) ((((const uint8_t *) buffer)[i * channels + 1u] - 128) << 8)
+                    : s_l;
+        } else {
+            s_l = channels == 2u ? src[i * 2u] : src[i];
+            s_r = channels == 2u ? src[i * 2u + 1u] : src[i];
+        }
+        conv[i * 2u] = s_l;
+        conv[i * 2u + 1u] = s_r;
+    }
+    ok = audio_play_pcm(conv, frames * 4u, sample_rate, 2u, 16u);
+    kfree(conv);
+    return ok;
+}
+
+/* Drain up to max_size bytes of captured PCM (16-bit stereo 44.1k).
+ * Starts recording on first call; returns 0 when no capture device. */
+uint32_t audio_record(void *buffer, uint32_t max_size)
+{
+    audio_record_request_t req;
+    int32_t rc;
+
+    if (buffer == NULL || max_size == 0u) {
+        return 0u;
+    }
+    memset(&req, 0, sizeof(req));
+    req.cmd = AUDIO_REC_CMD_START;
+    (void) audio_record_ctl(&req);
+
+    req.cmd = AUDIO_REC_CMD_READ;
+    req.buffer = buffer;
+    req.capacity = max_size;
+    req.bytes_copied = 0;
+    rc = audio_record_ctl(&req);
+    return rc == 0 ? req.bytes_copied : 0u;
+}
+
+/* read = drain recorded samples; write = queue a PCM playback buffer. */
+uint32_t audio_read(void *buffer, uint32_t max_size)
+{
+    return audio_record(buffer, max_size);
+}
+
+uint32_t audio_write(const void *buffer, uint32_t size, uint32_t sample_rate,
+                     uint16_t bits, uint16_t channels)
+{
+    if (!audio_play(buffer, size, sample_rate, bits, channels)) {
+        return 0u;
+    }
+    return size;
+}
+
+/* Per-channel master volume (left/right 0..100). The AC97 master register
+ * is programmed as a single (left<<8|right) attenuation word. */
+void audio_set_volume_lr(uint8_t left, uint8_t right)
+{
+    uint16_t atten;
+
+    if (left > 100u) {
+        left = 100u;
+    }
+    if (right > 100u) {
+        right = 100u;
+    }
+    g_audio_volume = left;
+    if (!g_audio_device.present || !g_audio_hw_initialized) {
+        return;
+    }
+    if (g_audio_device.kind == AUDIO_DEVICE_AC97) {
+        uint16_t l = (uint16_t) (((100u - left) * 31u) / 100u);
+        uint16_t r = (uint16_t) (((100u - right) * 31u) / 100u);
+
+        atten = (uint16_t) ((l << 8) | r);
+        audio_write16((uint16_t) (g_audio_device.mixer_base + AC97_MIXER_MASTER_VOL), atten);
+        audio_write16((uint16_t) (g_audio_device.mixer_base + AC97_MIXER_PCM_OUT_VOL), atten);
+    } else if (g_audio_device.kind == AUDIO_DEVICE_ES1371) {
+        es1371_set_volume(&g_audio_device, left);
+    }
+}
+
+uint8_t audio_get_volume(void)
+{
+    return g_audio_volume;
+}
+
+const audio_device_info_t *audio_info(void)
+{
+    return &g_audio_device;
+}
+
+const char *audio_status(void)
+{
+    if (!g_audio_device.present) {
+        return "audio: not found";
+    }
+    return g_audio_driver_status[0] != '\0' ? g_audio_driver_status : "audio: ready";
 }

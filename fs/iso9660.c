@@ -126,7 +126,7 @@ static bool iso9660_is_dir_entry(const iso9660_entry_t *entry)
     return entry != NULL && entry->valid && (entry->flags & ISO9660_ATTR_DIR) != 0;
 }
 
-static bool iso9660_is_hidden_entry(const iso9660_entry_t *entry)
+__attribute__((unused)) static bool iso9660_is_hidden_entry(const iso9660_entry_t *entry)
 {
     return entry != NULL && entry->valid && (entry->flags & ISO9660_ATTR_HIDDEN) != 0;
 }

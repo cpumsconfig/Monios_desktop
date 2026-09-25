@@ -13,6 +13,8 @@
 
 WINDOWS_DLL_API uint32_t windows_abi_version(void);
 WINDOWS_DLL_API void windows_enter_graphics_mode(void);
+WINDOWS_DLL_API uint16_t windows_screen_width(void);
+WINDOWS_DLL_API uint16_t windows_screen_height(void);
 WINDOWS_DLL_API int32_t windows_fill_rect(uint16_t x, uint16_t y, uint16_t width,
                                            uint16_t height, uint32_t color);
 WINDOWS_DLL_API int32_t windows_draw_text(uint16_t x, uint16_t y, const char *text, uint32_t color);

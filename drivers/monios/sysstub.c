@@ -1,48 +1,31 @@
-#include "appsys.h"
-#include "stdio.h"
+#include "driver_api.h"
 
-static const char *basename(const char *path)
+static monios_driver_log_fn_t g_log;
+static bool g_loaded;
+
+__declspec(dllexport)
+bool DriverEntry(const monios_driver_runtime_t *runtime)
 {
-    const char *base = path;
-
-    if (path == 0) {
-        return "driver.sys";
+    if (runtime == 0 ||
+        runtime->abi_version != MONIOS_DRIVER_ABI_VERSION ||
+        runtime->log == 0) {
+        return false;
     }
-    while (*path != '\0') {
-        if (*path == '/' || *path == '\\') {
-            base = path + 1;
-        }
-        path++;
-    }
-    return base;
+    g_log = runtime->log;
+    g_loaded = true;
+    runtime->log("monios native driver online");
+    return true;
 }
 
-static void write_line(const char *text)
+__declspec(dllexport)
+void DriverUnload(void)
 {
-    fputs(text);
-    fputs("\r\n");
-}
-
-int main(int argc, char **argv)
-{
-    const app_launch_info_t *info = app_launch_info();
-    const char *path = 0;
-
-    (void) argc;
-    (void) argv;
-    if (info != 0) {
-        path = info->program_path;
+    if (!g_loaded) {
+        return;
     }
-
-    write_line(basename(path));
-    write_line("MoniOS signed driver package");
-    write_line("hardware binding is provided by the kernel driver ABI compatibility layer");
-    if (info == 0 || info->privilege_level > APP_PRIV_R2) {
-        if (!app_request_r2("driver package inspection requests R2")) {
-            write_line("R2 denied");
-            return 1;
-        }
+    if (g_log != 0) {
+        g_log("monios native driver offline");
     }
-    write_line("package verified at R2");
-    return 0;
+    g_log = 0;
+    g_loaded = false;
 }

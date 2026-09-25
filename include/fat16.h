@@ -18,4 +18,6 @@ bool fat16_rmdir(const char *path);
 bool fat16_list_dir(const char *path, char *buffer, uint32_t buffer_size);
 bool fat16_list_root(char *buffer, uint32_t buffer_size);
 
+uint64_t fat16_total_bytes(uint64_t *free_out, uint32_t *cluster_size_out);
+
 #endif

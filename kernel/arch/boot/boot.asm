@@ -19,8 +19,32 @@ LABEL_START:
     mov dl, [BootDrive]
     int 13h
 
-    mov eax, [BPB_HiddSec]
-    add eax, SectorNoOfRootDirectory
+    ; ---- 从磁盘上的 BPB 读取真实几何（不再依赖编译期常量）--------------
+    ; 引导扇区里的 BPB 已由 tools/mkfat32.py 按镜像实际尺寸改写，因此几何
+    ; 必须在运行时读取。若沿用编译期常量，镜像尺寸一变就会算错根目录位置，
+    ; 于是找不到 LOADER.BIN 而落到 LABEL_NO_LOADERBIN 死循环。
+    ;   DATA_LBA = HiddSec + RsvdSecCnt + NumFATs * FATSz32
+    movzx eax, word [BPB_RsvdSecCnt]
+    movzx ecx, byte [BPB_NumFATs]
+    mov edx, [BPB_FATSz32]
+    imul edx, ecx
+    add eax, edx
+    add eax, [BPB_HiddSec]
+    mov [wDataLba], eax
+
+    ; cluster -> LBA 的加数 = DATA_LBA - 2 * SecPerClus
+    movzx ecx, byte [BPB_SecPerClus]
+    add ecx, ecx
+    mov ebx, eax
+    sub ebx, ecx
+    mov [wClusterBase], ebx
+
+    ; 根目录起始 LBA = DATA_LBA + (RootClus - 2) * SecPerClus
+    mov ecx, [BPB_RootClus]
+    sub ecx, 2
+    movzx edx, byte [BPB_SecPerClus]
+    imul ecx, edx
+    add eax, ecx
     mov dword [wSectorNo], eax
 LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     cmp word [wRootDirSizeForLoop], 0
@@ -75,8 +99,7 @@ LABEL_FILENAME_FOUND:
 
     add di, 01Ah
     movzx ecx, word [es:di]
-    add ecx, RootDirSectors + DeltaSectorNo
-    mov eax, [BPB_HiddSec]
+    mov eax, [wClusterBase]
     add eax, ecx
     mov dword [wCurrentLba], eax
     mov word [wLoadSegment], BaseOfLoader
@@ -114,6 +137,8 @@ wRootDirSizeForLoop dw RootDirSectors
 wSectorNo           dd 0
 wFileSectors        dw 0
 wCurrentLba         dd 0
+wDataLba            dd 0
+wClusterBase        dd 0
 wLoadSegment        dw 0
 wLoadOffset         dw 0
 bOdd                db 0

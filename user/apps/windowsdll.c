@@ -27,6 +27,18 @@ void windows_enter_graphics_mode(void)
 }
 
 WINDOWS_DLL_EXPORT
+uint16_t windows_screen_width(void)
+{
+    return (uint16_t) monios_syscall0(SYS_GRAPHICS_GET_WIDTH);
+}
+
+WINDOWS_DLL_EXPORT
+uint16_t windows_screen_height(void)
+{
+    return (uint16_t) monios_syscall0(SYS_GRAPHICS_GET_HEIGHT);
+}
+
+WINDOWS_DLL_EXPORT
 int32_t windows_fill_rect(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t color)
 {
     uint64_t pos = ((uint64_t) x << 48) | ((uint64_t) y << 32) | ((uint64_t) width << 16) | height;

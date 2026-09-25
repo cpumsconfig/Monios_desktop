@@ -14,6 +14,11 @@
 #define UI_SYSTEM_FONTS_DIR         "C:\\Monios\\System\\Fonts"
 #define UI_SYSTEM_LIB_DIR           "C:\\Monios\\System\\Lib"
 #define UI_SYSTEM_MEDIA_DIR         "C:\\Monios\\System\\Media"
+#define UI_SYSTEM_SECURITY_DIR      "C:\\Monios\\System\\Security"
+#define UI_TRUST_ROOT_DIR           "C:\\Monios\\System\\Security\\Root"
+#define UI_TRUST_ROOT_BUNDLE_PATH   "C:\\Monios\\System\\Security\\trust.bin"
+#define UI_CUSTOM_COMPONENT_DIR     "C:\\Monios\\System\\UI\\Comps"
+#define UI_OSLOG_DIR                "C:\\Monios\\OSlog"
 #define UI_USERS_DIR                "C:\\Monios\\Users"
 #define UI_ROOT_HOME                "C:\\Monios\\Users\\root"
 #define UI_GUEST_HOME               "C:\\Monios\\Users\\guest"
@@ -23,7 +28,7 @@
 #define UI_KERNEL_IMAGE_PATH        "C:\\Monios\\kernel.exe"
 #define UI_LOADER_IMAGE_PATH        "C:\\Monios\\System\\Boot\\loader.bin"
 #define UI_BOOT_FONT_PATH           "C:\\Monios\\System\\Fonts\\msyh.ttc"
-#define UI_WALLPAPER_PATH           "C:\\Monios\\System\\Media\\wall.bmp"
+#define UI_WALLPAPER_PATH           "C:\\Monios\\System\\Media\\wallpaper.jpg"
 #define UI_BOOT_IMAGE_PATH          "C:\\Monios\\System\\Media\\boot.bmp"
 #define UI_CURSOR_CONFIG_PATH       "C:\\Monios\\System\\Config\\cursor.cfg"
 #define UI_CURSOR_ASSET_PATH        "C:\\Monios\\System\\Cursors\\arrow.cur"
@@ -33,6 +38,7 @@
 #define UI_EXPLORER_PATH            "C:\\Monios\\Apps\\explorar.exe"
 #define UI_LOGON_PATH               "C:\\Monios\\Apps\\monilog.exe"
 #define UI_PLAYER_PATH              "C:\\Monios\\Apps\\player.exe"
+#define UI_BROWSER_PATH             "C:\\Monios\\Apps\\browser.exe"
 #define UI_NOTEPAD_PATH             "C:\\Monios\\Apps\\notepad.exe"
 #define UI_TASKMGR_PATH             "C:\\Monios\\Apps\\taskmgr.exe"
 #define UI_SETUP_PATH               "C:\\Monios\\Apps\\setup.exe"
@@ -41,6 +47,7 @@
 #define UI_MONIOS_DLL_PATH          "C:\\Monios\\System\\Lib\\monios.dll"
 #define UI_CONSOLE_DLL_PATH         "C:\\Monios\\System\\Lib\\console.dll"
 #define UI_WINDOWS_DLL_PATH         "C:\\Monios\\System\\Lib\\windows.dll"
+#define UI_OSUI_DLL_PATH            "C:\\Monios\\System\\Lib\\osui.dll"
 
 typedef enum {
     UI_NETWORK_NO_ADAPTER = 0,

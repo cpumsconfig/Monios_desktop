@@ -9,6 +9,7 @@
 #define X509_MAX_CHAIN_DEPTH 8
 #define X509_MAX_NAME_ENTRIES 16
 #define X509_MAX_EXTENSIONS 8
+#define X509_MAX_TRUSTED_ROOTS 64
 
 /* ASN.1 tags */
 #define ASN1_TAG_BOOLEAN     0x01
@@ -33,6 +34,7 @@ typedef struct {
     uint32_t oid_len;
     char value[128];
     uint32_t value_len;
+    uint32_t rdn_index;
 } x509_name_entry_t;
 
 /* X.509 name (issuer/subject) */
@@ -82,6 +84,10 @@ typedef struct {
 
     bool is_ca;
     int32_t path_len_constraint;
+    bool eku_present;
+    bool has_code_signing_eku;
+    bool key_usage_present;
+    uint16_t key_usage;
 
     rsa_pubkey_t rsa_key;
     bool rsa_key_ready;
@@ -95,7 +101,7 @@ typedef struct {
 
 /* Trusted root certificates */
 typedef struct {
-    x509_cert_t roots[16];
+    x509_cert_t roots[X509_MAX_TRUSTED_ROOTS];
     uint32_t count;
 } x509_trust_store_t;
 
@@ -118,6 +124,7 @@ int32_t x509_verify_signature(const x509_cert_t *cert, const x509_cert_t *issuer
 int32_t x509_verify_chain(const x509_chain_t *chain, const x509_trust_store_t *trust_store);
 int32_t x509_check_name_match(const x509_name_t *a, const x509_name_t *b);
 int32_t x509_check_validity(const x509_cert_t *cert, uint64_t current_time);
+bool x509_trust_contains(const x509_trust_store_t *store, const x509_cert_t *cert);
 
 /* Trust store */
 void x509_init_trust_store(x509_trust_store_t *store);

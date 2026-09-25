@@ -10,6 +10,25 @@ static uint32_t g_tcp_packets;
 static uint16_t g_next_ephemeral_port;
 static uint32_t g_seq_secret;
 
+/* Passive-open listeners: a SYN arriving on one of these ports creates a new
+ * server-side connection that later shows up in tcp_accept_ready(). */
+typedef struct {
+    bool used;
+    uint16_t local_port;
+} tcp_listener_t;
+
+static tcp_listener_t g_listeners[TCP_MAX_LISTENERS];
+
+static bool tcp_port_has_listener(uint16_t port)
+{
+    for (uint32_t i = 0; i < TCP_MAX_LISTENERS; i++) {
+        if (g_listeners[i].used && g_listeners[i].local_port == port) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t tcp_mix32(uint32_t value)
 {
     value ^= value >> 16;
@@ -130,7 +149,7 @@ static uint16_t tcp_alloc_ephemeral_port(void)
 {
     for (uint32_t i = 0; i < 1000; i++) {
         uint16_t port = g_next_ephemeral_port++;
-        if (g_next_ephemeral_port < 49152 || g_next_ephemeral_port > 65535) {
+        if (g_next_ephemeral_port < 49152) {
             g_next_ephemeral_port = 49152;
         }
         if (!tcp_port_in_use(port)) {
@@ -177,6 +196,104 @@ void tcp_init(void)
                                  0xA5366B4Du);
     }
     log_write("tcp: ipv4 stack ready");
+}
+
+int32_t tcp_listen_port(uint16_t local_port)
+{
+    if (local_port == 0) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < TCP_MAX_LISTENERS; i++) {
+        if (!g_listeners[i].used) {
+            g_listeners[i].used = true;
+            g_listeners[i].local_port = local_port;
+            log_write("tcp: listening port");
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void tcp_unlisten_port(uint16_t local_port)
+{
+    for (uint32_t i = 0; i < TCP_MAX_LISTENERS; i++) {
+        if (g_listeners[i].used && g_listeners[i].local_port == local_port) {
+            g_listeners[i].used = false;
+            g_listeners[i].local_port = 0;
+            return;
+        }
+    }
+}
+
+int32_t tcp_accept_ready(uint16_t local_port, uint8_t remote_ip_out[4], uint16_t *remote_port_out)
+{
+    for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connection_t *conn = &g_connections[i];
+
+        if (!conn->used || !conn->passive || conn->accepted) {
+            continue;
+        }
+        if (conn->local_port != local_port) {
+            continue;
+        }
+        if (conn->state != TCP_STATE_ESTABLISHED) {
+            continue;
+        }
+        conn->accepted = true;
+        if (remote_ip_out != NULL) {
+            memcpy(remote_ip_out, conn->remote_ip, 4);
+        }
+        if (remote_port_out != NULL) {
+            *remote_port_out = conn->remote_port;
+        }
+        return (int32_t) (i + 1);
+    }
+    return -1;
+}
+
+/* Create a server-side connection entry in response to an inbound SYN and
+ * answer SYN/ACK. The connection reaches ESTABLISHED once the client ACKs. */
+static tcp_connection_t *tcp_passive_open(const uint8_t remote_ip[4], uint16_t remote_port,
+                                           uint16_t local_port, uint32_t client_seq)
+{
+    int32_t handle = -1;
+    tcp_connection_t *conn = NULL;
+
+    for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        if (!g_connections[i].used) {
+            handle = (int32_t) (i + 1);
+            conn = &g_connections[i];
+            break;
+        }
+    }
+    if (handle < 0) {
+        log_write("tcp: listener backlog full");
+        return NULL;
+    }
+
+    memset(conn, 0, sizeof(*conn));
+    conn->used = true;
+    conn->passive = true;
+    conn->accepted = false;
+    conn->state = TCP_STATE_SYN_RCVD;
+    memcpy(conn->remote_ip, remote_ip, 4);
+    conn->remote_port = remote_port;
+    conn->local_port = local_port;
+    conn->seq_num = tcp_generate_conn_seq(remote_ip, remote_port, local_port);
+    conn->remote_seq = client_seq;
+    conn->ack_num = client_seq + 1;
+    conn->remote_ack = 0;
+
+    /* Send SYN/ACK: our seq = conn->seq_num, ack = client_seq+1. */
+    if (!tcp_send_segment(remote_ip, local_port, remote_port,
+                          conn->seq_num, conn->ack_num,
+                          TCP_FLAG_SYN | TCP_FLAG_ACK, NULL, 0)) {
+        memset(conn, 0, sizeof(*conn));
+        return NULL;
+    }
+    conn->seq_num++; /* SYN consumes one sequence number */
+    log_write("tcp: inbound syn");
+    return conn;
 }
 
 int32_t tcp_connect(const uint8_t remote_ip[4], uint16_t remote_port, uint16_t local_port)
@@ -411,9 +528,13 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
 
     if (conn == NULL) {
         if ((flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) == 0) {
-            uint8_t rst_flags = TCP_FLAG_RST | TCP_FLAG_ACK;
-            tcp_send_segment(src_ip, dst_port, src_port, 0, seq + 1, rst_flags, NULL, 0);
-            log_write("tcp: rst sent");
+            if (tcp_port_has_listener(dst_port)) {
+                tcp_passive_open(src_ip, src_port, dst_port, seq);
+            } else {
+                uint8_t rst_flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+                tcp_send_segment(src_ip, dst_port, src_port, 0, seq + 1, rst_flags, NULL, 0);
+                log_write("tcp: rst sent");
+            }
         }
         return;
     }
@@ -432,6 +553,21 @@ void tcp_handle_ipv4(const uint8_t *packet, uint16_t length)
             } else if ((flags & TCP_FLAG_RST) != 0 && tcp_ack_valid(conn, ack)) {
                 memset(conn, 0, sizeof(*conn));
                 log_write("tcp: connection reset");
+            }
+            break;
+
+        case TCP_STATE_SYN_RCVD:
+            /* Client ACKs our SYN/ACK -> established. A stray RST tears us down. */
+            if ((flags & TCP_FLAG_RST) != 0) {
+                memset(conn, 0, sizeof(*conn));
+                log_write("tcp: syn rcv reset");
+                break;
+            }
+            if ((flags & TCP_FLAG_ACK) != 0 && ack == conn->seq_num && seq == conn->ack_num) {
+                conn->state = TCP_STATE_ESTABLISHED;
+                conn->remote_ack = ack;
+                conn->remote_window = window;
+                log_write("tcp: inbound connection established");
             }
             break;
 

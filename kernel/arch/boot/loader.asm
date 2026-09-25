@@ -42,8 +42,31 @@ LABEL_START:
     mov sp, BaseOfStack
     mov [BootDrive], dl
 
-    mov eax, [BPB_HiddSec]
-    add eax, SectorNoOfRootDirectory
+    ; ---- 从磁盘上的 BPB 读取真实几何（不再依赖编译期常量）--------------
+    ; 与 boot.asm 同理：BPB 由 tools/mkfat32.py 按镜像实际尺寸改写，
+    ; 几何必须运行时读取，否则镜像尺寸变化后这里会找错根目录。
+    ;   DATA_LBA = HiddSec + RsvdSecCnt + NumFATs * FATSz32
+    movzx eax, word [BPB_RsvdSecCnt]
+    movzx ecx, byte [BPB_NumFATs]
+    mov edx, [BPB_FATSz32]
+    imul edx, ecx
+    add eax, edx
+    add eax, [BPB_HiddSec]
+    mov [dwDataLba], eax
+
+    ; cluster -> LBA 的加数 = DATA_LBA - 2 * SecPerClus
+    movzx ecx, byte [BPB_SecPerClus]
+    add ecx, ecx
+    mov ebx, eax
+    sub ebx, ecx
+    mov [dwClusterBase], ebx
+
+    ; 根目录起始 LBA = DATA_LBA + (RootClus - 2) * SecPerClus
+    mov ecx, [BPB_RootClus]
+    sub ecx, 2
+    movzx edx, byte [BPB_SecPerClus]
+    imul ecx, edx
+    add eax, ecx
     mov dword [wSectorNo], eax
 LABEL_SEARCH_IN_ROOT_DIR_BEGIN:
     cmp word [wRootDirSizeForLoop], 0
@@ -104,8 +127,7 @@ LABEL_FILENAME_FOUND:
     movzx eax, word [es:di + 014h]
     shl eax, 16
     mov ax, word [es:di + 01Ah]
-    add eax, RootDirSectors + DeltaSectorNo
-    add eax, [BPB_HiddSec]
+    add eax, [dwClusterBase]
     mov dword [dwCurrentLba], eax
     mov dword [dwKernelLoadPhys], BaseOfKernelFilePhyAddr
     mov dword [dwKernelLoadPhys + 4], 0
@@ -153,6 +175,8 @@ dwKernelSize        dd 0
 dwFileSectors       dd 0
 dwCurrentLba        dd 0
 dwKernelLoadPhys    dq 0
+dwDataLba           dd 0
+dwClusterBase       dd 0
 wRootDirSizeForLoop dw RootDirSectors
 wSectorNo           dd 0
 bOdd                db 0

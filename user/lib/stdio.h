@@ -11,6 +11,8 @@ int fputs(const char *text);
 int fputs_handle(const char *text, uint64_t handle);
 int printf(const char *format, ...);
 int vprintf(const char *format, va_list args);
+int vsprintf(char *buf, const char *format, va_list args);
+int sprintf(char *buf, const char *format, ...);
 void print_uint(uint32_t value);
 void print_int(int32_t value);
 

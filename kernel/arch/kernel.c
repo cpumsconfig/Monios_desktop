@@ -15,6 +15,7 @@
 #include "exec.h"
 #include "extfs.h"
 #include "file.h"
+#include "chkdsk.h"
 #include "futex.h"
 #include "gop.h"
 #include "heap.h"
@@ -47,6 +48,10 @@
 #include "net.h"
 #include "ntfs.h"
 #include "pcb.h"
+#include "proc_mgmt.h"
+#include "user_mgmt.h"
+#include "fs_perm.h"
+#include "vm.h"
 #include "pci.h"
 #include "pool.h"
 #include "prsys.h"
@@ -56,6 +61,7 @@
 #include "session.h"
 #include "gdb_stub.h"
 #include "crash_dump.h"
+#include "memdump.h"
 #include "ftrace.h"
 #include "frame.h"
 #include "fs_cache.h"
@@ -69,6 +75,7 @@
 #include "terminal.h"
 #include "ui.h"
 #include "tls.h"
+#include "trust_store.h"
 #include "http.h"
 #include "usb_ext.h"
 #include "vma.h"
@@ -79,6 +86,7 @@
 #include "power.h"
 #include "opp.h"
 #include "od.h"
+#include "osui.h"
 #include "path.h"
 
 static bool g_graphics_mode_requested;
@@ -96,7 +104,7 @@ static void u32_to_2dec(char *dst, uint32_t value)
     dst[1] = (char) ('0' + (value % 10));
 }
 
-static void u64_to_dec(char *buf, uint64_t value)
+static void __attribute__((unused)) u64_to_dec(char *buf, uint64_t value)
 {
     char temp[21];
     uint32_t i = 0;
@@ -163,6 +171,95 @@ void serial_write(const char *str)
 }
 
 static bool g_log_quiet;
+static bool g_log_file_ready;
+static char g_log_file_path[128];
+static char g_log_buffer[65536];
+static uint32_t g_log_buffer_len;
+
+static void kernel_log_append_buffer(const char *text)
+{
+    uint32_t length;
+
+    if (text == NULL || g_log_buffer_len >= sizeof(g_log_buffer) - 1) {
+        return;
+    }
+    length = (uint32_t) strlen(text);
+    if (length > sizeof(g_log_buffer) - 1 - g_log_buffer_len) {
+        length = sizeof(g_log_buffer) - 1 - g_log_buffer_len;
+    }
+    memcpy(g_log_buffer + g_log_buffer_len, text, length);
+    g_log_buffer_len += length;
+    g_log_buffer[g_log_buffer_len] = '\0';
+}
+
+static void kernel_log_append_dec(char *out, uint32_t *pos, uint32_t value)
+{
+    char digits[10];
+    uint32_t count = 0;
+
+    if (value == 0) {
+        out[(*pos)++] = '0';
+        return;
+    }
+    while (value > 0 && count < sizeof(digits)) {
+        digits[count++] = (char) ('0' + value % 10U);
+        value /= 10U;
+    }
+    while (count > 0) {
+        out[(*pos)++] = digits[--count];
+    }
+}
+
+static void kernel_log_open_file(void)
+{
+    cmos_time_t now;
+    char date[16];
+    uint32_t pos;
+    uint32_t sequence;
+
+    if (g_log_file_ready) {
+        return;
+    }
+    if (!file_exists(UI_SYSTEM_ROOT) && !file_mkdir(UI_SYSTEM_ROOT)) {
+        return;
+    }
+    if (!file_exists(UI_OSLOG_DIR) && !file_mkdir(UI_OSLOG_DIR)) {
+        return;
+    }
+    cmos_read_time(&now);
+    pos = 0;
+    kernel_log_append_dec(date, &pos, now.year);
+    date[pos++] = '-';
+    if (now.month < 10) date[pos++] = '0';
+    kernel_log_append_dec(date, &pos, now.month);
+    date[pos++] = '-';
+    if (now.day < 10) date[pos++] = '0';
+    kernel_log_append_dec(date, &pos, now.day);
+    date[pos] = '\0';
+
+    for (sequence = 1; sequence < 10000; sequence++) {
+        uint32_t path_pos = 0;
+
+        strcpy(g_log_file_path, UI_OSLOG_DIR);
+        path_pos = (uint32_t) strlen(g_log_file_path);
+        g_log_file_path[path_pos++] = PATH_SEPARATOR;
+        strcpy(g_log_file_path + path_pos, date);
+        path_pos += (uint32_t) strlen(date);
+        g_log_file_path[path_pos++] = '-';
+        kernel_log_append_dec(g_log_file_path, &path_pos, sequence);
+        strcpy(g_log_file_path + path_pos, ".log");
+        if (!file_exists(g_log_file_path)) {
+            break;
+        }
+    }
+    if (sequence >= 10000) {
+        g_log_file_path[0] = '\0';
+        return;
+    }
+    g_log_file_ready = file_write(g_log_file_path,
+                                  g_log_buffer,
+                                  g_log_buffer_len) >= 0;
+}
 
 void log_write(const char *str)
 {
@@ -175,6 +272,20 @@ void log_write(const char *str)
     serial_write(prefix);
     serial_write(str);
     serial_write_char('\n');
+    kernel_log_append_buffer(prefix);
+    kernel_log_append_buffer(str);
+    kernel_log_append_buffer("\n");
+    if (g_log_file_ready) {
+        file_write(g_log_file_path, g_log_buffer, g_log_buffer_len);
+    }
+}
+
+const char *kernel_log_tail(uint32_t *out_len)
+{
+    if (out_len != NULL) {
+        *out_len = g_log_buffer_len;
+    }
+    return g_log_buffer;
 }
 
 void log_write_event(const char *tag, const char *detail)
@@ -260,13 +371,30 @@ bool kernel_sleep_requested(void)
     return g_sleep_requested;
 }
 
-static void kernel_shutdown_processes_and_drivers(void)
+static bool kernel_shutdown_processes_and_drivers(void)
 {
     log_write("power: stopping processes");
     exec_shutdown_active();
+
+    /* Clean shutdown I/O teardown. Order matters:
+     *   1) stop user processes so they release open files;
+     *   2) sync every dirty cache (VFS write-back + extfs block cache) to disk;
+     *   3) unmount every mounted filesystem so on-disk state is consistent.
+     * These must run BEFORE driver_manager_shutdown(), which tears down the
+     * storage controllers (IDE/AHCI/NVMe). FAT32/extfs write through PIO
+     * polling, so they work even though interrupts are already disabled. */
+    log_write("power: syncing filesystems");
+    if (!file_sync_all()) {
+        log_write("power: shutdown cancelled, dirty data could not be written");
+        return false;
+    }
+    log_write("power: unmounting filesystems");
+    if (!file_unmount_all()) return false;
+
     graphics_close_all_programs();
     driver_manager_shutdown();
     task_shutdown_all();
+    return true;
 }
 
 static void kernel_poweroff(void)
@@ -507,13 +635,10 @@ static void task_poll_graphics_input(void *arg)
 static void task_update_desktop_shell(void *arg)
 {
     (void) arg;
-    if (!graphics_active()) {
-        return;
-    }
-    graphics_periodic_update(timer_ticks());
+    osui_desktop_tick();
 }
 
-static void draw_console_banner(void)
+static void __attribute__((unused)) draw_console_banner(void)
 {
     console_clear();
 }
@@ -533,6 +658,7 @@ void kernel_run_periodic_work(void)
         return;
     }
     running = true;
+    driver_manager_update(timer_ticks());
     audio_update();
     net_update();
     lwip_update();
@@ -550,6 +676,7 @@ void kernel_run_exec_periodic_work(void)
         return;
     }
     running = true;
+    driver_manager_update(timer_ticks());
     audio_update();
     net_update();
     lwip_update();
@@ -560,6 +687,191 @@ void kernel_run_exec_periodic_work(void)
     task_update_desktop_shell(NULL);
     task_handle_graphics_request(NULL);
     running = false;
+}
+
+/* ============================================================
+ * Boot timing instrumentation (TSC-based).
+ * ============================================================ */
+#define BOOT_TIMER_MAX_STAGES 64
+static uint64_t g_boot_tsc_start;
+static uint64_t g_boot_tsc_stages[BOOT_TIMER_MAX_STAGES];
+static const char *g_boot_stage_names[BOOT_TIMER_MAX_STAGES];
+static uint32_t g_boot_stage_count;
+
+static void boot_tick(const char *stage_name)
+{
+    uint64_t now = cpu_read_tsc();
+    if (g_boot_stage_count < BOOT_TIMER_MAX_STAGES) {
+        g_boot_tsc_stages[g_boot_stage_count] = now;
+        g_boot_stage_names[g_boot_stage_count] = stage_name;
+        g_boot_stage_count++;
+    }
+}
+
+static void boot_timing_report(void)
+{
+    uint64_t total;
+    uint64_t tsc_mhz = 0;
+    uint64_t now;
+    uint32_t i;
+
+    now = cpu_read_tsc();
+    total = now - g_boot_tsc_start;
+
+    {
+        uint64_t ticks = timer_ticks();
+        uint32_t hz = timer_hz();
+        if (ticks > 0 && hz > 0) {
+            uint64_t elapsed_ms = (ticks * 1000ULL) / hz;
+            if (elapsed_ms > 0) {
+                tsc_mhz = total / (elapsed_ms * 1000ULL);
+            }
+        }
+    }
+
+    serial_write("\r\n===== BOOT TIMING REPORT =====\r\n");
+    if (tsc_mhz > 0) {
+        serial_write("TSC approx MHz: ");
+        {
+            char rev[24]; uint32_t r = 0;
+            uint64_t v = tsc_mhz;
+            if (v == 0) { rev[r++] = '0'; }
+            while (v > 0 && r < 20) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+            while (r > 0) { serial_write_char(rev[--r]); }
+        }
+        serial_write("\r\n");
+    }
+    serial_write("stage                              delta_cycles\r\n");
+    serial_write("----------------------------------------\r\n");
+    for (i = 0; i < g_boot_stage_count; i++) {
+        uint64_t delta;
+        char buf[96];
+        uint32_t col = 0;
+        const char *s = g_boot_stage_names[i];
+
+        if (i == 0) {
+            delta = g_boot_tsc_stages[i] - g_boot_tsc_start;
+        } else {
+            delta = g_boot_tsc_stages[i] - g_boot_tsc_stages[i - 1];
+        }
+
+        while (s != NULL && *s != '\0' && col < 34) {
+            buf[col++] = *s++;
+        }
+        while (col < 36) { buf[col++] = ' '; }
+        {
+            uint64_t v = delta;
+            char rev[24]; uint32_t r = 0;
+            if (v == 0) { rev[r++] = '0'; }
+            while (v > 0 && r < 20) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+            while (r > 0 && col < sizeof(buf) - 1) { buf[col++] = rev[--r]; }
+        }
+        buf[col] = '\0';
+        serial_write(buf);
+        serial_write("\r\n");
+    }
+    {
+        char rev[24]; uint32_t r = 0;
+        uint64_t v = total;
+        if (v == 0) { rev[r++] = '0'; }
+        while (v > 0 && r < 20) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+        serial_write("TOTAL cycles: ");
+        while (r > 0) { serial_write_char(rev[--r]); }
+        serial_write("\r\n");
+    }
+    if (tsc_mhz > 0 && total > 0) {
+        uint64_t ms = total / (tsc_mhz * 1000ULL);
+        char rev[24]; uint32_t r = 0;
+        uint64_t v = ms;
+        if (v == 0) { rev[r++] = '0'; }
+        while (v > 0 && r < 20) { rev[r++] = (char)('0' + v % 10); v /= 10; }
+        serial_write("TOTAL approx ms: ");
+        while (r > 0) { serial_write_char(rev[--r]); }
+        serial_write("\r\n");
+    }
+    serial_write("==============================\r\n\r\n");
+}
+
+/* ============================================================
+ * Deferred (post-desktop) subsystem initialization.
+ * ============================================================ */
+static uint32_t g_deferred_step;
+
+static void task_deferred_init(void *arg)
+{
+    (void) arg;
+    static bool logged_start;
+    static bool reported;
+
+    if (!logged_start) {
+        log_write("boot: deferred subsystem init starting");
+        logged_start = true;
+    }
+
+    switch (g_deferred_step) {
+    case 0:
+        log_write("defer: audio");
+        audio_init();
+        extern void print_init(void); print_init();
+        aac_init();
+        audio_log_state();
+        break;
+    case 1:
+        log_write("defer: storage-ext");
+        storage_ext_init();
+        break;
+    case 2:
+        log_write("defer: i2c/i3c/spi buses");
+        iic_init();
+        i2c_init();
+        i3c_init();
+        spi_init();
+        break;
+    case 3:
+        log_write("defer: tpm/mcb/md");
+        tpm_init();
+        mcb_init();
+        md_init();
+        break;
+    case 4:
+        log_write("defer: usb-ext");
+        usb_ext_init();
+        break;
+    case 5:
+        log_write("defer: bluetooth");
+        bluetooth_init();
+        break;
+    case 6:
+        log_write("defer: wifi");
+        wifi_init();
+        break;
+    case 7:
+        log_write("defer: net stack");
+        ipv6_init();
+        net_init();
+        extern void firewall_init(void); firewall_init();
+        break;
+    case 8:
+        log_write("defer: lwip/tls/http");
+        lwip_init();
+        tls_init();
+        http_init();
+        break;
+    case 9:
+        log_write("defer: browser/gpu/gui");
+        browser_init();
+        gpu_init();
+        gui_init();
+        break;
+    default:
+        if (!reported) {
+            reported = true;
+            log_write("boot: deferred subsystem init complete");
+            boot_timing_report();
+        }
+        break;
+    }
+    g_deferred_step++;
 }
 
 void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
@@ -573,38 +885,44 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     serial_write_char('\n');
     g_log_quiet = false;
     log_write("boot: serial online");
-    /* Loaders may provide the actual physical load base in .kconfig after
-     * relocating the PE image. BIOS leaves it zero and uses the link base. */
+    g_boot_tsc_start = cpu_read_tsc();
+    boot_tick("kernel_entry");
+    /* Loaders may provide the actual physical load base in .kconfig. */
     extern uint64_t _kconfig_start;
     volatile uint64_t *kcfg = &_kconfig_start;
+    uint64_t loader_heap_base = kcfg[3];
+    uint64_t loader_heap_size = kcfg[4];
     uint64_t kernel_phys_base = kcfg[0] != 0 ? kcfg[0] : KERNEL_PHYS_BASE;
     uint64_t kernel_virt_base = kcfg[1] != 0 ? kcfg[1] : KERNEL_VIRT_BASE;
     kcfg[0] = kernel_phys_base;
     kcfg[1] = kernel_virt_base;
     kcfg[2] = 0;
-    kcfg[3] = 0;
+    kcfg[3] = loader_heap_base;
+    kcfg[4] = loader_heap_size;
     crash_dump_init();
+    memdump_init();
     log_write("boot: crash dump online");
     gdb_stub_init();
-    log_write("boot: gdb stub online (COM1 115200)");
+    log_write("boot: gdb stub online (COM2 115200)");
     ftrace_init();
     log_write("boot: ftrace online");
+    {
+        extern void profiler_init(void);
+        extern void memstats_init(void);
+        profiler_init();
+        memstats_init();
+    }
+    log_write("boot: profiler + memstats online");
 
-    /* kconfig section – written by kernel, read by crash_dump
-     * to locate kernel global state after a crash. */
-    /* ftrace symbol table – map PA → name for key entry points.
-     * Forward declarations for functions defined in other .c files. */
     extern void cpu_exception_dispatch(void);
     extern void init_gdt(void);
     extern void init_idt(void);
     extern void init_page_tables(void);
     extern void syscall_init(void);
     extern void shell_init(void);
-    extern void ftrace_init(void);
     extern void ftrace_dump_serial(void);
-    extern void crash_dump_init(void);
 
-    static const uint64_t  ftrace_addrs[] = {
+    static const uint64_t ftrace_addrs[] = {
         (uint64_t)(void *)&kernel_main,
         (uint64_t)(void *)&cpu_exception_dispatch,
         (uint64_t)(void *)&init_gdt,
@@ -612,7 +930,6 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
         (uint64_t)(void *)&init_page_tables,
         (uint64_t)(void *)&syscall_init,
         (uint64_t)(void *)&shell_init,
-        (uint64_t)(void *)&ftrace_init,
         (uint64_t)(void *)&ftrace_dump_serial,
         (uint64_t)(void *)&crash_dump_init,
     };
@@ -624,13 +941,13 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
         "init_page_tables",
         "syscall_init",
         "shell_init",
-        "ftrace_init",
         "ftrace_dump_serial",
         "crash_dump_init",
     };
     ftrace_set_symbols(ftrace_addrs, ftrace_names,
         (uint32_t)(sizeof(ftrace_addrs) / sizeof(ftrace_addrs[0])),
         kernel_phys_base);
+    boot_tick("debug_subsystems");
 
     log_write("boot: init gdt");
     init_gdt();
@@ -653,9 +970,13 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     vma_init();
     lazyalloc_init();
     vmext_init();
+    vm_init();
     bios_init();
     rtc_init();
     gop_init();
+    boot_tick("memory_vm");
+    log_write("boot: enable fpu/sse");
+    cpu_enable_fpu_sse();
     log_write("boot: start startup animation");
     graphics_set_boot_animation_mode(true);
     graphics_enter_mode();
@@ -663,7 +984,6 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     kernel_boot_animation_update(8, "Detecting hardware");
     log_write("boot: detect cpu");
     cpu_log_info();
-    cpu_enable_fpu_sse();
     cmos_log_time();
     log_write("boot: init acpi");
     acpi_init(boot_rsdp);
@@ -675,15 +995,21 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     log_write("boot: probe pci");
     pci_log_devices();
     kernel_boot_animation_update(28, "Hardware ready");
+    boot_tick("acpi_smp_dma_pci");
+
     scheduler_init();
     schedopt_init();
     pcb_init();
+    proc_mgmt_init();
+    user_mgmt_init();
+    extern void procmon_init(void); procmon_init();
     futex_init();
     ipc_init();
     signal_init();
     prsys_init();
     log_write("boot: init task system");
     task_init();
+    boot_tick("scheduler_pcb");
     log_write("boot: init interrupts");
     init_interrupts(100);
     acpi_enable_power_button();
@@ -691,45 +1017,54 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     opp_init();
     od_init();
     kernel_boot_animation_update(40, "Starting kernel services");
-    log_write("boot: probe audio");
-    audio_init();
-    aac_init();
-    audio_log_state();
+    boot_tick("interrupts_power");
+
+    /* audio/aac deferred to task_deferred_init (not needed for desktop). */
     log_write("boot: init syscalls");
     syscall_init();
     kernel_boot_animation_update(52, "Starting system services");
+    boot_tick("syscalls");
+
     log_write("boot: init filesystem");
     file_init();
+    extern void efs_init(void); efs_init();
+    extern void uac_init(void); uac_init();
+    extern void audit_init(void); audit_init();
     cdrom_init();
     log_write(cdrom_status());
     if (file_auto_mount()) {
         log_write("boot: filesystem mounted");
+        kernel_log_open_file();
+        trust_store_load(UI_TRUST_ROOT_BUNDLE_PATH);
     } else {
         log_write("boot: filesystem mount failed");
     }
+    /* FAT32: auto chkdsk only if last shutdown was unclean (WAL dirty) */
+    chkdsk_auto_on_boot();
+
+    fs_perm_init();
     graphics_boot_load_image();
     graphics_reload_cursor_style();
     kernel_boot_animation_update(58, "Mounting filesystem");
+    boot_tick("filesystem");
+
     log_write("boot: load UI font");
     while (!font_ready()) {
         if (font_init_failed()) {
-            log_write("boot: UI font load failed; refusing to enter system");
-            kernel_boot_animation_update(58, "UI font load failed");
-            asm volatile ("cli");
-            for (;;) {
-                asm volatile ("hlt");
-            }
+            log_write("boot: UI font load failed; continuing with fallback");
+            break;
         }
-        font_init_step(256u * 1024u);
+        font_init_step(1024u * 1024u);
         kernel_boot_animation_update(58u + (font_init_progress() * 20u) / 100u,
                                      "Loading UI font");
     }
     log_write("boot: UI font ready");
     kernel_boot_animation_update(78, "UI font ready");
+    boot_tick("font");
+
     g_installer_boot_media = (file_exists(PATH_ROOT "INSTALL.FLG") &&
                               file_exists(PATH_ROOT "SETUP.EXE")) ||
                              installer_boot_media_present();
-    /* Filesystem auto-mounted during boot. */
     log_write("boot: init registry");
     registry_init();
     log_write("boot: init device namespace");
@@ -738,28 +1073,14 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     terminal_init();
     log_write("boot: load drivers");
     driver_manager_init();
-    storage_ext_init();
-    iic_init();
-    i2c_init();
-    i3c_init();
-    spi_init();
-    tpm_init();
-    mcb_init();
-    md_init();
-    usb_ext_init();
-    bluetooth_init();
-    wifi_init();
-    ipv6_init();
-    net_init();
-    lwip_init();
-    tls_init();
-    http_init();
-    browser_init();
-    gpu_init();
-    gui_init();
+    boot_tick("registry_device_drivers");
+
+    /* storage/buses/usb/net/bluetooth/wifi/gpu deferred to task_deferred_init. */
     kernel_boot_animation_update(88, "Drivers and services ready");
+    boot_tick("drivers");
     log_write("boot: init session");
     ensure_desktop_layout();
+    osui_init();
     log_write("boot: init input");
     init_input();
     hid_init();
@@ -773,12 +1094,13 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
     task_create("keypoll", task_poll_keyboard_events, NULL, 1, true);
     task_create("guipoll", task_poll_graphics_input, NULL, 1, true);
     task_create("deskui", task_update_desktop_shell, NULL, 1, true);
-    /* Task to handle deferred graphics enter requests (checks request flag). */
     task_create("grreq", task_handle_graphics_request, NULL, 1, true);
+    task_create("defer", task_deferred_init, NULL, 2, true);
     log_write("boot: init shell");
     shell_init();
     shell_env_set("MONIOS_BOOT_MODE", boot_is_uefi ? "uefi" : "mbr");
     kernel_boot_animation_update(98, "Starting shell");
+    boot_tick("tasks_shell");
     kernel_boot_animation_update(100, g_installer_boot_media ? "Installer ready" : "Ready");
     graphics_boot_finish();
     graphics_set_boot_animation_mode(false);
@@ -796,9 +1118,9 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
         graphics_draw_shell();
         shell_set_boot_complete(true);
     }
+    boot_tick("desktop_ready");
     log_write("boot: main loop");
     while (1) {
-        /* 调试：主循环心跳 */
         static uint32_t loop_count = 0;
         if (loop_count++ % 100000 == 0) {
             asm volatile ("movb $0x2E, %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "ax", "dx");
@@ -806,7 +1128,11 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
         if (g_shutdown_requested) {
             log_write("power: shutdown requested");
             asm volatile ("cli");
-            kernel_shutdown_processes_and_drivers();
+            if (!kernel_shutdown_processes_and_drivers()) {
+                g_shutdown_requested = false;
+                asm volatile ("sti");
+                continue;
+            }
             kernel_poweroff();
             for (;;) {
                 asm volatile ("cli; hlt");
@@ -815,7 +1141,11 @@ void kernel_main(uint64_t boot_mode, uint64_t boot_rsdp)
         if (g_reboot_requested) {
             log_write("power: reboot requested");
             asm volatile ("cli");
-            kernel_shutdown_processes_and_drivers();
+            if (!kernel_shutdown_processes_and_drivers()) {
+                g_reboot_requested = false;
+                asm volatile ("sti");
+                continue;
+            }
             kernel_reboot();
             for (;;) {
                 asm volatile ("cli; hlt");

@@ -9,6 +9,10 @@ static bool storage_probe_cb(const pci_device_info_t *info, void *ctx)
     storage_ext_info_t *st = (storage_ext_info_t *) ctx;
 
     if (info->class_code != 0x01) {
+        if (info->vendor_id == 0x1AF4 &&
+            (info->device_id == 0x1001 || info->device_id == 0x1042)) {
+            st->virtio_block_devices++;
+        }
         return true;
     }
     if (info->subclass == 0x01) {
@@ -23,6 +27,10 @@ static bool storage_probe_cb(const pci_device_info_t *info, void *ctx)
         st->raid_controllers++;
     } else {
         st->other_storage++;
+    }
+    if (info->vendor_id == 0x1AF4 &&
+        (info->device_id == 0x1001 || info->device_id == 0x1042)) {
+        st->virtio_block_devices++;
     }
     return true;
 }

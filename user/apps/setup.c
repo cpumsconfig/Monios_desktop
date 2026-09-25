@@ -30,6 +30,7 @@
 #define SETUP_FAT32_RESERVED_SECTORS 32U
 #define SETUP_FAT32_FAT_COUNT 2U
 #define SETUP_FAT32_FAT_SIZE 1576U
+#define SETUP_FAT32_SECTORS_PER_CLUSTER 32U
 #define SETUP_FAT32_ROOT_CLUSTER 2U
 #define SETUP_FAT32_DATA_LBA (SETUP_FAT32_RESERVED_SECTORS + SETUP_FAT32_FAT_COUNT * SETUP_FAT32_FAT_SIZE)
 #define SETUP_ZIP_LOCAL_SIG   0x04034B50U
@@ -946,7 +947,7 @@ static bool setup_prepare_fat32_boot_sector(uint8_t boot_sector[512],
         return false;
     }
     setup_store_le16(boot_sector + 11, 512);
-    boot_sector[13] = 1;
+    boot_sector[13] = SETUP_FAT32_SECTORS_PER_CLUSTER;
     setup_store_le16(boot_sector + 14, SETUP_FAT32_RESERVED_SECTORS);
     boot_sector[16] = SETUP_FAT32_FAT_COUNT;
     setup_store_le16(boot_sector + 17, 0);
@@ -1045,7 +1046,8 @@ static bool setup_format_fat32_partition(const setup_install_plan_t *plan,
             return false;
         }
     }
-    return setup_write_zero_sectors(target_lba + SETUP_FAT32_DATA_LBA, 1);
+    return setup_write_zero_sectors(target_lba + SETUP_FAT32_DATA_LBA,
+                                    SETUP_FAT32_SECTORS_PER_CLUSTER);
 }
 
 static bool setup_write_partition_table(const setup_install_plan_t *plan,
@@ -1186,6 +1188,7 @@ static bool setup_zip_scan(const char *zip_path,
                            const setup_install_plan_t *plan)
 {
     uint32_t offset = 0;
+    uint32_t package_bytes;
     int32_t package_size;
     uint32_t copied = 0;
     uint32_t last_percent = 12U;
@@ -1201,10 +1204,11 @@ static bool setup_zip_scan(const char *zip_path,
     if (package_size <= 0) {
         return false;
     }
+    package_bytes = (uint32_t) package_size;
     if (plan == 0) {
         *total_uncompressed = 0;
     }
-    while (offset + 30U <= (uint32_t) package_size) {
+    while (offset <= package_bytes && package_bytes - offset >= 30U) {
         uint8_t header[30];
         uint32_t sig;
         uint16_t flags;
@@ -1240,13 +1244,14 @@ static bool setup_zip_scan(const char *zip_path,
             name_len >= sizeof(name)) {
             return false;
         }
-        if (!setup_read_package_at(zip_path, offset + 30U, name, name_len)) {
+        if (name_len > package_bytes - offset - 30U ||
+            extra_len > package_bytes - offset - 30U - name_len ||
+            !setup_read_package_at(zip_path, offset + 30U, name, name_len)) {
             return false;
         }
         name[name_len] = '\0';
         data_offset = offset + 30U + name_len + extra_len;
-        if (data_offset + compressed_size < data_offset ||
-            data_offset + compressed_size > (uint32_t) package_size) {
+        if (compressed_size > package_bytes - data_offset) {
             return false;
         }
         if (name[name_len - 1U] != '/') {
@@ -1275,6 +1280,13 @@ static bool setup_zip_scan(const char *zip_path,
                 if (written != (int) uncompressed_size) {
                     setup_line("file copy failed");
                     setup_line(target_path);
+                    fputs("copy result: ");
+                    print_int(written);
+                    fputs("\r\n");
+                    return false;
+                }
+                if (copied > *total_uncompressed ||
+                    uncompressed_size > *total_uncompressed - copied) {
                     return false;
                 }
                 copied += uncompressed_size;

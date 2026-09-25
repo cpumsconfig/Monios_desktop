@@ -175,7 +175,7 @@ page_t *page_from_phys(uint64_t phys)
 page_t *page_from_virt(uint64_t virt)
 {
     /* 简化实现，假设虚拟地址和物理地址有固定偏移 */
-    uint64_t phys = virt; /* 暂时假设恒等映射 */
+    /* 暂时假设恒等映射：virt 即 phys，下方直接使用 virt */
     if (!g_page_info.ready || virt < g_page_info.base_phys) {
         return NULL;
     }

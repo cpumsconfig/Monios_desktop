@@ -3,6 +3,7 @@
 
 #include "stdbool.h"
 #include "stdint.h"
+#include "pcb.h"
 
 #define EXEC_ABI_VERSION      5U
 #define EXEC_HANDLE_STDIN     0U
@@ -66,9 +67,33 @@ typedef struct {
 
 bool exec_run(const char *path, uint32_t argc, char *argv[], const char *cwd, char *env[], uint32_t env_count, int32_t *exit_code);
 bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const char *cwd, char *env[], uint32_t env_count, uint32_t run_flags, int32_t *exit_code);
+
+/*
+ * CGI support: run the .exe at `path` and redirect its stdout into the
+ * kernel buffer `out_buf` (capacity `out_cap`, NUL-terminated) instead of
+ * drawing it to the console. When invoked from inside another user process
+ * (e.g. httpd), the caller's flat user image region is snapshot/restored
+ * around the child so the caller can resume transparently. Returns true if
+ * the child ran to completion.
+ */
+bool exec_capture_active(void);
+void exec_capture_write(const char *buffer, uint32_t size);
+bool exec_run_capture(const char *path, char *out_buf, uint32_t out_cap, int32_t *exit_code, char *envp[]);
 bool exec_resolve_path(const char *path, char *output, uint32_t output_size);
 uint32_t exec_image_flags_for_path(const char *path);
+bool exec_signature_status_for_path(const char *path,
+                                    bool *signed_present,
+                                    bool *signature_valid,
+                                    bool *publisher_trusted);
+bool exec_extract_icon_bitmap(const char *path,
+                              uint32_t *pixels,
+                              uint16_t width,
+                              uint16_t height);
 const char *exec_current_cwd(void);
+const char *exec_current_program_path(void);
+uint32_t exec_current_image_flags(void);
+uint32_t exec_current_privilege_level(void);
+bool exec_grant_current_privilege(uint32_t privilege_level);
 bool exec_active(void);
 bool exec_address_in_active_image(uint64_t address);
 bool exec_user_range_valid(const void *ptr, uint64_t size);
@@ -80,5 +105,9 @@ uint64_t exec_kernel_stack_top(void);
 uint64_t exec_user_stack_top(void);
 bool exec_process_completed(void);
 uint64_t exec_resume_stack_pointer(void);
+
+/* Run a forked child PCB to completion on its own address space; returns the
+ * child's exit code. Used by sys_waitpid(). */
+int32_t exec_run_child(pcb_t *child);
 
 #endif

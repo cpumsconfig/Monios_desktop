@@ -1,4 +1,5 @@
 #include "common.h"
+#include "authenticode.h"
 #include "exec.h"
 #include "file.h"
 #include "hash.h"
@@ -9,7 +10,10 @@
 #include "pcb.h"
 #include "session.h"
 #include "terminal.h"
+#include "trust_store.h"
 #include "ui.h"
+#include "vm.h"
+#include "user_mgmt.h"
 
 #define ELF_MAGIC_0 0x7F
 #define ELF_MAGIC_1 'E'
@@ -39,10 +43,15 @@
 #define PE_RESOURCE_OFFSET_MASK 0x7FFFFFFFU
 #define PE_RESOURCE_ID_ICON 3U
 #define PE_RESOURCE_ID_GROUP_ICON 14U
+#define PE_WIN_CERT_REVISION_1 0x0100
+#define PE_WIN_CERT_REVISION_2 0x0200
+#define PE_WIN_CERT_TYPE_PKCS_SIGNED_DATA 0x0002
 #define PE_RESOURCE_ID_VERSION 16U
 #define PE_RESOURCE_ID_MANIFEST 24U
 #define PE_RESOURCE_MAX_ENTRIES 256U
 #define PE_RESOURCE_MAX_DEPTH 4U
+#define PE_RESOURCE_ANY_ID 0xFFFFFFFFU
+#define MONIOS_SIGNER_ID_SIZE 32U
 #define EXEC_DLL_MAX 8U
 
 #define RZS_MAGIC_0 'R'
@@ -315,8 +324,36 @@ typedef struct {
 
 typedef enum {
     EXEC_IMAGE_FORMAT_ELF,
-    EXEC_IMAGE_FORMAT_PE
+    EXEC_IMAGE_FORMAT_PE,
+    EXEC_IMAGE_FORMAT_DOS
 } exec_image_format_t;
+
+/* DOS compat entry hook.  kernel/compat/dos.c registers itself here once
+ * it is linked into the build (see report).  Until then it is NULL and a
+ * pure-DOS MZ image is rejected exactly as before - no behaviour change. */
+static int (*g_dos_compat_run)(const uint8_t *image, uint32_t size, int32_t *exit_code) = NULL;
+
+void exec_set_dos_entry(int (*fn)(const uint8_t *, uint32_t, int32_t *))
+{
+    g_dos_compat_run = fn;
+}
+
+/* Detect MZ magic with NO PE signature (legacy 16-bit DOS image). */
+static bool exec_is_pure_dos_mz(const uint8_t *image, uint32_t size)
+{
+    if (image == NULL || size < 0x40) return false;
+    if (image[0] != 'M' || image[1] != 'Z') return false;
+    int32_t lfanew = (int32_t)image[0x3C]
+                   | ((int32_t)image[0x3D] << 8)
+                   | ((int32_t)image[0x3E] << 16)
+                   | ((int32_t)image[0x3F] << 24);
+    if (lfanew >= 0 && (uint32_t)lfanew + 4u <= size) {
+        const uint8_t *sig = image + (uint32_t)lfanew;
+        if (sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0)
+            return false;
+    }
+    return true;
+}
 
 typedef struct {
     exec_image_format_t format;
@@ -355,6 +392,10 @@ typedef int32_t (*exec_entry_t)(const exec_launch_info_t *info);
 
 typedef struct {
     const exec_launch_info_t *launch_info;
+    uint32_t image_flags;
+    uint32_t privilege_level;
+    char cwd[PATH_MAX_LEN];
+    char program_path[PATH_MAX_LEN];
     int32_t exit_code;
     uint8_t fault_vector;
     uint64_t fault_error_code;
@@ -399,12 +440,20 @@ static bool exec_range_valid(uint64_t start, uint64_t size)
 static uint8_t *exec_user_alloc(uint8_t **cursor, uint32_t size, uint32_t align, uint8_t *limit)
 {
     uint64_t address = (uint64_t) *cursor;
-    uint64_t aligned = (address + (align - 1)) & ~(uint64_t) (align - 1);
-    uint8_t *result = (uint8_t *) aligned;
+    uint64_t aligned;
+    uint8_t *result;
 
-    if (result + size > limit) {
+    if (cursor == NULL || limit == NULL || align == 0 ||
+        (align & (align - 1U)) != 0 ||
+        address > 0xFFFFFFFFFFFFFFFFULL - (uint64_t) (align - 1U)) {
         return NULL;
     }
+    aligned = (address + (uint64_t) (align - 1U)) & ~(uint64_t) (align - 1U);
+    if (aligned > (uint64_t) limit ||
+        (uint64_t) size > (uint64_t) limit - aligned) {
+        return NULL;
+    }
+    result = (uint8_t *) aligned;
     *cursor = result + size;
     return result;
 }
@@ -423,13 +472,18 @@ static char *exec_user_copy_string(uint8_t **cursor, uint8_t *limit, const char 
 
 static exec_launch_info_t *exec_build_user_launch_info(uint32_t argc, char *argv[], const char *cwd, const char *program_path, char *env[], uint32_t env_count, uint32_t image_flags, uint32_t privilege_level, uint32_t subsystem)
 {
+#define EXEC_MAX_ARGC 128U
+#define EXEC_MAX_ENV  128U
     uint8_t *cursor = (uint8_t *) EXEC_USER_DATA_BASE;
     uint8_t *limit = (uint8_t *) EXEC_USER_DATA_LIMIT;
     exec_launch_info_t *info = (exec_launch_info_t *) exec_user_alloc(&cursor, sizeof(exec_launch_info_t), 16, limit);
     char **user_argv = NULL;
     char **user_env = NULL;
 
-    if (info == NULL) {
+    if (argc > EXEC_MAX_ARGC || env_count > EXEC_MAX_ENV ||
+        (argc > 0 && (argv == NULL || argv[0] == NULL)) ||
+        (env_count > 0 && env == NULL) ||
+        cwd == NULL || program_path == NULL || info == NULL) {
         return NULL;
     }
 
@@ -485,6 +539,8 @@ static exec_launch_info_t *exec_build_user_launch_info(uint32_t argc, char *argv
     }
 
     return info;
+#undef EXEC_MAX_ARGC
+#undef EXEC_MAX_ENV
 }
 
 static bool exec_path_has_suffix(const char *path, const char *suffix)
@@ -718,6 +774,17 @@ static bool exec_prepare_image(const uint8_t *image, uint32_t image_size, const 
     prepared->image = payload;
     prepared->image_size = payload_size;
     if (!exec_image_has_pe_signature(payload, payload_size)) {
+        /* Legacy 16-bit DOS MZ/COM image? Route to NTVDM compat layer when
+         * linked in.  Hook is NULL by default -> behaviour unchanged. */
+        if (g_dos_compat_run != NULL &&
+            exec_is_pure_dos_mz(payload, payload_size)) {
+            prepared->format     = EXEC_IMAGE_FORMAT_DOS;
+            prepared->image      = payload;
+            prepared->image_size = payload_size;
+            prepared->entry      = 0;
+            *image_flags = flags | EXEC_IMAGE_FLAG_CONSOLE;
+            return true;
+        }
         return false;
     }
     prepared->format = EXEC_IMAGE_FORMAT_PE;
@@ -753,7 +820,8 @@ static bool exec_validate_elf_header(exec_prepared_image_t *prepared)
     if (header->e_phentsize != sizeof(elf64_phdr_t)) {
         return false;
     }
-    if (header->e_phoff + (uint64_t) header->e_phnum * sizeof(elf64_phdr_t) > image_size) {
+    if (header->e_phoff > image_size ||
+        header->e_phnum > (image_size - header->e_phoff) / sizeof(elf64_phdr_t)) {
         return false;
     }
     if (!exec_range_valid(header->e_entry, 1)) {
@@ -931,7 +999,8 @@ static bool exec_load_elf_segments(const exec_prepared_image_t *prepared)
         if (program_header->p_memsz < program_header->p_filesz) {
             return false;
         }
-        if (program_header->p_offset + program_header->p_filesz > image_size) {
+        if (program_header->p_offset > image_size ||
+            program_header->p_filesz > image_size - program_header->p_offset) {
             return false;
         }
         if (!exec_range_valid(program_header->p_vaddr, program_header->p_memsz == 0 ? 1 : program_header->p_memsz)) {
@@ -1321,6 +1390,410 @@ static bool exec_scan_pe_resources(exec_prepared_image_t *prepared)
     return exec_scan_pe_resource_directory(prepared, prepared->resource_table_rva, 0, 0);
 }
 
+static bool exec_find_pe_resource_data(const exec_prepared_image_t *prepared,
+                                       uint32_t directory_rva,
+                                       uint32_t depth,
+                                       uint32_t type_id,
+                                       uint32_t resource_id,
+                                       uint32_t wanted_type,
+                                       uint32_t wanted_id,
+                                       uint32_t *data_file_offset,
+                                       uint32_t *data_size)
+{
+    uint32_t directory_offset;
+    uint32_t relative_offset;
+    uint32_t entry_count;
+    uint32_t entries_size;
+    const pe_resource_directory_t *directory;
+    const pe_resource_directory_entry_t *entries;
+
+    if (prepared == NULL || !prepared->resource_present ||
+        depth >= PE_RESOURCE_MAX_DEPTH ||
+        data_file_offset == NULL || data_size == NULL ||
+        directory_rva < prepared->resource_table_rva) {
+        return false;
+    }
+    relative_offset = directory_rva - prepared->resource_table_rva;
+    if (!exec_resource_offset_in_table(prepared, relative_offset, sizeof(pe_resource_directory_t)) ||
+        !exec_pe_rva_to_file_offset(prepared,
+                                    directory_rva,
+                                    sizeof(pe_resource_directory_t),
+                                    &directory_offset)) {
+        return false;
+    }
+    directory = (const pe_resource_directory_t *) (prepared->image + directory_offset);
+    entry_count = (uint32_t) directory->number_of_named_entries +
+                  (uint32_t) directory->number_of_id_entries;
+    if (entry_count > PE_RESOURCE_MAX_ENTRIES ||
+        entry_count > 0xFFFFFFFFU / sizeof(pe_resource_directory_entry_t)) {
+        return false;
+    }
+    entries_size = entry_count * sizeof(pe_resource_directory_entry_t);
+    if (!exec_resource_offset_in_table(prepared,
+                                       relative_offset + sizeof(pe_resource_directory_t),
+                                       entries_size)) {
+        return false;
+    }
+    entries = (const pe_resource_directory_entry_t *)
+        (prepared->image + directory_offset + sizeof(pe_resource_directory_t));
+
+    for (uint32_t i = 0; i < entry_count; i++) {
+        uint32_t child_type = type_id;
+        uint32_t child_resource_id = resource_id;
+
+        if (!exec_validate_pe_resource_name(prepared, entries[i].name)) {
+            return false;
+        }
+        if ((entries[i].name & PE_RESOURCE_ENTRY_NAME_IS_STRING) == 0) {
+            if (depth == 0) {
+                child_type = entries[i].name & 0xFFFFU;
+            } else if (depth == 1) {
+                child_resource_id = entries[i].name & 0xFFFFU;
+            }
+        } else if (depth == 1) {
+            child_resource_id = PE_RESOURCE_ANY_ID;
+        }
+
+        if ((entries[i].offset_to_data & PE_RESOURCE_ENTRY_IS_DIRECTORY) != 0) {
+            uint32_t child_offset = entries[i].offset_to_data & PE_RESOURCE_OFFSET_MASK;
+
+            if (!exec_resource_offset_in_table(prepared,
+                                               child_offset,
+                                               sizeof(pe_resource_directory_t)) ||
+                !exec_find_pe_resource_data(prepared,
+                                             prepared->resource_table_rva + child_offset,
+                                             depth + 1,
+                                             child_type,
+                                             child_resource_id,
+                                             wanted_type,
+                                             wanted_id,
+                                             data_file_offset,
+                                             data_size)) {
+                if (!exec_resource_offset_in_table(prepared,
+                                                   child_offset,
+                                                   sizeof(pe_resource_directory_t))) {
+                    return false;
+                }
+                continue;
+            }
+            return true;
+        }
+
+        if (child_type == wanted_type &&
+            (wanted_id == PE_RESOURCE_ANY_ID || child_resource_id == wanted_id)) {
+            uint32_t data_entry_offset = entries[i].offset_to_data & PE_RESOURCE_OFFSET_MASK;
+            uint32_t data_entry_file_offset;
+            const pe_resource_data_entry_t *data_entry;
+
+            if (!exec_resource_offset_in_table(prepared,
+                                               data_entry_offset,
+                                               sizeof(pe_resource_data_entry_t)) ||
+                !exec_pe_rva_to_file_offset(prepared,
+                                            prepared->resource_table_rva + data_entry_offset,
+                                            sizeof(pe_resource_data_entry_t),
+                                            &data_entry_file_offset)) {
+                return false;
+            }
+            data_entry = (const pe_resource_data_entry_t *)
+                (prepared->image + data_entry_file_offset);
+            if (data_entry->size == 0 ||
+                !exec_pe_rva_to_file_offset(prepared,
+                                            data_entry->data_rva,
+                                            data_entry->size,
+                                            data_file_offset)) {
+                return false;
+            }
+            *data_size = data_entry->size;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t exec_icon_read_pixel(const uint8_t *data,
+                                     uint32_t data_size,
+                                     uint32_t dib_size,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uint16_t bit_count,
+                                     uint32_t palette_offset,
+                                     uint32_t xor_offset,
+                                     uint32_t xor_stride,
+                                     uint32_t mask_offset,
+                                     uint32_t mask_stride,
+                                     uint32_t x,
+                                     uint32_t y)
+{
+    uint32_t row;
+    uint32_t offset;
+    uint8_t alpha = 0xFF;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    uint32_t palette_entries;
+
+    (void) dib_size;
+    if (data == NULL || width == 0 || height == 0 || x >= width || y >= height ||
+        xor_stride == 0 || xor_offset > data_size ||
+        (uint64_t) xor_offset + (uint64_t) xor_stride * height > data_size) {
+        return 0;
+    }
+    row = height - 1U - y;
+    offset = xor_offset + row * xor_stride;
+
+    if (bit_count == 32) {
+        uint32_t pixel_offset = offset + x * 4U;
+        if (pixel_offset + 4U > data_size) {
+            return 0;
+        }
+        blue = data[pixel_offset];
+        green = data[pixel_offset + 1U];
+        red = data[pixel_offset + 2U];
+        alpha = data[pixel_offset + 3U];
+    } else if (bit_count == 24) {
+        uint32_t pixel_offset = offset + x * 3U;
+        if (pixel_offset + 3U > data_size) {
+            return 0;
+        }
+        blue = data[pixel_offset];
+        green = data[pixel_offset + 1U];
+        red = data[pixel_offset + 2U];
+    } else if (bit_count == 8 || bit_count == 4 || bit_count == 1) {
+        /* bits_per_row already folded into caller-supplied offset; unused */
+        uint32_t palette_index;
+        uint32_t palette_entry_offset;
+        uint8_t packed;
+
+        if (bit_count == 8) {
+            palette_index = data[offset + x];
+        } else if (bit_count == 4) {
+            if (offset + (x / 2U) >= data_size) {
+                return 0;
+            }
+            packed = data[offset + x / 2U];
+            palette_index = (x & 1U) == 0 ? (packed >> 4) : (packed & 0x0FU);
+        } else {
+            if (offset + (x / 8U) >= data_size) {
+                return 0;
+            }
+            packed = data[offset + x / 8U];
+            palette_index = (packed >> (7U - (x & 7U))) & 1U;
+        }
+        palette_entries = 1U << bit_count;
+        palette_entry_offset = (palette_index < palette_entries ? palette_index : 0U) * 4U;
+        if (palette_offset > data_size ||
+            palette_entry_offset + 4U > data_size - palette_offset) {
+            return 0;
+        }
+        blue = data[palette_offset + palette_entry_offset];
+        green = data[palette_offset + palette_entry_offset + 1U];
+        red = data[palette_offset + palette_entry_offset + 2U];
+    } else {
+        return 0;
+    }
+
+    if (mask_offset != 0 && mask_stride != 0 &&
+        mask_offset <= data_size &&
+        (uint64_t) mask_offset + (uint64_t) mask_stride * height <= data_size) {
+        uint32_t mask_byte = mask_offset + row * mask_stride + x / 8U;
+        if (mask_byte < data_size && (data[mask_byte] & (uint8_t) (0x80U >> (x & 7U))) != 0) {
+            alpha = 0;
+        }
+    }
+    return ((uint32_t) alpha << 24) |
+           ((uint32_t) red << 16) |
+           ((uint32_t) green << 8) |
+           blue;
+}
+
+static bool exec_decode_icon_dib(const uint8_t *data,
+                                 uint32_t data_size,
+                                 uint32_t *pixels,
+                                 uint16_t output_width,
+                                 uint16_t output_height)
+{
+    uint32_t dib_size;
+    int32_t dib_width;
+    int32_t dib_height;
+    uint16_t planes;
+    uint16_t bit_count;
+    uint32_t palette_entries = 0;
+    uint32_t palette_offset;
+    uint32_t xor_offset;
+    uint32_t xor_stride;
+    uint32_t mask_offset;
+    uint32_t mask_stride;
+    uint32_t source_width;
+    uint32_t source_height;
+
+    if (data == NULL || pixels == NULL || output_width == 0 || output_height == 0 ||
+        data_size < 40U) {
+        return false;
+    }
+    dib_size = exec_read_u32(data);
+    dib_width = (int32_t) exec_read_u32(data + 4U);
+    dib_height = (int32_t) exec_read_u32(data + 8U);
+    planes = exec_read_u16(data + 12U);
+    bit_count = exec_read_u16(data + 14U);
+    if (dib_size < 40U || dib_size > data_size ||
+        dib_width <= 0 || dib_height == 0 || planes == 0 ||
+        (bit_count != 32 && bit_count != 24 && bit_count != 8 &&
+         bit_count != 4 && bit_count != 1)) {
+        return false;
+    }
+    source_width = (uint32_t) dib_width;
+    source_height = (uint32_t) (dib_height < 0 ? -dib_height : dib_height) / 2U;
+    if (source_width == 0 || source_height == 0 || source_width > 1024U ||
+        source_height > 1024U) {
+        return false;
+    }
+    if (bit_count <= 8) {
+        palette_entries = exec_read_u32(data + 32U);
+        if (palette_entries == 0) {
+            palette_entries = 1U << bit_count;
+        }
+        if (palette_entries > (1U << bit_count)) {
+            return false;
+        }
+    }
+    palette_offset = dib_size;
+    if ((uint64_t) palette_offset + (uint64_t) palette_entries * 4U > data_size) {
+        return false;
+    }
+    xor_offset = palette_offset + palette_entries * 4U;
+    xor_stride = ((source_width * bit_count + 31U) / 32U) * 4U;
+    mask_stride = ((source_width + 31U) / 32U) * 4U;
+    if (xor_stride == 0 ||
+        (uint64_t) xor_offset + (uint64_t) xor_stride * source_height > data_size) {
+        return false;
+    }
+    mask_offset = xor_offset + xor_stride * source_height;
+    if ((uint64_t) mask_offset + (uint64_t) mask_stride * source_height > data_size) {
+        mask_offset = 0;
+    }
+    for (uint32_t y = 0; y < output_height; y++) {
+        uint32_t source_y = ((uint64_t) y * source_height) / output_height;
+        for (uint32_t x = 0; x < output_width; x++) {
+            uint32_t source_x = ((uint64_t) x * source_width) / output_width;
+            pixels[y * output_width + x] =
+                exec_icon_read_pixel(data,
+                                      data_size,
+                                      dib_size,
+                                      source_width,
+                                      source_height,
+                                      bit_count,
+                                      palette_offset,
+                                      xor_offset,
+                                      xor_stride,
+                                      mask_offset,
+                                      mask_stride,
+                                      source_x,
+                                      source_y);
+        }
+    }
+    return true;
+}
+
+bool exec_extract_icon_bitmap(const char *path,
+                              uint32_t *pixels,
+                              uint16_t width,
+                              uint16_t height)
+{
+    char resolved_path[PATH_MAX_LEN];
+    exec_prepared_image_t prepared;
+    uint32_t image_flags;
+    uint32_t group_offset;
+    uint32_t group_size;
+    uint32_t icon_offset;
+    uint32_t icon_size;
+    uint8_t *image;
+    int32_t image_size;
+    const uint8_t *group;
+    uint16_t icon_count;
+    uint32_t selected_id = PE_RESOURCE_ANY_ID;
+    uint32_t selected_distance = 0xFFFFFFFFU;
+    uint32_t target_size;
+
+    if (pixels == NULL || width == 0 || height == 0 ||
+        path == NULL || path[0] == '\0' ||
+        !path_resolve(exec_current_cwd(), path, resolved_path, sizeof(resolved_path)) ||
+        !file_exists(resolved_path) || file_is_dir(resolved_path)) {
+        return false;
+    }
+    image_size = file_size(resolved_path);
+    if (image_size <= 0) {
+        return false;
+    }
+    image = (uint8_t *) kmalloc((uint32_t) image_size);
+    if (image == NULL) {
+        return false;
+    }
+    if (file_read(resolved_path, image, (uint32_t) image_size) != image_size ||
+        !exec_prepare_image(image,
+                            (uint32_t) image_size,
+                            resolved_path,
+                            &prepared,
+                            &image_flags) ||
+        prepared.format != EXEC_IMAGE_FORMAT_PE ||
+        !prepared.resource_present ||
+        !prepared.icon_resource_present ||
+        !exec_validate_prepared_image(&prepared) ||
+        !exec_find_pe_resource_data(&prepared,
+                                    prepared.resource_table_rva,
+                                    0,
+                                    0,
+                                    PE_RESOURCE_ANY_ID,
+                                    PE_RESOURCE_ID_GROUP_ICON,
+                                    PE_RESOURCE_ANY_ID,
+                                    &group_offset,
+                                    &group_size) ||
+        group_size < 6U) {
+        kfree(image);
+        return false;
+    }
+
+    group = image + group_offset;
+    icon_count = exec_read_u16(group + 4U);
+    target_size = width > height ? width : height;
+    if (target_size == 0) {
+        target_size = 32;
+    }
+    for (uint32_t i = 0; i < icon_count; i++) {
+        uint32_t entry_offset = 6U + i * 14U;
+        uint32_t icon_width;
+        uint32_t icon_height;
+        uint32_t distance;
+
+        if (entry_offset + 14U > group_size) {
+            break;
+        }
+        icon_width = group[entry_offset] == 0 ? 256U : group[entry_offset];
+        icon_height = group[entry_offset + 1U] == 0 ? 256U : group[entry_offset + 1U];
+        distance = (icon_width > target_size ? icon_width - target_size : target_size - icon_width) +
+                   (icon_height > target_size ? icon_height - target_size : target_size - icon_height);
+        if (selected_id == PE_RESOURCE_ANY_ID || distance < selected_distance) {
+            selected_distance = distance;
+            selected_id = exec_read_u16(group + entry_offset + 12U);
+        }
+    }
+    if (selected_id == PE_RESOURCE_ANY_ID ||
+        !exec_find_pe_resource_data(&prepared,
+                                    prepared.resource_table_rva,
+                                    0,
+                                    0,
+                                    PE_RESOURCE_ANY_ID,
+                                    PE_RESOURCE_ID_ICON,
+                                    selected_id,
+                                    &icon_offset,
+                                    &icon_size) ||
+        !exec_decode_icon_dib(image + icon_offset, icon_size, pixels, width, height)) {
+        kfree(image);
+        return false;
+    }
+    kfree(image);
+    return true;
+}
+
 static const char *exec_canonical_dll_name(const char *name)
 {
     if (name == NULL) {
@@ -1334,6 +1807,9 @@ static const char *exec_canonical_dll_name(const char *name)
     }
     if (strcasecmp(name, "windows.dll") == 0) {
         return "windows.dll";
+    }
+    if (strcasecmp(name, "osui.dll") == 0) {
+        return "osui.dll";
     }
     return NULL;
 }
@@ -1671,12 +2147,7 @@ static bool exec_probe_image_flags_for_path(const char *resolved_path, uint32_t 
 
 bool exec_resolve_path(const char *path, char *output, uint32_t output_size)
 {
-    const char *base = PATH_ROOT;
-
-    if (g_exec_context != NULL && g_exec_context->launch_info != NULL && g_exec_context->launch_info->cwd != NULL) {
-        base = g_exec_context->launch_info->cwd;
-    }
-    return path_resolve(base, path, output, output_size);
+    return path_resolve(exec_current_cwd(), path, output, output_size);
 }
 
 uint32_t exec_image_flags_for_path(const char *path)
@@ -1696,10 +2167,74 @@ uint32_t exec_image_flags_for_path(const char *path)
     return EXEC_IMAGE_FLAG_CONSOLE;
 }
 
+bool exec_signature_status_for_path(const char *path,
+                                    bool *signed_present,
+                                    bool *signature_valid,
+                                    bool *publisher_trusted)
+{
+    char resolved_path[PATH_MAX_LEN];
+    exec_prepared_image_t prepared;
+    uint32_t image_flags;
+    int32_t image_size;
+    uint8_t *image;
+    bool signature_valid_local;
+    uint8_t signer_id[MONIOS_SIGNER_ID_SIZE];
+
+    if (signed_present != NULL) {
+        *signed_present = false;
+    }
+    if (signature_valid != NULL) {
+        *signature_valid = false;
+    }
+    if (publisher_trusted != NULL) {
+        *publisher_trusted = false;
+    }
+    if (path == NULL || path[0] == '\0' ||
+        !path_resolve(exec_current_cwd(), path, resolved_path, sizeof(resolved_path)) ||
+        !file_exists(resolved_path) || file_is_dir(resolved_path)) {
+        return false;
+    }
+    image_size = file_size(resolved_path);
+    if (image_size <= 0) {
+        return false;
+    }
+    image = (uint8_t *) kmalloc((uint32_t) image_size);
+    if (image == NULL) {
+        return false;
+    }
+    if (file_read(resolved_path, image, (uint32_t) image_size) != image_size) {
+        kfree(image);
+        return false;
+    }
+    if (!exec_prepare_image(image,
+                            (uint32_t) image_size,
+                            resolved_path,
+                            &prepared,
+                            &image_flags) ||
+        !exec_validate_prepared_image(&prepared)) {
+        kfree(image);
+        return false;
+    }
+    if (signed_present != NULL) {
+        *signed_present = prepared.certificate_present;
+    }
+    signature_valid_local = authenticode_verify_pe(image,
+                                                   (uint32_t) image_size,
+                                                   signer_id);
+    if (signature_valid != NULL) {
+        *signature_valid = signature_valid_local;
+    }
+    if (publisher_trusted != NULL) {
+        *publisher_trusted = signature_valid_local;
+    }
+    kfree(image);
+    return true;
+}
+
 const char *exec_current_cwd(void)
 {
-    if (g_exec_context != NULL && g_exec_context->launch_info != NULL && g_exec_context->launch_info->cwd != NULL) {
-        return g_exec_context->launch_info->cwd;
+    if (g_exec_context != NULL && g_exec_context->cwd[0] != '\0') {
+        return g_exec_context->cwd;
     }
     return PATH_ROOT;
 }
@@ -1744,6 +2279,40 @@ const exec_launch_info_t *exec_current_launch_info(void)
         return NULL;
     }
     return g_exec_context->launch_info;
+}
+
+const char *exec_current_program_path(void)
+{
+    if (g_exec_context == NULL || g_exec_context->program_path[0] == '\0') {
+        return PATH_ROOT;
+    }
+    return g_exec_context->program_path;
+}
+
+uint32_t exec_current_image_flags(void)
+{
+    return g_exec_context != NULL ? g_exec_context->image_flags : 0;
+}
+
+uint32_t exec_current_privilege_level(void)
+{
+    return g_exec_context != NULL ? g_exec_context->privilege_level : EXEC_PRIV_R0;
+}
+
+bool exec_grant_current_privilege(uint32_t privilege_level)
+{
+    if (g_exec_context == NULL ||
+        privilege_level != EXEC_PRIV_R2 ||
+        g_exec_context->privilege_level <= privilege_level) {
+        return false;
+    }
+    g_exec_context->privilege_level = privilege_level;
+    g_exec_context->image_flags |= EXEC_IMAGE_FLAG_NEEDS_R2;
+    if (g_exec_context->launch_info != NULL) {
+        ((exec_launch_info_t *) g_exec_context->launch_info)->privilege_level = privilege_level;
+        ((exec_launch_info_t *) g_exec_context->launch_info)->image_flags |= EXEC_IMAGE_FLAG_NEEDS_R2;
+    }
+    return true;
 }
 
 void exec_complete_from_syscall(int32_t exit_code)
@@ -1887,8 +2456,11 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
     if ((run_flags & EXEC_RUN_FLAG_CONSOLE_WINDOW) != 0) {
         image_flags |= EXEC_IMAGE_FLAG_CONSOLE;
     }
-    console_window_requested = prepared.subsystem == EXEC_SUBSYSTEM_CONSOLE ||
-                              (image_flags & EXEC_IMAGE_FLAG_CONSOLE) != 0;
+    /*
+     * Shell-launched console programs inherit console 0. A separate
+     * graphical console is opt-in for callers that explicitly request it.
+     */
+    console_window_requested = (run_flags & EXEC_RUN_FLAG_CONSOLE_WINDOW) != 0;
     run_as_r0_driver = (image_flags & EXEC_IMAGE_FLAG_DRIVER) != 0 &&
                        (image_flags & EXEC_IMAGE_FLAG_SIGNED) != 0 &&
                        (image_flags & EXEC_IMAGE_FLAG_NEEDS_R0) != 0 &&
@@ -1929,6 +2501,10 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
         console_window_opened = terminal_open_process_console(pid, resolved_path);
     }
     runtime_context.launch_info = user_launch_info;
+    runtime_context.image_flags = image_flags;
+    runtime_context.privilege_level = privilege_level;
+    strlcpy(runtime_context.cwd, cwd_copy, sizeof(runtime_context.cwd));
+    strlcpy(runtime_context.program_path, resolved_path, sizeof(runtime_context.program_path));
     runtime_context.exit_code = -1;
     runtime_context.fault_vector = 0;
     runtime_context.fault_error_code = 0;
@@ -1990,4 +2566,156 @@ bool exec_run_with_flags(const char *path, uint32_t argc, char *argv[], const ch
         return completed;
     }
 
+}
+
+/* ------------------------------------------------------------------ */
+/* CGI stdout capture                                                  */
+/*                                                                     */
+/* When a user process (httpd) asks the kernel to run a CGI child via  */
+/* SYS_EXEC_CAPTURE, exec_run_with_flags() unconditionally wipes and  */
+/* reloads the whole flat user image region [EXEC_LOAD_BASE,         */
+/* EXEC_LOAD_LIMIT). That would destroy the caller's own code, data  */
+/* and stack. We snapshot the region before spawning the child and    */
+/* restore it afterwards so the caller resumes as if nothing happened. */
+/* The child's stdout (SYS_HANDLE_WRITE on stdout/stderr) is          */
+/* redirected into a caller-provided kernel buffer.                  */
+/* ------------------------------------------------------------------ */
+static char *g_exec_capture_buf;
+static uint32_t g_exec_capture_cap;
+static uint32_t g_exec_capture_len;
+
+static __attribute__((unused)) uint8_t g_exec_image_save[EXEC_LOAD_LIMIT - EXEC_LOAD_BASE];
+
+bool exec_capture_active(void)
+{
+    return g_exec_capture_buf != NULL;
+}
+
+void exec_capture_write(const char *buffer, uint32_t size)
+{
+    uint32_t i;
+
+    if (g_exec_capture_buf == NULL || buffer == NULL || size == 0U) {
+        return;
+    }
+    for (i = 0U; i < size; i++) {
+        if (g_exec_capture_len + 1U >= g_exec_capture_cap) {
+            break;
+        }
+        g_exec_capture_buf[g_exec_capture_len++] = buffer[i];
+    }
+    g_exec_capture_buf[g_exec_capture_len] = '\0';
+}
+
+bool exec_run_capture(const char *path, char *out_buf, uint32_t out_cap, int32_t *exit_code, char *envp[])
+{
+    exec_runtime_context_t *saved_ctx;
+    bool nested;
+    /* image_saved removed: per-process AS makes snapshot unnecessary */
+    bool ok;
+    int32_t child_exit = -1;
+    char *child_argv[2];
+
+    if (path == NULL || out_buf == NULL || out_cap == 0U || g_exec_capture_buf != NULL) {
+        return false;
+    }
+
+    nested = exec_active();
+    saved_ctx = g_exec_context;
+
+    if (nested) {
+        /* Per-process AS: child has its own user pages, no snapshot needed. */
+        g_exec_context = NULL;
+    }
+
+    g_exec_capture_buf = out_buf;
+    g_exec_capture_cap = out_cap;
+    g_exec_capture_len = 0U;
+    out_buf[0] = '\0';
+
+    child_argv[0] = (char *) path;
+    child_argv[1] = NULL;
+
+    ok = exec_run_with_flags(path, 1U, child_argv, NULL, envp, envp ? 2U : 0U, 0U, &child_exit);
+
+    g_exec_capture_buf = NULL;
+    g_exec_capture_cap = 0U;
+
+
+    /* Restore the caller's execution context and TSS rsp0 so the caller's
+     * next syscall lands on its own kernel stack (the child kernel stack
+     * was freed by exec_run_with_flags). */
+    g_exec_context = saved_ctx;
+    if (exec_active()) {
+        tss_set_rsp0(exec_kernel_stack_top());
+    }
+
+    if (exit_code != NULL) {
+        *exit_code = child_exit;
+    }
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* fork support: run a forked child PCB to completion.                */
+/* Mirrors the nested-exec pattern of exec_run_capture: swap in the   */
+/* child's exec_runtime_context + address space + kernel stack, iretq  */
+/* into the child at its saved register state, and return here once   */
+/* the child exits.                                                    */
+/* ------------------------------------------------------------------ */
+extern void fork_enter_user_mode(uint64_t entry,
+                                 uint64_t user_rsp,
+                                 uint64_t rflags,
+                                 uint64_t kernel_stack_top,
+                                 uint64_t resume_rsp_slot_ptr);
+
+int32_t exec_run_child(pcb_t *child)
+{
+    exec_runtime_context_t *saved_ctx;
+    exec_runtime_context_t *child_ctx;
+    pcb_t *parent;
+    int32_t code;
+
+    if (child == NULL || !child->addr_space.active || child->kernel_stack == NULL) {
+        return -1;
+    }
+
+    parent = pcb_get_current();
+    saved_ctx = g_exec_context;
+
+    child_ctx = (exec_runtime_context_t *) kmalloc(sizeof(exec_runtime_context_t));
+    if (child_ctx == NULL) {
+        return -1;
+    }
+    memset(child_ctx, 0, sizeof(*child_ctx));
+    child_ctx->kernel_stack = child->kernel_stack;
+    child_ctx->completed = false;
+
+    /* Adopt the child so its syscalls bookkeep against the right PCB. */
+    pcb_set_current((int32_t) child->pid);
+    g_exec_context = child_ctx;
+    vm_switch_to(&child->addr_space);
+    tss_set_rsp0((uint64_t) child->kernel_stack + EXEC_KERNEL_STACK_SIZE);
+
+    fork_enter_user_mode(child->reg_rip,
+                         child->reg_rsp,
+                         child->reg_rflags,
+                         (uint64_t) child->kernel_stack + EXEC_KERNEL_STACK_SIZE,
+                         (uint64_t) &child_ctx->resume_rsp);
+
+    /* The child has exited via sys_exit / SYS_EXIT_PROCESS. */
+    code = child_ctx->exit_code;
+
+    g_exec_context = saved_ctx;
+    if (parent != NULL) {
+        pcb_set_current((int32_t) parent->pid);
+        vm_switch_to(&parent->addr_space);
+        if (saved_ctx != NULL) {
+            tss_set_rsp0(exec_kernel_stack_top());
+        }
+    } else {
+        vm_switch_to(NULL);
+    }
+    kfree(child_ctx);
+    return code;
 }

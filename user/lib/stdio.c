@@ -253,3 +253,103 @@ void print_int(int32_t value)
     }
     print_uint((uint32_t) value);
 }
+
+/* Minimal string formatter for WIP GUI apps (gdbgui/sysmon).
+ * Supports: %s %d %i %u %x %X %% and plain text. */
+
+static uint32_t stdio_utoa(uint64_t value, char *out, uint32_t base, bool upper)
+{
+    char digits[20];
+    const char *alpha = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    uint32_t n = 0;
+    uint32_t i = 0;
+
+    if (value == 0) {
+        out[i++] = '0';
+        out[i] = '\0';
+        return i;
+    }
+    while (value != 0 && n < sizeof(digits)) {
+        digits[n++] = alpha[value % base];
+        value /= base;
+    }
+    while (n > 0) {
+        out[i++] = digits[--n];
+    }
+    out[i] = '\0';
+    return i;
+}
+
+int vsprintf(char *buf, const char *format, va_list args)
+{
+    const char *cursor = format;
+    uint32_t pos = 0;
+
+    if (buf == 0) {
+        return -1;
+    }
+    while (*cursor != '\0') {
+        if (*cursor != '%') {
+            buf[pos++] = *cursor++;
+            continue;
+        }
+        cursor++;
+        if (*cursor == '%') {
+            buf[pos++] = '%';
+            cursor++;
+            continue;
+        }
+        {
+            uint32_t length = 0;
+            char spec;
+            if (*cursor == 'l') { length = 1; cursor++; if (*cursor == 'l') { length = 2; cursor++; } }
+            spec = *cursor;
+            if (spec == '\0') break;
+            cursor++;
+            switch (spec) {
+            case 's': {
+                const char *s = __builtin_va_arg(args, const char *);
+                if (s == 0) s = "(null)";
+                while (*s != '\0') buf[pos++] = *s++;
+                break;
+            }
+            case 'd':
+            case 'i': {
+                int64_t v = (length == 0) ? (int64_t) __builtin_va_arg(args, int)
+                                          : (int64_t) __builtin_va_arg(args, long long);
+                if (v < 0) { buf[pos++] = '-'; v = -v; }
+                pos += stdio_utoa((uint64_t) v, buf + pos, 10, false);
+                break;
+            }
+            case 'u': {
+                uint64_t v = (length == 0) ? (uint64_t) __builtin_va_arg(args, unsigned)
+                                           : (uint64_t) __builtin_va_arg(args, unsigned long long);
+                pos += stdio_utoa(v, buf + pos, 10, false);
+                break;
+            }
+            case 'x': case 'X': {
+                uint64_t v = (length == 0) ? (uint64_t) __builtin_va_arg(args, unsigned)
+                                           : (uint64_t) __builtin_va_arg(args, unsigned long long);
+                pos += stdio_utoa(v, buf + pos, 16, spec == 'X');
+                break;
+            }
+            default:
+                buf[pos++] = '%';
+                buf[pos++] = spec;
+                break;
+            }
+        }
+    }
+    buf[pos] = '\0';
+    return (int) pos;
+}
+
+int sprintf(char *buf, const char *format, ...)
+{
+    va_list args;
+    int result;
+    __builtin_va_start(args, format);
+    result = vsprintf(buf, format, args);
+    __builtin_va_end(args);
+    return result;
+}

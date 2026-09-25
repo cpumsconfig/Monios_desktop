@@ -10,6 +10,7 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 KERNEL_LOAD_PHYS = 0x2000000
+KERNEL_MAX_PHYS = 0x3FFFFFFF
 KERNEL_VIRT_BASE = 0xFFFF800002000000
 KERNEL_MAX_BYTES = 0x400000
 KERNEL_IMAGE_MAX_BYTES = 0x3000000
@@ -18,10 +19,13 @@ KERNEL_HEADER_READ_BYTES = 0x1000
 KERNEL_HEADER_MAX_ADDRESS = 0x7FFFFFFF
 FONT_REGION_PHYS = 0x6000000
 FONT_HEADER_SIZE = 0x1000
-FONT_MAX_BYTES = 0x1800000
+FONT_MAX_BYTES = 0x1400000
 FONT_DATA_PHYS = FONT_REGION_PHYS + FONT_HEADER_SIZE
 FONT_PAGE_COUNT = (FONT_HEADER_SIZE + FONT_MAX_BYTES + 0xFFF) // 0x1000
 BOOT_FONT_MAGIC = 0x544E464D
+KERNEL_HEAP_SIZE = 0x2000000
+KERNEL_HEAP_FALLBACK_SIZE = 0x1000000
+KERNEL_HEAP_MIN_SIZE = 0x800000
 
 MACHINE_X64 = 0x8664
 PE32_PLUS_MAGIC = 0x20B
@@ -73,6 +77,7 @@ default rel
 %define FILE_SET_POSITION               0x38
 
 %define KERNEL_LOAD_PHYS                {KERNEL_LOAD_PHYS:#x}
+%define KERNEL_MAX_PHYS                 {KERNEL_MAX_PHYS:#x}
 %define KERNEL_VIRT_BASE                {KERNEL_VIRT_BASE:#x}
 %define KERNEL_MAX_BYTES                {KERNEL_MAX_BYTES:#x}
 %define KERNEL_IMAGE_MAX_BYTES          {KERNEL_IMAGE_MAX_BYTES:#x}
@@ -85,6 +90,9 @@ default rel
 %define FONT_MAX_BYTES                  {FONT_MAX_BYTES:#x}
 %define FONT_PAGE_COUNT                 {FONT_PAGE_COUNT}
 %define BOOT_FONT_MAGIC                 {BOOT_FONT_MAGIC:#x}
+%define KERNEL_HEAP_SIZE                {KERNEL_HEAP_SIZE:#x}
+%define KERNEL_HEAP_FALLBACK_SIZE       {KERNEL_HEAP_FALLBACK_SIZE:#x}
+%define KERNEL_HEAP_MIN_SIZE            {KERNEL_HEAP_MIN_SIZE:#x}
 %define ISO_WAIT_POLL_USEC              1000000
 %define ISO_WAIT_TIMEOUT_TICKS          10
 
@@ -148,6 +156,7 @@ _start:
 
     call find_acpi_rsdp
     call wait_for_iso_key_optional
+    call iso_boot_animation
 
     ; root_dir->Open(root_dir, &kernel_file, L"\\KERNEL.EXE", READ, 0)
     mov rcx, [root_dir]
@@ -188,10 +197,22 @@ _start:
     call kernel_image_size
     test rax, rax
     jz fail_kernel_pe
+    mov [kernel_image_size_bytes], rax
     add rax, 0xfff
     shr rax, 12
     mov r8, rax
-    mov rcx, EFI_ALLOCATE_ANY_PAGES
+    mov qword [kernel_addr], KERNEL_LOAD_PHYS
+    mov rcx, EFI_ALLOCATE_ADDRESS
+    mov rdx, EFI_LOADER_DATA
+    lea r9, [kernel_addr]
+    sub rsp, 40
+    call qword [rbx + BS_ALLOCATE_PAGES]
+    add rsp, 40
+    test rax, rax
+    jz .kernel_allocated
+
+    mov qword [kernel_addr], KERNEL_MAX_PHYS
+    mov rcx, EFI_ALLOCATE_MAX_ADDRESS
     mov rdx, EFI_LOADER_DATA
     lea r9, [kernel_addr]
     sub rsp, 40
@@ -199,6 +220,7 @@ _start:
     add rsp, 40
     test rax, rax
     jnz fail_alloc_kernel
+.kernel_allocated:
 
     ; Rewind the file and read the full PE into the allocated image.
     mov rcx, [kernel_file]
@@ -232,9 +254,12 @@ _start:
     test rax, rax
     jz fail_kernel_pe
     mov [kernel_entry], rax
-    call patch_kernel_config
 
     call load_font_optional
+    call allocate_kernel_heap
+    test rax, rax
+    jz fail_kernel_heap
+    call patch_kernel_config
 
     mov rcx, [root_dir]
     mov rax, rcx
@@ -275,6 +300,9 @@ fail_read_kernel:
     jmp fail
 fail_kernel_pe:
     mov al, 'E'
+    jmp fail
+fail_kernel_heap:
+    mov al, 'Q'
     jmp fail
 
 kernel_image_size:
@@ -615,7 +643,64 @@ patch_kernel_config:
     mov [rdx], rax
     mov rax, KERNEL_VIRT_BASE
     mov [rdx + 8], rax
+    mov rax, [kernel_heap_addr]
+    mov [rdx + 24], rax
+    mov rax, [kernel_heap_size]
+    mov [rdx + 32], rax
 .done:
+    ret
+
+allocate_kernel_heap:
+    mov qword [kernel_heap_size], KERNEL_HEAP_SIZE
+    mov rcx, EFI_ALLOCATE_ANY_PAGES
+    mov rdx, EFI_LOADER_DATA
+    mov r8, KERNEL_HEAP_SIZE
+    add r8, 0xfff
+    shr r8, 12
+    lea r9, [kernel_heap_addr]
+    sub rsp, 40
+    call qword [rbx + BS_ALLOCATE_PAGES]
+    add rsp, 40
+    test rax, rax
+    jz .ready
+
+    mov qword [kernel_heap_size], KERNEL_HEAP_FALLBACK_SIZE
+    mov rcx, EFI_ALLOCATE_ANY_PAGES
+    mov rdx, EFI_LOADER_DATA
+    mov r8, KERNEL_HEAP_FALLBACK_SIZE
+    add r8, 0xfff
+    shr r8, 12
+    lea r9, [kernel_heap_addr]
+    sub rsp, 40
+    call qword [rbx + BS_ALLOCATE_PAGES]
+    add rsp, 40
+    test rax, rax
+    jz .ready
+
+    mov qword [kernel_heap_size], KERNEL_HEAP_MIN_SIZE
+    mov rax, [kernel_addr]
+    add rax, [kernel_image_size_bytes]
+    add rax, 0x1fffff
+    and rax, 0xffffffffffe00000
+    mov [kernel_heap_addr], rax
+    mov rcx, EFI_ALLOCATE_ADDRESS
+    mov rdx, EFI_LOADER_DATA
+    mov r8, KERNEL_HEAP_MIN_SIZE
+    add r8, 0xfff
+    shr r8, 12
+    lea r9, [kernel_heap_addr]
+    sub rsp, 40
+    call qword [rbx + BS_ALLOCATE_PAGES]
+    add rsp, 40
+    test rax, rax
+    jnz .failed
+.ready:
+    mov al, 'H'
+    call serial_putc
+    mov eax, 1
+    ret
+.failed:
+    xor eax, eax
     ret
 
 find_acpi_rsdp:
@@ -675,6 +760,56 @@ clear_firmware_screen:
     call qword [rax + SIMPLE_TEXT_OUTPUT_CLEAR_SCREEN]
     add rsp, 40
 .cfs_done:
+    ret
+
+iso_boot_animation:
+    call clear_firmware_screen
+    mov rcx, [r15 + EFI_SYSTEM_TABLE_CON_OUT]
+    test rcx, rcx
+    jz .iba_done
+    lea rdx, [iso_boot_title]
+    mov rax, rcx
+    sub rsp, 40
+    call qword [rax + SIMPLE_TEXT_OUTPUT_STRING]
+    add rsp, 40
+    lea rdx, [iso_boot_stage0]
+    mov rax, rcx
+    sub rsp, 40
+    call qword [rax + SIMPLE_TEXT_OUTPUT_STRING]
+    add rsp, 40
+    mov rcx, 350000
+    sub rsp, 40
+    call qword [rbx + BS_STALL]
+    add rsp, 40
+    mov rcx, [r15 + EFI_SYSTEM_TABLE_CON_OUT]
+    lea rdx, [iso_boot_stage1]
+    mov rax, rcx
+    sub rsp, 40
+    call qword [rax + SIMPLE_TEXT_OUTPUT_STRING]
+    add rsp, 40
+    mov rcx, 350000
+    sub rsp, 40
+    call qword [rbx + BS_STALL]
+    add rsp, 40
+    mov rcx, [r15 + EFI_SYSTEM_TABLE_CON_OUT]
+    lea rdx, [iso_boot_stage2]
+    mov rax, rcx
+    sub rsp, 40
+    call qword [rax + SIMPLE_TEXT_OUTPUT_STRING]
+    add rsp, 40
+    mov rcx, 350000
+    sub rsp, 40
+    call qword [rbx + BS_STALL]
+    add rsp, 40
+    mov rcx, [r15 + EFI_SYSTEM_TABLE_CON_OUT]
+    lea rdx, [iso_boot_stage3]
+    mov rax, rcx
+    sub rsp, 40
+    call qword [rax + SIMPLE_TEXT_OUTPUT_STRING]
+    add rsp, 40
+.iba_done:
+    mov al, 'A'
+    call serial_putc
     ret
 
 wait_for_iso_key_optional:
@@ -845,6 +980,16 @@ any_key_prompt:
     dw 'P', 'r', 'e', 's', 's', ' ', 'a', 'n', 'y', ' ', 'k', 'e', 'y', ' ', 't', 'o', ' ', 'b', 'o', 'o', 't', ' ', 'M', 'o', 'n', 'i', 'O', 'S', ' ', 'I', 'S', 'O', 13, 10, 0
 poll_dot:
     dw '.', 0
+iso_boot_title:
+    dw 13, 10, 'M', 'o', 'n', 'i', 'O', 'S', ' ', 'I', 'S', 'O', 13, 10, 13, 10, 0
+iso_boot_stage0:
+    dw '[', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ']', ' ', 'Preparing firmware', 13, 10, 0
+iso_boot_stage1:
+    dw '[', '=', '=', '=', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ']', ' ', 'Loading kernel', 13, 10, 0
+iso_boot_stage2:
+    dw '[', '=', '=', '=', '=', '=', '=', ' ', ' ', ' ', ' ', ']', ' ', 'Staging UI resources', 13, 10, 0
+iso_boot_stage3:
+    dw '[', '=', '=', '=', '=', '=', '=', '=', '=', '=', '=', ']', ' ', 'Starting MoniOS', 13, 10, 0
 
 align 8
 loaded_image:
@@ -867,6 +1012,12 @@ kernel_entry:
     dq 0
 kernel_addr:
     dq 0
+kernel_image_size_bytes:
+    dq 0
+kernel_heap_addr:
+    dq 0
+kernel_heap_size:
+    dq KERNEL_HEAP_SIZE
 read_size:
     dq KERNEL_MAX_BYTES
 kernel_reloc_rva:

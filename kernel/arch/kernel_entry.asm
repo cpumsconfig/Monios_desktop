@@ -66,6 +66,7 @@ global syscall_interrupt_handler
 global syscall_entry
 global exec_enter_user_mode
 global exec_enter_kernel_mode
+global fork_enter_user_mode
 extern syscall_fast_dispatch
 extern g_syscall_kernel_stack
 extern g_syscall_user_rsp
@@ -84,6 +85,7 @@ extern exec_process_completed
 extern gdb_stub_handle_exception
 extern ftrace_record_entry
 extern ftrace_record_exit
+extern profiler_timer_tick
 extern exec_resume_stack_pointer
 
 _start:
@@ -142,6 +144,8 @@ exception%1_handler:
 exception_common:
     mov rdi, rsp
     call cpu_exception_dispatch
+    cmp rax, 2
+    je .Lpf_resume
     cmp rax, 0
     je .halt
     add rsp, 16
@@ -154,36 +158,84 @@ exception_common:
     mov gs, ax
     sti
     ret
+.Lpf_resume:
+    ; Page fault resolved by the demand-pager: drop vector+error code and
+    ; iretq straight back to the faulting instruction.
+    add rsp, 16
+    iretq
 .halt:
     hlt
     jmp .halt
 
 EXCEPTION_NO_ERROR 0
-EXCEPTION_NO_ERROR 1
+; exception1 (#DB / single-step / hw breakpoint) handled below via gdb_stub
 
-exception3_handler:
+%macro GDB_EXCEPTION_ENTRY 1
+exception%1_handler:
     cli
     cld
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
     mov rdi, rsp
+    mov rsi, %1
+    xor edx, edx
     call gdb_stub_handle_exception
-    cmp rax, 0
-    je .halt
-    add rsp, 16
-    call exec_resume_stack_pointer
-    mov rsp, rax
-    mov ax, GDT_KERNEL_DATA_SELECTOR
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    sti
-    ret
-.halt:
-    hlt
-    jmp .halt
+    test rax, rax
+    jz .L%1_not_handled
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    iretq
+.L%1_not_handled:
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    push 0
+    push %1
+    jmp exception_common
+%endmacro
+
+GDB_EXCEPTION_ENTRY 1
+GDB_EXCEPTION_ENTRY 3
 
 EXCEPTION_NO_ERROR 2
-; EXCEPTION_NO_ERROR 3 removed – handled by gdb_stub_exception3_handler
 EXCEPTION_NO_ERROR 4
 EXCEPTION_NO_ERROR 5
 EXCEPTION_NO_ERROR 6
@@ -230,6 +282,8 @@ irq0_interrupt_handler:
     push rbx
     push rax
     cld
+    mov rdi, rsp
+    call profiler_timer_tick
     call timer_interrupt_dispatch
     pop rax
     pop rbx
@@ -507,6 +561,44 @@ exec_enter_user_mode:
     push qword (GDT_USER_CODE_SELECTOR | 3)
     push rdi
     mov rdi, rdx
+    mov ax, (GDT_USER_DATA_SELECTOR | 3)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    iretq
+
+.resume:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+; fork_enter_user_mode: enter a forked child into user mode at its saved
+;   register state, with RAX = 0 (the fork() child return value).
+;   rdi = child rip, rsi = child user rsp, rdx = child rflags,
+;   rcx = child kernel stack top, r8 = &resume_rsp slot.
+fork_enter_user_mode:
+    cli
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    lea rax, [rel .resume]
+    push rax
+    mov [r8], rsp
+    mov rsp, rcx
+    push qword (GDT_USER_DATA_SELECTOR | 3)
+    push rsi              ; user rsp
+    push rdx             ; rflags (saved from parent syscall frame)
+    push qword (GDT_USER_CODE_SELECTOR | 3)
+    push rdi             ; user rip
+    xor eax, eax         ; child returns 0 from fork()
     mov ax, (GDT_USER_DATA_SELECTOR | 3)
     mov ds, ax
     mov es, ax

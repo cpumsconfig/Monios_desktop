@@ -1,4 +1,5 @@
 #include "common.h"
+#include "dhcp.h"
 #include "dns.h"
 #include "cpu.h"
 #include "e1000.h"
@@ -8,8 +9,10 @@
 #include "net.h"
 #include "pci.h"
 #include "pcnet.h"
+#include "rtl8139.h"
 #include "socket.h"
 #include "tcp.h"
+#include "virtio.h"
 
 #define PCI_CLASS_NETWORK          0x02
 #define PCI_SUBCLASS_ETHERNET      0x00
@@ -41,6 +44,7 @@ static uint16_t g_ping_seq;
 static uint16_t g_ping_ident;
 static bool g_ping_waiting;
 static uint8_t g_ping_target_ip[4];
+
 #define ARP_CACHE_SIZE 8
 static uint8_t g_arp_ip[ARP_CACHE_SIZE][4];
 static uint8_t g_arp_mac[ARP_CACHE_SIZE][6];
@@ -49,16 +53,40 @@ static uint8_t g_arp_pending_ip[4];
 static bool g_arp_pending;
 static uint32_t g_arp_next_slot;
 static bool g_net_backend_ready;
+static bool g_net_virtio_backend;
 static bool g_rx_started;
-static bool g_dhcp_waiting;
-static uint8_t g_dhcp_expected_type;
-static uint32_t g_dhcp_xid;
-static uint8_t g_dhcp_offered_ip[4];
-static uint8_t g_dhcp_server_ip[4];
-static uint8_t g_dhcp_offer_mask[4];
-static uint8_t g_dhcp_offer_gateway[4];
-static uint8_t g_dhcp_offer_dns[4];
-static bool g_dhcp_offer_valid;
+/* DNS server list populated by DHCP (option 6) or static config.
+ * g_dns_ip remains the primary for legacy callers. */
+#define NET_DNS_MAX_SERVERS 4
+static uint8_t g_dns_servers[NET_DNS_MAX_SERVERS][4];
+static uint32_t g_dns_server_count;
+
+/* ============================================================
+ *  防火墙钩子（security group）。未注册时为 NULL => 全部放行。
+ * ============================================================ */
+static net_firewall_check_fn g_fw_in_hook = NULL;
+static net_firewall_check_fn g_fw_out_hook = NULL;
+
+void net_register_firewall_hooks(net_firewall_check_fn inbound,
+                                 net_firewall_check_fn outbound)
+{
+    g_fw_in_hook = inbound;
+    g_fw_out_hook = outbound;
+}
+
+/* 从 IPv4 报文里提取传输层端口（仅 TCP/UDP），ICMP 等返回 0。 */
+__attribute__((unused))
+static uint16_t net_transport_port(const uint8_t *ip, uint16_t ip_total,
+                                   bool src)
+{
+    uint8_t proto = ip[9];
+
+    if ((proto != NET_IP_PROTO_TCP && proto != NET_IP_PROTO_UDP) ||
+        ip_total < 24) {
+        return 0;
+    }
+    return ip_get16(ip + 20 + (src ? 0 : 2));
+}
 
 static bool net_mmio_identity_mapped(uint32_t mmio)
 {
@@ -257,6 +285,15 @@ static void net_write_ether_header(uint8_t *packet, const uint8_t dst[6], uint16
 
 static bool net_send_frame(const uint8_t *packet, uint16_t length)
 {
+    if (g_net_virtio_backend) {
+        if (!virtio_net_send_frame(packet, length)) {
+            strcpy(g_net_status, "net: virtio tx failed");
+            log_write(g_net_status);
+            return false;
+        }
+        log_write("net: virtio tx submitted");
+        return true;
+    }
     if (!e1000_send_frame(packet, length)) {
         strcpy(g_net_status, "net: tx failed");
         log_write(g_net_status);
@@ -374,94 +411,69 @@ static bool net_send_udp_frame(const uint8_t dst_mac[6],
     return net_send_frame(packet, frame_len);
 }
 
-static uint32_t net_make_dhcp_xid(void)
-{
-    uint64_t tsc = cpu_read_tsc();
-    uint32_t tick_mix = (uint32_t) timer_ticks() ^ (uint32_t) tsc ^ (uint32_t) (tsc >> 32);
-    uint32_t mac_mix = ((uint32_t) g_mac[0] << 24) ^
-                       ((uint32_t) g_mac[1] << 16) ^
-                       ((uint32_t) g_mac[2] << 8) ^
-                       g_mac[3] ^
-                       ((uint32_t) g_mac[4] << 11) ^
-                       ((uint32_t) g_mac[5] << 3);
+/* ============================================================
+ *  DHCP wire hooks (called by kernel/net/dhcp.c).
+ * ============================================================ */
 
-    tick_mix ^= tick_mix << 13;
-    tick_mix ^= tick_mix >> 17;
-    tick_mix ^= tick_mix << 5;
-    tick_mix ^= (uint32_t) g_ping_ident << 16;
-    return 0x4D4F0000u ^ mac_mix ^ tick_mix;
+const uint8_t *net_hw_mac(void)
+{
+    return g_mac;
 }
 
-static uint32_t net_read32_be(const uint8_t *data)
+bool net_dhcp_broadcast(const uint8_t src_ip[4],
+                        const uint8_t *payload, uint16_t len)
 {
-    return ((uint32_t) data[0] << 24) | ((uint32_t) data[1] << 16) | ((uint32_t) data[2] << 8) | data[3];
-}
-
-static void net_put32_be(uint8_t *data, uint32_t value)
-{
-    data[0] = (uint8_t) (value >> 24);
-    data[1] = (uint8_t) (value >> 16);
-    data[2] = (uint8_t) (value >> 8);
-    data[3] = (uint8_t) value;
-}
-
-static bool net_send_dhcp_message(uint8_t message_type, const uint8_t requested_ip[4], const uint8_t server_ip[4])
-{
-    uint8_t payload[300];
-    uint8_t *opt;
-    uint16_t payload_len;
     static const uint8_t broadcast_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
     static const uint8_t zero_ip[4] = { 0, 0, 0, 0 };
     static const uint8_t broadcast_ip[4] = { 255, 255, 255, 255 };
 
-    memset(payload, 0, sizeof(payload));
-    payload[0] = 1;
-    payload[1] = 1;
-    payload[2] = 6;
-    net_put32_be(payload + 4, g_dhcp_xid);
-    ip_put16(payload + 10, 0x8000);
-    memcpy(payload + 28, g_mac, 6);
-    net_put32_be(payload + 236, NET_DHCP_MAGIC_COOKIE);
-
-    opt = payload + 240;
-    *opt++ = 53;
-    *opt++ = 1;
-    *opt++ = message_type;
-    if (requested_ip != NULL) {
-        *opt++ = 50;
-        *opt++ = 4;
-        memcpy(opt, requested_ip, 4);
-        opt += 4;
+    if (payload == NULL || len == 0 || len > 1472) {
+        return false;
     }
-    if (server_ip != NULL) {
-        *opt++ = 54;
-        *opt++ = 4;
-        memcpy(opt, server_ip, 4);
-        opt += 4;
-    }
-    *opt++ = 55;
-    *opt++ = 4;
-    *opt++ = 1;
-    *opt++ = 3;
-    *opt++ = 6;
-    *opt++ = 51;
-    *opt++ = 12;
-    *opt++ = 6;
-    memcpy(opt, "monios", 6);
-    opt += 6;
-    *opt++ = 255;
-    payload_len = (uint16_t) (opt - payload);
-
-    strcpy(g_net_status, message_type == NET_DHCP_DISCOVER ? "net: dhcp discover" : "net: dhcp request");
-    log_write(g_net_status);
     return net_send_udp_frame(broadcast_mac,
-                              zero_ip,
+                              src_ip != NULL ? src_ip : zero_ip,
                               broadcast_ip,
                               NET_DHCP_CLIENT_PORT,
                               NET_DHCP_SERVER_PORT,
                               payload,
-                              payload_len,
-                              (uint16_t) g_dhcp_xid);
+                              len,
+                              (uint16_t) timer_ticks());
+}
+
+void net_dhcp_apply_lease(const dhcp_lease_t *lease)
+{
+    if (lease == NULL) {
+        return;
+    }
+    memcpy(g_local_ip, lease->ip, 4);
+    memcpy(g_netmask, lease->netmask, 4);
+    if (!net_ip_is_zero(lease->gateway)) {
+        memcpy(g_gateway_ip, lease->gateway, 4);
+    }
+    if (lease->dns_count > 0 && !net_ip_is_zero(lease->dns[0])) {
+        memcpy(g_dns_ip, lease->dns[0], 4);
+    } else if (!net_ip_is_zero(lease->gateway)) {
+        memcpy(g_dns_ip, lease->gateway, 4);
+    }
+    g_dns_server_count = 0;
+    for (uint32_t i = 0; i < lease->dns_count &&
+                          g_dns_server_count < NET_DNS_MAX_SERVERS; i++) {
+        if (!net_ip_is_zero(lease->dns[i])) {
+            memcpy(g_dns_servers[g_dns_server_count], lease->dns[i], 4);
+            g_dns_server_count++;
+        }
+    }
+    if (g_dns_server_count == 0) {
+        memcpy(g_dns_servers[0], g_dns_ip, 4);
+        g_dns_server_count = 1;
+    }
+    g_net_info.dhcp_configured = true;
+    g_ping_waiting = false;
+    g_arp_pending = false;
+    net_refresh_ip_texts();
+    net_log_ipv4_config("net: dhcp lease",
+                        g_local_ip, g_netmask, g_gateway_ip, g_dns_ip,
+                        lease->server_id);
 }
 
 static bool net_send_icmp_reply(const uint8_t dst_mac[6], const uint8_t dst_ip[4], const uint8_t *request, uint16_t request_size)
@@ -528,137 +540,6 @@ static bool net_send_icmp_echo(const uint8_t dst_mac[6], const uint8_t dst_ip[4]
     return net_send_frame(packet, sizeof(packet));
 }
 
-static void net_cache_dhcp_peer_mac(const uint8_t server_ip[4], const uint8_t gateway_ip[4], const uint8_t src_mac[6])
-{
-    if (src_mac == NULL) {
-        return;
-    }
-    if (!net_ip_is_zero(server_ip)) {
-        arp_cache_add(server_ip, src_mac);
-        net_log_ip_field("net: dhcp server mac cached ", server_ip);
-    }
-    if (!net_ip_is_zero(gateway_ip) && (net_ip_is_zero(server_ip) || ip_equal(gateway_ip, server_ip))) {
-        arp_cache_add(gateway_ip, src_mac);
-        net_log_ip_field("net: dhcp gateway mac cached ", gateway_ip);
-    }
-}
-
-static void net_handle_dhcp(const uint8_t *udp_payload, uint16_t udp_payload_len, const uint8_t src_mac[6])
-{
-    const uint8_t *opt;
-    const uint8_t *end;
-    uint8_t message_type = 0;
-    uint8_t server_ip[4] = { 0, 0, 0, 0 };
-    uint8_t offered_mask[4] = { 255, 255, 255, 0 };
-    uint8_t offered_gateway[4] = { 0, 0, 0, 0 };
-    uint8_t offered_dns[4] = { 0, 0, 0, 0 };
-    bool have_server = false;
-
-    if (!g_dhcp_waiting || udp_payload == NULL || udp_payload_len < 240) {
-        return;
-    }
-    if (udp_payload[0] != 2 || udp_payload[1] != 1 || udp_payload[2] != 6) {
-        return;
-    }
-    if (net_read32_be(udp_payload + 4) != g_dhcp_xid) {
-        return;
-    }
-    if (memcmp(udp_payload + 28, g_mac, 6) != 0 || net_read32_be(udp_payload + 236) != NET_DHCP_MAGIC_COOKIE) {
-        return;
-    }
-
-    opt = udp_payload + 240;
-    end = udp_payload + udp_payload_len;
-    while (opt < end && *opt != 255) {
-        uint8_t code;
-        uint8_t len;
-
-        code = *opt++;
-        if (code == 0) {
-            continue;
-        }
-        if (opt >= end) {
-            break;
-        }
-        len = *opt++;
-        if ((uint32_t) (end - opt) < len) {
-            break;
-        }
-        if (code == 53 && len >= 1) {
-            message_type = opt[0];
-        } else if (code == 54 && len >= 4) {
-            memcpy(server_ip, opt, 4);
-            have_server = true;
-        } else if (code == 1 && len >= 4) {
-            memcpy(offered_mask, opt, 4);
-        } else if (code == 3 && len >= 4) {
-            memcpy(offered_gateway, opt, 4);
-        } else if (code == 6 && len >= 4) {
-            memcpy(offered_dns, opt, 4);
-        }
-        opt += len;
-    }
-
-    if (message_type != g_dhcp_expected_type) {
-        return;
-    }
-    if (message_type == NET_DHCP_ACK &&
-        (!g_dhcp_offer_valid ||
-         !ip_equal(udp_payload + 16, g_dhcp_offered_ip) ||
-         !ip_equal(have_server ? server_ip : udp_payload + 20, g_dhcp_server_ip))) {
-        return;
-    }
-    if (message_type == NET_DHCP_OFFER) {
-        if (net_ip_is_zero(udp_payload + 16) ||
-            net_ip_is_zero(have_server ? server_ip : udp_payload + 20)) {
-            return;
-        }
-        memcpy(g_dhcp_offered_ip, udp_payload + 16, 4);
-        memcpy(g_dhcp_server_ip, have_server ? server_ip : udp_payload + 20, 4);
-        memcpy(g_dhcp_offer_mask, offered_mask, 4);
-        memcpy(g_dhcp_offer_gateway, offered_gateway, 4);
-        memcpy(g_dhcp_offer_dns, offered_dns, 4);
-        g_dhcp_offer_valid = true;
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp offer ");
-        ip_to_text(g_dhcp_offered_ip, g_net_status + strlen(g_net_status));
-        log_write(g_net_status);
-        net_log_ipv4_config("net: dhcp offer",
-                            g_dhcp_offered_ip,
-                            g_dhcp_offer_mask,
-                            g_dhcp_offer_gateway,
-                            g_dhcp_offer_dns,
-                            g_dhcp_server_ip);
-        net_cache_dhcp_peer_mac(g_dhcp_server_ip, g_dhcp_offer_gateway, src_mac);
-        return;
-    }
-    if (message_type == NET_DHCP_ACK) {
-        memcpy(g_local_ip, udp_payload + 16, 4);
-        memcpy(g_netmask, offered_mask, 4);
-        if (offered_gateway[0] != 0 || offered_gateway[1] != 0 || offered_gateway[2] != 0 || offered_gateway[3] != 0) {
-            memcpy(g_gateway_ip, offered_gateway, 4);
-        }
-        if (offered_dns[0] != 0 || offered_dns[1] != 0 || offered_dns[2] != 0 || offered_dns[3] != 0) {
-            memcpy(g_dns_ip, offered_dns, 4);
-        } else if (offered_gateway[0] != 0 || offered_gateway[1] != 0 || offered_gateway[2] != 0 || offered_gateway[3] != 0) {
-            memcpy(g_dns_ip, offered_gateway, 4);
-        }
-        g_net_info.dhcp_configured = true;
-        net_refresh_ip_texts();
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp ack ip ");
-        strcpy(g_net_status + strlen(g_net_status), g_net_info.ip_text);
-        log_write(g_net_status);
-        net_log_ipv4_config("net: dhcp ack",
-                            g_local_ip,
-                            g_netmask,
-                            g_gateway_ip,
-                            g_dns_ip,
-                            g_dhcp_server_ip);
-        net_cache_dhcp_peer_mac(g_dhcp_server_ip, g_gateway_ip, src_mac);
-    }
-}
-
 static void net_handle_udp(const uint8_t *packet, uint16_t length)
 {
     const uint8_t *ip;
@@ -689,7 +570,7 @@ static void net_handle_udp(const uint8_t *packet, uint16_t length)
     }
     udp_payload = udp + 8;
     if (src_port == NET_DHCP_SERVER_PORT && dst_port == NET_DHCP_CLIENT_PORT) {
-        net_handle_dhcp(udp_payload, (uint16_t) (udp_len - 8), packet + 6);
+        dhcp_handle_packet(udp_payload, (uint16_t) (udp_len - 8), packet + 6);
         return;
     }
     dns_handle_udp(ip + 12, src_port, udp_payload, (uint16_t) (udp_len - 8));
@@ -796,6 +677,7 @@ static void net_handle_ipv4(const uint8_t *packet, uint16_t length)
 {
     const uint8_t *ip;
     const uint8_t *icmp;
+    bool accept_dhcp;
     uint16_t ip_total;
     uint16_t sequence;
     uint16_t ident;
@@ -814,8 +696,14 @@ static void net_handle_ipv4(const uint8_t *packet, uint16_t length)
     if ((ip_get16(ip + 6) & 0x3FFFu) != 0) {
         return;
     }
+    accept_dhcp = dhcp_is_waiting() &&
+                  ip[9] == NET_IP_PROTO_UDP &&
+                  ip_total >= 28 &&
+                  ip_get16(ip + 20) == NET_DHCP_SERVER_PORT &&
+                  ip_get16(ip + 22) == NET_DHCP_CLIENT_PORT;
     if (!ip_equal(ip + 16, g_local_ip) &&
-        !(ip[16] == 255 && ip[17] == 255 && ip[18] == 255 && ip[19] == 255)) {
+        !(ip[16] == 255 && ip[17] == 255 && ip[18] == 255 && ip[19] == 255) &&
+        !accept_dhcp) {
         return;
     }
     if (ip[9] == NET_IP_PROTO_UDP) {
@@ -869,13 +757,21 @@ static void net_packet_handler(const uint8_t *packet, uint16_t length)
 
 static void net_poll(void)
 {
-    e1000_poll(net_packet_handler);
+    if (g_net_virtio_backend) {
+        virtio_net_poll(net_packet_handler);
+    } else {
+        e1000_poll(net_packet_handler);
+    }
 }
 
 static void net_start_rx_if_ready(void)
 {
     if (g_net_backend_ready && g_net_info.connected && !g_rx_started) {
-        e1000_rx_start();
+        if (g_net_virtio_backend) {
+            virtio_net_rx_start();
+        } else {
+            e1000_rx_start();
+        }
         g_rx_started = true;
     }
 }
@@ -887,48 +783,8 @@ bool net_dhcp_request(void)
         log_write(g_net_status);
         return false;
     }
-
     net_start_rx_if_ready();
-    g_dhcp_xid = net_make_dhcp_xid();
-    g_dhcp_offer_valid = false;
-    g_dhcp_expected_type = NET_DHCP_OFFER;
-    g_dhcp_waiting = true;
-    if (!net_send_dhcp_message(NET_DHCP_DISCOVER, NULL, NULL)) {
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp discover failed");
-        log_write(g_net_status);
-        return false;
-    }
-    for (uint32_t i = 0; i < 800000 && g_dhcp_waiting; i++) {
-        net_poll();
-        io_wait();
-    }
-    if (!g_dhcp_offer_valid) {
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp timeout");
-        log_write(g_net_status);
-        return false;
-    }
-
-    g_dhcp_expected_type = NET_DHCP_ACK;
-    g_dhcp_waiting = true;
-    if (!net_send_dhcp_message(NET_DHCP_REQUEST, g_dhcp_offered_ip, g_dhcp_server_ip)) {
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp request failed");
-        log_write(g_net_status);
-        return false;
-    }
-    for (uint32_t i = 0; i < 800000 && g_dhcp_waiting; i++) {
-        net_poll();
-        io_wait();
-    }
-    if (g_dhcp_waiting) {
-        g_dhcp_waiting = false;
-        strcpy(g_net_status, "net: dhcp ack timeout");
-        log_write(g_net_status);
-        return false;
-    }
-    return g_net_info.dhcp_configured;
+    return dhcp_start_discovery();
 }
 
 bool net_configure_static(const char *ip, const char *mask, const char *gateway, const char *dns)
@@ -952,9 +808,10 @@ bool net_configure_static(const char *ip, const char *mask, const char *gateway,
     memcpy(g_netmask, new_mask, 4);
     memcpy(g_gateway_ip, new_gateway, 4);
     memcpy(g_dns_ip, new_dns, 4);
+    g_dns_server_count = 1;
+    memcpy(g_dns_servers[0], new_dns, 4);
     g_net_info.dhcp_configured = false;
     g_ping_waiting = false;
-    g_dhcp_waiting = false;
     g_arp_pending = false;
     for (uint32_t i = 0; i < ARP_CACHE_SIZE; i++) {
         g_arp_valid[i] = false;
@@ -1013,14 +870,13 @@ bool net_driver_init(void)
     memset(&g_net_info, 0, sizeof(g_net_info));
     memset(g_mac, 0, sizeof(g_mac));
     g_net_backend_ready = false;
+    g_net_virtio_backend = false;
     g_rx_started = false;
     g_ping_waiting = false;
     g_arp_next_slot = 0;
     for (uint32_t i = 0; i < ARP_CACHE_SIZE; i++) {
         g_arp_valid[i] = false;
     }
-    g_dhcp_waiting = false;
-    g_dhcp_offer_valid = false;
     g_ping_seq = 0;
     {
         uint64_t tsc = cpu_read_tsc();
@@ -1035,6 +891,7 @@ bool net_driver_init(void)
     }
     g_arp_pending = false;
     tcp_init();
+    dhcp_init();
     dns_init();
     socket_init();
     strcpy(g_net_info.driver, "none");
@@ -1043,38 +900,51 @@ bool net_driver_init(void)
     if (!pci_find_first(PCI_CLASS_NETWORK, PCI_SUBCLASS_ETHERNET, &info)) {
         strcpy(g_net_status, "net: no ethernet device detected");
         log_write(g_net_status);
-        return true;
+        return false;
     }
 
     g_net_info.present = true;
-    g_net_info.connected = true;
+    g_net_info.onboard = true;
+    g_net_info.connected = false;
     g_net_info.vendor_id = info.vendor_id;
     g_net_info.device_id = info.device_id;
     g_net_info.bus = info.bus;
     g_net_info.slot = info.slot;
     g_net_info.func = info.func;
     g_net_info.irq = info.interrupt_line;
-    /* Only touch MMIO ranges that the early page tables identity-map. */
-    uint32_t mmio_bar = info.bar0 & 0xFFFFFFF0u;
-    if (e1000_supported(&info) && mmio_bar != 0 && net_mmio_identity_mapped(mmio_bar) &&
-        e1000_init(&info, &g_net_info, g_mac)) {
-        g_net_backend_ready = e1000_ready();
-        strcpy(g_net_status, "net: e1000 ring ready");
-    } else if (pcnet_supported(&info) && pcnet_init(&info, &g_net_info, g_mac)) {
-        g_net_backend_ready = pcnet_ready();
-        strcpy(g_net_status, pcnet_status());
+    if (virtio_net_init(&g_net_info, g_mac)) {
+        g_net_backend_ready = virtio_net_ready();
+        g_net_virtio_backend = g_net_backend_ready;
+        g_net_info.connected = virtio_net_link_up();
+        strcpy(g_net_status, virtio_net_status());
     } else {
-        if (e1000_supported(&info) && mmio_bar != 0 && !net_mmio_identity_mapped(mmio_bar)) {
-            log_write("net: e1000 skipped unmapped MMIO BAR");
+        /* Only touch MMIO ranges that the early page tables identity-map. */
+        uint32_t mmio_bar = info.bar0 & 0xFFFFFFF0u;
+
+        if (e1000_supported(&info) && mmio_bar != 0 && net_mmio_identity_mapped(mmio_bar) &&
+            e1000_init(&info, &g_net_info, g_mac)) {
+            g_net_backend_ready = e1000_ready();
+            strcpy(g_net_status, "net: e1000 ring ready");
+        } else if (pcnet_supported(&info) && pcnet_init(&info, &g_net_info, g_mac)) {
+            g_net_backend_ready = pcnet_ready();
+            strcpy(g_net_status, pcnet_status());
+        } else if (rtl8139_supported(&info) &&
+                   rtl8139_detect(&info, &g_net_info, g_mac)) {
+            strcpy(g_net_status, "net: rtl8139 onboard adapter detected; backend pending");
+        } else {
+            if (e1000_supported(&info) && mmio_bar != 0 && !net_mmio_identity_mapped(mmio_bar)) {
+                log_write("net: e1000 skipped unmapped MMIO BAR");
+            }
+            strcpy(g_net_info.driver, "onboard-ether");
+            g_net_info.mmio_base = 0;
+            g_net_info.io_base = 0;
+            g_net_info.connected = false;
+            strcpy(g_net_status, "net: ethernet detected; backend unavailable");
         }
-        strcpy(g_net_info.driver, "onboard-ether");
-        g_net_info.mmio_base = 0;
-        g_net_info.io_base = 0;
-        strcpy(g_net_status, "net: onboard ethernet link ready");
     }
     net_set_mac_text(g_mac);
     log_write(g_net_status);
-    return true;
+    return g_net_backend_ready;
 }
 
 void net_init(void)
@@ -1086,7 +956,8 @@ void net_init(void)
         return;
     }
     if (g_net_backend_ready) {
-        g_net_info.connected = e1000_link_up();
+        g_net_info.connected = g_net_virtio_backend ?
+                               virtio_net_link_up() : e1000_link_up();
     }
     if (!g_net_info.connected) {
         strcpy(g_net_status, "net: link down");
@@ -1116,10 +987,12 @@ void net_init(void)
 void net_update(void)
 {
     if (g_net_backend_ready) {
-        g_net_info.connected = e1000_link_up();
+        g_net_info.connected = g_net_virtio_backend ?
+                               virtio_net_link_up() : e1000_link_up();
         if (g_net_info.connected) {
             net_start_rx_if_ready();
             net_poll();
+            dhcp_tick();
         }
     }
 }
@@ -1129,13 +1002,36 @@ const uint8_t *net_local_ip(void)
     return g_local_ip;
 }
 
-bool net_get_dns_ip(uint8_t out[4])
+bool net_get_dns_server(uint32_t index, uint8_t out[4])
 {
-    if (out == NULL || (g_dns_ip[0] == 0 && g_dns_ip[1] == 0 && g_dns_ip[2] == 0 && g_dns_ip[3] == 0)) {
+    if (out == NULL) {
         return false;
     }
-    memcpy(out, g_dns_ip, 4);
+    if (g_dns_server_count == 0) {
+        if (net_ip_is_zero(g_dns_ip)) {
+            return false;
+        }
+        memcpy(out, g_dns_ip, 4);
+        return true;
+    }
+    if (index >= g_dns_server_count) {
+        return false;
+    }
+    memcpy(out, g_dns_servers[index], 4);
     return true;
+}
+
+uint32_t net_dns_server_count(void)
+{
+    if (g_dns_server_count == 0) {
+        return net_ip_is_zero(g_dns_ip) ? 0u : 1u;
+    }
+    return g_dns_server_count;
+}
+
+bool net_get_dns_ip(uint8_t out[4])
+{
+    return net_get_dns_server(0, out);
 }
 
 bool net_resolve_ipv4(const char *target, uint8_t out[4])
@@ -1172,7 +1068,19 @@ bool net_send_ipv4_packet(const uint8_t dst_ip[4], uint8_t proto, const uint8_t 
         log_write("net: ipv4 local delivery");
         return true;
     }
-    if (ip_same_subnet(g_local_ip, dst_ip, g_netmask)) {
+    /* 出站防火墙钩子：拦截则不发送（未注册则放行）。 */
+    if (g_fw_out_hook != NULL) {
+        uint16_t fw_sp = 0;
+        uint16_t fw_dp = 0;
+        if (proto == NET_IP_PROTO_TCP || proto == NET_IP_PROTO_UDP) {
+            fw_sp = ip_get16(payload);
+            fw_dp = ip_get16(payload + 2);
+        }
+        if (!g_fw_out_hook(proto, g_local_ip, dst_ip, fw_sp, fw_dp)) {
+            log_write("net: outbound blocked by firewall");
+            return false;
+        }
+    }    if (ip_same_subnet(g_local_ip, dst_ip, g_netmask)) {
         memcpy(next_hop_ip, dst_ip, 4);
     } else {
         memcpy(next_hop_ip, g_gateway_ip, 4);
@@ -1381,7 +1289,11 @@ bool net_ping(const char *target)
 void net_shutdown(void)
 {
     if (g_net_info.present) {
-        e1000_shutdown();
+        if (g_net_virtio_backend) {
+            virtio_net_shutdown();
+        } else {
+            e1000_shutdown();
+        }
         pcnet_shutdown();
         strcpy(g_net_status, "net: shutdown");
         g_net_info.connected = false;

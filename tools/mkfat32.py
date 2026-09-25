@@ -7,14 +7,34 @@ from pathlib import Path
 
 
 SECTOR_SIZE = 512
-TOTAL_SECTORS = 202752
+TOTAL_SECTORS = 786432  # 384MB
 RESERVED_SECTORS = 32
 FAT_COUNT = 2
 SECTORS_PER_CLUSTER = 1
-FAT_SIZE = 1576
+# 8192 sectors * 512 bytes / 4 = 1048576 FAT entries, which must cover every
+# cluster in the data area below (see MAX_CLUSTER). 4096 was no longer enough
+# once the volume grew past ~256MB.
+FAT_SIZE = 8192
 ROOT_CLUSTER = 2
 DATA_LBA = RESERVED_SECTORS + FAT_COUNT * FAT_SIZE
 END_CLUSTER = 0x0FFFFFFF
+
+# fs/fat32.c carves the final FAT32_WAL_SECTORS sectors of the volume out for
+# its write-ahead log (g_wal_log_lba = total_sectors - FAT32_WAL_SECTORS), and
+# its own allocator stops there too. Nothing may be stored in that region: if
+# mkfat32.py allocated over it, the first WAL write would silently overwrite
+# file data.
+WAL_RESERVED_SECTORS = 512
+
+# Highest cluster number whose sectors still fit *below* the WAL carve-out.
+# From cluster_lba(c) = DATA_LBA + (c - 2) * SPC and
+#   cluster_lba(c) + SPC <= TOTAL_SECTORS - WAL_RESERVED_SECTORS
+# we get  c <= (TOTAL_SECTORS - WAL_RESERVED_SECTORS - DATA_LBA) / SPC + 1.
+MAX_CLUSTER = (
+    (TOTAL_SECTORS - WAL_RESERVED_SECTORS - DATA_LBA) // SECTORS_PER_CLUSTER + 1
+)
+# Capacity actually available to files, for error messages.
+USABLE_BYTES = (MAX_CLUSTER - ROOT_CLUSTER) * SECTORS_PER_CLUSTER * SECTOR_SIZE
 
 
 def short_name(name: str) -> bytes:
@@ -138,10 +158,64 @@ class Fat32Image:
     def cluster_lba(self, cluster: int) -> int:
         return DATA_LBA + (cluster - 2) * SECTORS_PER_CLUSTER
 
+    @staticmethod
+    def validate_boot_geometry(bs: bytearray) -> None:
+        """确认引导头内嵌的 BPB 几何与本工具一致（见 write_boot_sector 说明）。"""
+        embedded = {
+            "SecPerClus": bs[13],
+            "RsvdSecCnt": struct.unpack_from("<H", bs, 14)[0],
+            "NumFATs": bs[16],
+            "HiddSec": struct.unpack_from("<I", bs, 28)[0],
+            "FATSz32": struct.unpack_from("<I", bs, 36)[0],
+            "RootClus": struct.unpack_from("<I", bs, 44)[0],
+            "TotSec32": struct.unpack_from("<I", bs, 32)[0],
+        }
+        expected = {
+            "SecPerClus": SECTORS_PER_CLUSTER,
+            "RsvdSecCnt": RESERVED_SECTORS,
+            "NumFATs": FAT_COUNT,
+            "HiddSec": 0,
+            "FATSz32": FAT_SIZE,
+            "RootClus": ROOT_CLUSTER,
+            "TotSec32": TOTAL_SECTORS,
+        }
+        mismatch = [
+            "- {0}: 引导头={1} 本工具={2}".format(k, embedded[k], expected[k])
+            for k in expected
+            if embedded[k] != expected[k]
+        ]
+        if mismatch:
+            raise SystemExit(
+                "引导扇区 BPB 几何与 mkfat32 不一致，请更新 "
+                "kernel/arch/boot/include/fat32hdr.inc：\n" + "\n".join(mismatch)
+            )
+
     def write_boot_sector(self, boot_sector: bytes) -> None:
         if len(boot_sector) != SECTOR_SIZE:
             raise ValueError("boot sector must be exactly 512 bytes")
-        self.data[0:SECTOR_SIZE] = boot_sector
+        bs = bytearray(boot_sector)
+
+        # 校验引导扇区自带的 BPB 几何与本工具的几何是否一致。
+        #
+        # loader.bin 读的是它**自己内嵌**的那份 BPB（本工具只改写引导扇区，
+        # 不改写 loader.bin），所以 kernel/arch/boot/include/fat32hdr.inc 里的
+        # 数值必须与这里一致。不一致的后果是 loader 算错根目录位置、找不到
+        # KERNEL.EXE 并在实模式下死循环 —— 表现为开机黑屏且串口无任何输出，
+        # 极难排查。因此这里主动校验，把静默的启动失败变成构建期显式报错。
+        self.validate_boot_geometry(bs)
+
+        # Patch BPB with our actual parameters
+        struct.pack_into("<H", bs, 11, SECTOR_SIZE)           # bytes per sector
+        bs[13] = SECTORS_PER_CLUSTER                           # sectors per cluster
+        struct.pack_into("<H", bs, 14, RESERVED_SECTORS)      # reserved sectors
+        bs[16] = FAT_COUNT                                     # num FATs
+        struct.pack_into("<H", bs, 17, 0)                     # root entries (FAT32 = 0)
+        struct.pack_into("<H", bs, 19, 0)                      # total sectors 16-bit (FAT32 = 0)
+        struct.pack_into("<H", bs, 22, 0)                      # FAT size 16-bit (FAT32 = 0)
+        struct.pack_into("<I", bs, 32, TOTAL_SECTORS)          # total sectors 32-bit
+        struct.pack_into("<I", bs, 36, FAT_SIZE)               # FAT size 32-bit
+        struct.pack_into("<I", bs, 44, ROOT_CLUSTER)           # root cluster number
+        self.data[0:SECTOR_SIZE] = bs
         backup_offset = 6 * SECTOR_SIZE
         self.data[backup_offset:backup_offset + SECTOR_SIZE] = boot_sector
         fsinfo = bytearray(SECTOR_SIZE)
@@ -157,14 +231,34 @@ class Fat32Image:
 
     def alloc_cluster(self) -> int:
         cluster = self.next_cluster
+        # Refuse before writing, not after. The old version only checked the FAT
+        # array length, which is longer than the data area, so a payload that
+        # overran the volume was accepted here and then written past the end of
+        # self.data by write_cluster() - Python slice assignment silently grows
+        # the bytearray, so the image came out larger than the volume it
+        # describes and the overflowed clusters ended up at the wrong LBAs.
+        # That produced a bootable-looking image with a handful of silently
+        # corrupt files. Now it is a build failure.
+        if cluster > MAX_CLUSTER:
+            used = (cluster - ROOT_CLUSTER) * SECTORS_PER_CLUSTER * SECTOR_SIZE
+            raise RuntimeError(
+                "FAT32 volume is full: cannot allocate cluster {0}. The payload "
+                "does not fit in {1} bytes ({2:.1f} MiB) - raise TOTAL_SECTORS in "
+                "tools/mkfat32.py (and BPB_TotSec32/BPB_FATSz32 in "
+                "kernel/arch/boot/include/fat32hdr.inc to match)."
+                .format(cluster, USABLE_BYTES, USABLE_BYTES / 1048576)
+            )
         self.next_cluster += 1
-        if self.next_cluster >= len(self.fat):
-            raise RuntimeError("FAT is full")
         self.fat[cluster] = END_CLUSTER
         return cluster
 
     def write_cluster(self, cluster: int, payload: bytes) -> None:
         offset = self.cluster_lba(cluster) * SECTOR_SIZE
+        if offset + SECTOR_SIZE > len(self.data):
+            raise RuntimeError(
+                "cluster {0} maps to byte {1}, past the end of the {2}-byte "
+                "volume".format(cluster, offset, len(self.data))
+            )
         self.data[offset:offset + SECTOR_SIZE] = b"\0" * SECTOR_SIZE
         self.data[offset:offset + len(payload)] = payload
 
@@ -272,6 +366,17 @@ class Fat32Image:
             self.data[start:start + len(fat_bytes)] = fat_bytes
 
     def save(self) -> None:
+        # Invariant: the image must be exactly the volume it declares. If this
+        # trips, something allocated past the end of the data area (see
+        # alloc_cluster/write_cluster) - writing the file anyway would hand the
+        # boot chain an image whose FAT points at the wrong LBAs.
+        expected_bytes = TOTAL_SECTORS * SECTOR_SIZE
+        if len(self.data) != expected_bytes:
+            raise RuntimeError(
+                "internal error: image buffer is {0} bytes but the volume is "
+                "{1} bytes".format(len(self.data), expected_bytes)
+            )
+
         self.flush_dirs()
         self.flush_fats()
         if self.path.exists() and self.path.stat().st_size == len(self.data):

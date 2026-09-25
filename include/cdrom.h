@@ -24,6 +24,9 @@ typedef struct {
 } cdrom_info_t;
 
 void cdrom_init(void);
+void cdrom_shutdown(void);
+bool cdrom_probe(void);
+bool cdrom_check_media(void);
 bool cdrom_read_sector(uint32_t lba, void *buffer);
 bool cdrom_read_sectors(uint32_t lba, uint32_t count, void *buffer);
 bool cdrom_is_present(void);

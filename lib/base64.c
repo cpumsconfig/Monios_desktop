@@ -31,11 +31,12 @@ static int32_t base64_decode_char(char ch)
 
 int32_t base64_encode(const uint8_t *input, uint32_t input_size, char *output, uint32_t output_size)
 {
-    uint32_t out_len = ((input_size + 2) / 3) * 4;
+    uint64_t out_len = (((uint64_t) input_size + 2) / 3) * 4;
     uint32_t i;
     uint32_t out_index = 0;
 
-    if (output_size <= out_len) {
+    if (output == NULL || (input == NULL && input_size != 0) ||
+        out_len > 0x7FFFFFFFULL || output_size <= out_len) {
         return -1;
     }
 
@@ -73,6 +74,11 @@ int32_t base64_decode(const char *input, uint8_t *output, uint32_t output_size)
     int32_t values[4];
     uint32_t value_count = 0;
     uint32_t out_index = 0;
+    bool finished = false;
+
+    if (input == NULL || (output == NULL && output_size != 0)) {
+        return -1;
+    }
 
     while (*input != '\0') {
         int32_t value = base64_decode_char(*input++);
@@ -80,7 +86,7 @@ int32_t base64_decode(const char *input, uint8_t *output, uint32_t output_size)
         if (value == -3) {
             continue;
         }
-        if (value < -2) {
+        if (value == -1 || finished) {
             return -1;
         }
 
@@ -94,17 +100,24 @@ int32_t base64_decode(const char *input, uint8_t *output, uint32_t output_size)
             }
 
             if (values[2] == -2) {
+                if (values[3] != -2) {
+                    return -1;
+                }
                 values[2] = 0;
                 values[3] = 0;
                 bytes_to_write = 1;
             } else if (values[3] == -2) {
+                if (values[2] < 0) {
+                    return -1;
+                }
                 values[3] = 0;
                 bytes_to_write = 2;
             } else if (values[2] < 0 || values[3] < 0) {
                 return -1;
             }
 
-            if (out_index + bytes_to_write > output_size) {
+            if (bytes_to_write > output_size - out_index ||
+                bytes_to_write > 0x7FFFFFFFU - out_index) {
                 return -1;
             }
 
@@ -121,6 +134,7 @@ int32_t base64_decode(const char *input, uint8_t *output, uint32_t output_size)
                 output[out_index++] = (uint8_t) (triple & 0xFF);
             }
 
+            finished = bytes_to_write < 3;
             value_count = 0;
         }
     }

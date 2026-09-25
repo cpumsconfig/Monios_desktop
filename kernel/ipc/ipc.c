@@ -1,6 +1,8 @@
 #include "ipc.h"
 #include "common.h"
 #include "pool.h"
+#include "pipe.h"
+#include "shm.h"
 
 #define IPC_MAX_PORTS 16U
 #define IPC_QUEUE_DEPTH 8U
@@ -61,6 +63,8 @@ void ipc_init(void)
     g_ipc_info.queue_depth = IPC_QUEUE_DEPTH;
     g_ipc_info.message_size = IPC_MESSAGE_MAX;
     pool_init(&g_port_pool, "ipc", g_port_bitmap, IPC_MAX_PORTS);
+    pipe_init();
+    shm_init();
     strcpy(g_ipc_status, "ipc: ready");
 }
 

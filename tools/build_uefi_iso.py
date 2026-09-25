@@ -241,7 +241,7 @@ def build_esp_image(
     if font_path is not None and font_path.exists():
         image.add_file(font_path, "/FONTS/MSYH.TTC")
         image.add_file(font_path, "/MSYH.TTC")
-    for name in ("monios.dll", "console.dll", "windows.dll"):
+    for name in ("monios.dll", "console.dll", "windows.dll", "osui.dll"):
         dll_path = PROJECT_DIR / "out" / name
         if dll_path.exists():
             image.add_file(dll_path, f"/SYSTEM/LIB/{name.upper()}")
@@ -303,7 +303,7 @@ def build_payload_zip(output: Path, mode: str, efi: Path, kernel: Path, setup: P
             add_zip_entry(zf, PROJECT_DIR / "out" / name, f"MONIOS/APPS/{name}")
         if setup is not None and setup.exists():
             add_zip_entry(zf, setup, "MONIOS/APPS/SETUP.EXE")
-        for name in ("monios.dll", "console.dll", "windows.dll"):
+        for name in ("monios.dll", "console.dll", "windows.dll", "osui.dll"):
             add_zip_entry(zf, PROJECT_DIR / "out" / name, f"MONIOS/SYSTEM/LIB/{name}")
         for name in DRIVER_PACKAGE_NAMES:
             add_zip_entry(zf, PROJECT_DIR / "out" / f"{name}.sys", f"MONIOS/DRIVER/{name}.SYS")
@@ -313,7 +313,7 @@ def build_payload_zip(output: Path, mode: str, efi: Path, kernel: Path, setup: P
             (PROJECT_DIR / "music_vm.wav", "MONIOS/USERS/ROOT/DESKTOP/MUSIC.WAV"),
             (PROJECT_DIR / "bgm.m4a", "MONIOS/USERS/ROOT/DESKTOP/BGM.M4A"),
             (PROJECT_DIR / "bgm.wav", "MONIOS/USERS/ROOT/DESKTOP/BGM.WAV"),
-            (PROJECT_DIR / "assets" / "wall.bmp", "MONIOS/SYSTEM/MEDIA/WALL.BMP"),
+            (PROJECT_DIR / "assets" / "wallpaper.jpg", "MONIOS/SYSTEM/MEDIA/WALLPAPER.JPG"),
             (PROJECT_DIR / "assets" / "boot.bmp", "MONIOS/SYSTEM/MEDIA/BOOT.BMP"),
             (PROJECT_DIR / "out" / "arrow.cur", "MONIOS/SYSTEM/CURSORS/ARROW.CUR"),
             (PROJECT_DIR / "pwd.txt", "MONIOS/SYSTEM/CONFIG/PWD.TXT"),
@@ -445,6 +445,7 @@ def main() -> None:
         (b"MONIOS.DLL;1", "monios.dll"),
         (b"CONSOLE.DLL;1", "console.dll"),
         (b"WINDOWS.DLL;1", "windows.dll"),
+        (b"OSUI.DLL;1", "osui.dll"),
     ):
         dll_path = PROJECT_DIR / "out" / name
         if dll_path.exists():

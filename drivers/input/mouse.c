@@ -14,6 +14,7 @@
 
 #define PS2_STATUS_OUTPUT_FULL 0x01
 #define PS2_STATUS_INPUT_FULL  0x02
+#define PS2_WAIT_LIMIT 100000U
 
 #define MOUSE_CURSOR_CHAR 0xDB
 #define MOUSE_CURSOR_ATTR 0x0F
@@ -29,6 +30,9 @@ typedef struct {
     uint8_t packet_index;
     uint8_t packet_size;
     bool wheel_enabled;
+    bool five_button;
+    bool present;
+    int32_t sensitivity;
     uint16_t draw_row;
     uint16_t draw_col;
     uint16_t saved_cell;
@@ -37,10 +41,14 @@ typedef struct {
 
 static mouse_driver_state_t mouse_state;
 
-static void ps2_wait_input_empty(void)
+static bool ps2_wait_input_empty(void)
 {
-    while ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) != 0) {
+    for (uint32_t i = 0; i < PS2_WAIT_LIMIT; i++) {
+        if ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) == 0) {
+            return true;
+        }
     }
+    return false;
 }
 
 static bool ps2_wait_output_full_with_timeout(uint32_t timeout)
@@ -53,16 +61,22 @@ static bool ps2_wait_output_full_with_timeout(uint32_t timeout)
     return false;
 }
 
-static void ps2_write_command(uint8_t value)
+static bool ps2_write_command(uint8_t value)
 {
-    ps2_wait_input_empty();
+    if (!ps2_wait_input_empty()) {
+        return false;
+    }
     outb(PS2_COMMAND_PORT, value);
+    return true;
 }
 
-static void ps2_write_data(uint8_t value)
+static bool ps2_write_data(uint8_t value)
 {
-    ps2_wait_input_empty();
+    if (!ps2_wait_input_empty()) {
+        return false;
+    }
     outb(PS2_DATA_PORT, value);
+    return true;
 }
 
 static uint8_t ps2_read_data(void)
@@ -70,10 +84,9 @@ static uint8_t ps2_read_data(void)
     return inb(PS2_DATA_PORT);
 }
 
-static void mouse_write_device(uint8_t value)
+static bool mouse_write_device(uint8_t value)
 {
-    ps2_write_command(0xD4);
-    ps2_write_data(value);
+    return ps2_write_command(0xD4) && ps2_write_data(value);
 }
 
 static bool mouse_expect_ack(void)
@@ -86,17 +99,23 @@ static bool mouse_expect_ack(void)
 
 static bool mouse_set_sample_rate(uint8_t rate)
 {
-    mouse_write_device(0xF3);
+    if (!mouse_write_device(0xF3)) {
+        return false;
+    }
     if (!mouse_expect_ack()) {
         return false;
     }
-    mouse_write_device(rate);
+    if (!mouse_write_device(rate)) {
+        return false;
+    }
     return mouse_expect_ack();
 }
 
 static uint8_t mouse_get_device_id(void)
 {
-    mouse_write_device(0xF2);
+    if (!mouse_write_device(0xF2)) {
+        return 0xFF;
+    }
     if (!mouse_expect_ack()) {
         return 0xFF;
     }
@@ -124,8 +143,8 @@ void mouse_redraw_cursor(void)
     if (graphics_active()) {
         uint32_t width = graphics_framebuffer_width();
         uint32_t height = graphics_framebuffer_height();
-        uint16_t gx = (uint16_t) (mouse_state.x_pixels > (int32_t) width - 1 ? width - 1 : mouse_state.x_pixels);
-        uint16_t gy = (uint16_t) (mouse_state.y_pixels > (int32_t) height - 1 ? height - 1 : mouse_state.y_pixels);
+        uint16_t gx = (uint16_t) (mouse_state.x_pixels > (int32_t) width - 1 ? (int32_t) (width - 1) : mouse_state.x_pixels);
+        uint16_t gy = (uint16_t) (mouse_state.y_pixels > (int32_t) height - 1 ? (int32_t) (height - 1) : mouse_state.y_pixels);
         graphics_mouse_redraw(gx, gy);
         return;
     }
@@ -152,6 +171,10 @@ void mouse_redraw_cursor(void)
 
 static void mouse_apply_movement(int32_t dx, int32_t dy)
 {
+    if (mouse_state.sensitivity != 0) {
+        dx = (dx * mouse_state.sensitivity) / 100;
+        dy = (dy * mouse_state.sensitivity) / 100;
+    }
     mouse_state.x_accum += dx;
     mouse_state.y_accum -= dy;
 
@@ -189,14 +212,19 @@ void init_mouse(void)
     mouse_state.packet_index = 0;
     mouse_state.packet_size = 3;
     mouse_state.wheel_enabled = false;
+    mouse_state.five_button = false;
+    mouse_state.sensitivity = 100;
     mouse_state.drawn = false;
 
     while ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0) {
         (void) ps2_read_data();
     }
 
-    ps2_write_command(0xA8);
-    ps2_write_command(0x20);
+    if (!ps2_write_command(0xA8) || !ps2_write_command(0x20)) {
+        log_write("mouse: controller command timeout");
+        mouse_redraw_cursor();
+        return;
+    }
     if (!ps2_wait_output_full_with_timeout(1000000)) {
         log_write("mouse: controller config timeout");
         mouse_redraw_cursor();
@@ -206,11 +234,13 @@ void init_mouse(void)
     config = ps2_read_data();
     config |= 0x03;
     config &= (uint8_t) ~0x20;
-    ps2_write_command(0x60);
-    ps2_write_data(config);
+    if (!ps2_write_command(0x60) || !ps2_write_data(config)) {
+        log_write("mouse: controller config write timeout");
+        mouse_redraw_cursor();
+        return;
+    }
 
-    mouse_write_device(0xF6);
-    if (!mouse_expect_ack()) {
+    if (!mouse_write_device(0xF6) || !mouse_expect_ack()) {
         log_write("mouse: reset-defaults ack failed");
         mouse_redraw_cursor();
         return;
@@ -223,15 +253,23 @@ void init_mouse(void)
         mouse_state.packet_size = 4;
         mouse_state.wheel_enabled = true;
         log_write("mouse: wheel packet mode enabled");
+        /* Second identification sequence promotes to 5-button (IntelliMouse Explorer). */
+        if (mouse_set_sample_rate(200) &&
+            mouse_set_sample_rate(200) &&
+            mouse_set_sample_rate(80) &&
+            mouse_get_device_id() == 0x04) {
+            mouse_state.five_button = true;
+            log_write("mouse: 5-button packet mode enabled");
+        }
     }
 
-    mouse_write_device(0xF4);
-    if (!mouse_expect_ack()) {
+    if (!mouse_write_device(0xF4) || !mouse_expect_ack()) {
         log_write("mouse: enable-streaming ack failed");
         mouse_redraw_cursor();
         return;
     }
 
+    mouse_state.present = true;
     log_write("mouse: ps/2 mouse ready");
     mouse_redraw_cursor();
 }
@@ -266,6 +304,11 @@ void mouse_interrupt_dispatch(void)
     if (mouse_state.wheel_enabled && mouse_state.packet_size == 4) {
         wheel = (int8_t) ((mouse_state.packet[3] & 0x08) != 0 ? (mouse_state.packet[3] | 0xF0) : (mouse_state.packet[3] & 0x0F));
         mouse_state.wheel_delta += wheel;
+        if (mouse_state.five_button) {
+            /* extra buttons 4/5 live in byte[3] bits 4/5 */
+            if (mouse_state.packet[3] & 0x10) mouse_state.buttons |= 0x08;
+            if (mouse_state.packet[3] & 0x20) mouse_state.buttons |= 0x10;
+        }
     }
     mouse_apply_movement(dx, dy);
 }
@@ -291,4 +334,98 @@ int32_t mouse_consume_wheel_delta(void)
 
     mouse_state.wheel_delta = 0;
     return delta;
+}
+
+/* --- USB HID boot-protocol mouse injection --------------------------- */
+/* Called by drivers/usb/hid.c when a USB mouse interrupt-IN report
+ * arrives.  dx/dy/wheel are signed 8-bit movement deltas; buttons is a
+ * bitmask of MOUSE_BUTTON_* (left/right/middle).  Merges into the same
+ * cursor state used by the PS/2 driver so the rest of the stack (UI,
+ * windows) sees a single unified pointer. */
+void mouse_inject_usb_report(int8_t dx, int8_t dy, int8_t wheel, uint8_t buttons)
+{
+    mouse_state.buttons = (uint8_t) (buttons & 0x07u);
+    if (wheel != 0) {
+        mouse_state.wheel_delta += wheel;
+    }
+    mouse_apply_movement((int32_t) dx, (int32_t) dy);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Probe / control / generic read-write interface                     */
+/* ------------------------------------------------------------------ */
+
+bool mouse_probe(void)
+{
+    uint8_t id;
+
+    /* Flush the controller buffer. */
+    while ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) != 0) {
+        (void) ps2_read_data();
+    }
+
+    if (!ps2_write_command(0xA8)) {
+        log_write("mouse: not found (controller)");
+        return false;
+    }
+    if (!mouse_write_device(0xF6) || !mouse_expect_ack()) {
+        log_write("mouse: not found (no ack)");
+        return false;
+    }
+    id = mouse_get_device_id();
+    if (id == 0xFF) {
+        log_write("mouse: not found");
+        return false;
+    }
+    log_write("mouse: detected");
+    return true;
+}
+
+bool mouse_present(void)
+{
+    return mouse_state.present;
+}
+
+bool mouse_write(uint8_t command)
+{
+    if (!mouse_write_device(command)) {
+        return false;
+    }
+    return mouse_expect_ack();
+}
+
+bool mouse_set_resolution(uint8_t resolution)
+{
+    if (!mouse_write_device(0xE8)) {
+        return false;
+    }
+    if (!mouse_expect_ack()) {
+        return false;
+    }
+    if (!mouse_write_device(resolution)) {
+        return false;
+    }
+    return mouse_expect_ack();
+}
+
+bool mouse_set_sample_rate_public(uint8_t rate)
+{
+    return mouse_set_sample_rate(rate);
+}
+
+void mouse_set_sensitivity(uint32_t percent)
+{
+    if (percent < 25) percent = 25;
+    if (percent > 400) percent = 400;
+    mouse_state.sensitivity = (int32_t) percent;
+}
+
+void mouse_read_state(mouse_snapshot_t *snapshot)
+{
+    mouse_get_snapshot(snapshot);
+}
+
+const char *mouse_status_text(void)
+{
+    return mouse_state.present ? "mouse: ready" : "mouse: not found";
 }

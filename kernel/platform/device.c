@@ -60,6 +60,7 @@
 #include "usb_ext.h"
 #include "vma.h"
 #include "vmext.h"
+#include "virtio.h"
 #include "wifi.h"
 #include "xhci.h"
 
@@ -130,6 +131,9 @@ static const device_entry_t g_devices[] = {
     { "storagex", "storage", true, false },
     { "power", "power", true, false },
     { "gpu", "graphics", true, false },
+    { "igpu", "graphics", true, false },
+    { "nvidia", "graphics", true, false },
+    { "virtio", "bus", true, false },
     { "gui", "gui", true, false },
     { "browser", "net", true, false },
     { "wm", "gui", true, false },
@@ -351,6 +355,7 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
     }
     if (strcmp(dev->name, "ahci") == 0) {
         const ahci_info_t *info = ahci_info();
+        (void)info;
         device_append(buffer, size, ahci_status());
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
@@ -1019,6 +1024,53 @@ int32_t device_read(const char *name, char *buffer, uint32_t size)
         device_append_u32(buffer, size, info->height);
         device_append(buffer, size, "x");
         device_append_u32(buffer, size, info->bpp);
+        device_append(buffer, size, "\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "igpu") == 0) {
+        const gpu_info_t *info = gpu_info();
+
+        device_append(buffer,
+                      size,
+                      info->igpu_detected ? info->igpu_name :
+                      "integrated graphics unavailable");
+        device_append(buffer, size, "\n");
+        device_append(buffer,
+                      size,
+                      info->igpu_ready ? "adapter ready\n" : "adapter pending\n");
+        device_append(buffer,
+                      size,
+                      info->igpu_mmio_ready ? "mmio ready\n" : "mmio pending\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "nvidia") == 0) {
+        const gpu_info_t *info = gpu_info();
+
+        device_append(buffer,
+                      size,
+                      info->nvidia_detected ? info->nvidia_name :
+                      "nvidia unavailable");
+        device_append(buffer, size, "\n");
+        device_append(buffer,
+                      size,
+                      info->nvidia_ready ? "adapter ready\n" : "adapter pending\n");
+        device_append(buffer,
+                      size,
+                      info->nvidia_mmio_ready ? "mmio ready\n" : "mmio pending\n");
+        device_append(buffer,
+                      size,
+                      info->nvidia_bus_master_enabled ?
+                      "bus master enabled\n" : "bus master disabled\n");
+        return (int32_t) strlen(buffer);
+    }
+    if (strcmp(dev->name, "virtio") == 0) {
+        const virtio_info_t *info = virtio_info();
+
+        device_append(buffer, size, virtio_status());
+        device_append(buffer, size, "\nkind ");
+        device_append_u32(buffer, size, (uint32_t) info->kind);
+        device_append(buffer, size, "\ndevices ");
+        device_append_u32(buffer, size, info->device_count);
         device_append(buffer, size, "\n");
         return (int32_t) strlen(buffer);
     }

@@ -162,6 +162,10 @@ int main(int argc, char **argv)
     }
     fputs("registered boot driver: ");
     write_line(driver_path);
-    write_line("reboot to load driver");
+    if (app_driver_load(driver_path)) {
+        write_line("driver loaded");
+    } else {
+        write_line("driver registered; reboot to retry load");
+    }
     return 0;
 }

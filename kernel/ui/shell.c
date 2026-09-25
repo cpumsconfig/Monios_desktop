@@ -13,6 +13,8 @@
 #include "console.h"
 #include "cpu.h"
 #include "device.h"
+#include "driver_manager.h"
+#include "driver_status.h"
 #include "dns.h"
 #include "eevdf.h"
 #include "extfs.h"
@@ -20,6 +22,7 @@
 #include "file.h"
 #include "frame.h"
 #include "fs_cache.h"
+#include "fs_perm.h"
 #include "futex.h"
 #include "gop.h"
 #include "gpu.h"
@@ -74,10 +77,16 @@
 #include "tpm.h"
 #include "ui.h"
 #include "usb_ext.h"
+#include "user_mgmt.h"
 #include "vma.h"
 #include "vmext.h"
 #include "wifi.h"
 #include "xhci.h"
+#include "audit.h"
+#include "audio.h"
+#include "efs.h"
+#include "firewall.h"
+#include "mp3_dec.h"
 
 #define SHELL_LINE_MAX 256
 #define SHELL_ARG_MAX  8
@@ -773,6 +782,8 @@ static void shell_write_prompt_prefix(void)
     } else {
         console_write("[R3] ");
     }
+    console_write(user_session_name());
+    console_write("@");
     if (!ui_path_to_windows(g_shell_cwd, display_path, sizeof(display_path))) {
         strcpy(display_path, SHELL_DEFAULT_DRIVE "\\");
     }
@@ -2233,7 +2244,7 @@ static void shell_run_command(char *line, bool admin_once)
     argc = shell_expand_globs_in_argv(argc, argv);
 
     if (strcmp(argv[0], "help") == 0) {
-        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth cpu fpu cpuid tcb ide ahci nvme cdrom storagex hda aac pcnet lwip xhci usbext hid ntfs iso9660 extfs fscache iic i2c i3c spi tpm mcb md opp od bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr appdev assoc reg clear which grep head tail ver");
+        shell_print_line("help whoami users login pwd cd ls cat echo wc upper lower mkdir touch write rm rmdir run hash base64 env set unset sudo su exit shutdown net dhcp dns ipv4 ipv6 tls ssl http https wifi bluetooth bt cpu fpu cpuid tcb ide ahci nvme cdrom storagex hda aac pcnet lwip xhci usbext hid ntfs iso9660 extfs fscache iic i2c i3c spi tpm mcb md opp od bios gop rtc heap frame vma lazyalloc vmext bitmap buddy eevdf futex ipc muqss pcb pool prsys scheduler schedopt signal socket udp ping dev wm gui gpu browser power term smp taskmgr appdev assoc reg clear which grep head tail ver");
         return;
     }
 
@@ -2253,6 +2264,78 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
+    if (strcmp(argv[0], "insmod") == 0) {
+        if (argc < 2) {
+            shell_print_line("usage: insmod <driver.sys>");
+            return;
+        }
+        {
+            char resolved[PATH_MAX_LEN];
+            if (!shell_resolve_path(argv[1], resolved)) {
+                shell_print_line("insmod: cannot resolve path");
+                return;
+            }
+            if (driver_manager_load(resolved)) {
+                shell_print_line("insmod: driver loaded");
+            } else {
+                shell_print_line("insmod: failed (need signed .sys under driver dir)");
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "rmmod") == 0) {
+        if (argc < 2) {
+            shell_print_line("usage: rmmod <driver_name>");
+            return;
+        }
+        if (driver_manager_unload(argv[1], false)) {
+            shell_print_line("rmmod: driver unloaded");
+        } else {
+            shell_print_line("rmmod: failed (not found / in use / not unloadable)");
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "lsmod") == 0) {
+        driver_status_snapshot_t snap;
+        uint32_t i;
+
+        memset(&snap, 0, sizeof(snap));
+        driver_manager_snapshot(&snap);
+        for (i = 0; i < snap.count && i < DRIVER_STATUS_MAX; i++) {
+            char line[160];
+            const driver_status_entry_t *e = &snap.entries[i];
+
+            line[0] = '\0';
+            strcpy(line, e->name);
+            strcat(line, e->loaded ? "  loaded" : "  -");
+            strcat(line, (e->flags & DRIVER_STATUS_FLAG_EXTERNAL) ? " ext" : " builtin");
+            strcat(line, (e->flags & DRIVER_STATUS_FLAG_UNLOADABLE) ? " unload" : "");
+            strcat(line, (e->flags & DRIVER_STATUS_FLAG_CRITICAL) ? " crit" : "");
+            console_write(line);
+            console_write("\r\n");
+        }
+        {
+            char summary[64];
+            char num[12];
+            char tmp[12];
+            uint32_t tv;
+            uint32_t tn;
+            tv = snap.count; num[0] = '\0'; tn = 0;
+            if (tv == 0) { num[tn++] = '0'; } else { uint32_t tt = 0; while (tv > 0) { tmp[tt++] = (char)('0' + (tv % 10u)); tv /= 10u; } while (tt > 0) num[tn++] = tmp[--tt]; }
+            num[tn] = '\0';
+            strcat(summary, num);
+            strcat(summary, " drivers, ");
+            tv = snap.loaded_count; num[0] = '\0'; tn = 0;
+            if (tv == 0) { num[tn++] = '0'; } else { uint32_t tt = 0; while (tv > 0) { tmp[tt++] = (char)('0' + (tv % 10u)); tv /= 10u; } while (tt > 0) num[tn++] = tmp[--tt]; }
+            num[tn] = '\0';
+            strcat(summary, num);
+            strcat(summary, " loaded");
+            shell_print_line(summary);
+        }
+        return;
+    }
     if (strcmp(argv[0], "which") == 0) {
         if (argc < 2) {
             shell_print_line("usage: which <command>");
@@ -2263,7 +2346,6 @@ static void shell_run_command(char *line, bool admin_once)
         };
         char found_path[PATH_MAX_LEN];
         bool found = false;
-        char resolved[PATH_MAX_LEN];
 
         for (uint32_t si = 0; search_paths[si] != NULL && !found; si++) {
             char list_buf[2048];
@@ -2391,7 +2473,7 @@ static void shell_run_command(char *line, bool admin_once)
 
         /* parse options */
         for (uint32_t i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "-i") == 0 == 0 || strcmp(argv[i], "--ignore-case") == 0) {
+            if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--ignore-case") == 0) {
                 ignore_case = true;
             } else if (argv[i][0] != '-') {
                 if (pattern[0] == '\0') {
@@ -2690,16 +2772,109 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
-    if (strcmp(argv[0], "whoami") == 0) {
-        const session_user_t *user = session_current_user();
+    if (strcasecmp(argv[0], "whoami") == 0) {
+        shell_print_line(user_session_name());
+        return;
+    }
 
-        shell_print_line(user != NULL ? user->name : "unknown");
-        if (g_shell_privilege == SHELL_PRIV_R0) {
-            shell_print_line("ring: R0");
-        } else if (g_shell_privilege == SHELL_PRIV_R2) {
-            shell_print_line("ring: R2");
+    if (strcasecmp(argv[0], "id") == 0) {
+        char id_line[64];
+        uint32_t pos = 0;
+        uint32_t k;
+        uint32_t vals[2];
+        const char *hdrs[2] = { "uid=", " gid=" };
+
+        vals[0] = user_session_uid();
+        vals[1] = user_session_gid();
+        for (k = 0; k < 2; k++) {
+            uint32_t v = vals[k];
+            uint32_t n = 0;
+            uint32_t d;
+            char tmp[16];
+
+            strcpy(id_line + pos, hdrs[k]);
+            pos += (uint32_t) strlen(hdrs[k]);
+            if (v == 0) {
+                id_line[pos++] = '0';
+            } else {
+                while (v > 0 && n < sizeof(tmp)) {
+                    tmp[n++] = (char) ('0' + (v % 10));
+                    v /= 10;
+                }
+                for (d = 0; d < n; d++) {
+                    id_line[pos++] = tmp[n - 1 - d];
+                }
+            }
+        }
+        id_line[pos] = '\0';
+        shell_print_line(id_line);
+        return;
+    }
+
+    if (strcasecmp(argv[0], "su") == 0) {
+        const char *target = (argc >= 2) ? argv[1] : "root";
+        char msg[USER_NAME_MAX + 32];
+
+        if (user_su(target, NULL) == 0) {
+            strcpy(msg, "Switched to user: ");
+            strcat(msg, user_session_name());
+            shell_print_line(msg);
         } else {
-            shell_print_line("ring: R3");
+            shell_print_line("su: Authentication failed");
+        }
+        return;
+    }
+
+    if (strcasecmp(argv[0], "chmod") == 0) {
+        uint32_t mode = 0;
+        const char *p;
+
+        if (argc < 3) {
+            shell_print_line("usage: chmod <mode> <path>");
+            return;
+        }
+        for (p = argv[1]; *p != '\0'; p++) {
+            if (*p < '0' || *p > '7') {
+                shell_print_line("chmod: bad mode (octal, e.g. 755)");
+                return;
+            }
+            mode = mode * 8u + (uint32_t) (*p - '0');
+        }
+        if (!shell_resolve_path(argv[2], resolved_path)) {
+            shell_print_line("invalid path");
+            return;
+        }
+        if (sys_chmod(resolved_path, mode) == 0) {
+            shell_print_line("chmod ok");
+        } else {
+            shell_print_line("chmod failed");
+        }
+        return;
+    }
+
+    if (strcasecmp(argv[0], "chown") == 0) {
+        uint32_t uid = 0;
+        const char *p;
+
+        if (argc < 3) {
+            shell_print_line("usage: chown <uid> <path>");
+            return;
+        }
+        for (p = argv[1]; *p != '\0'; p++) {
+            if (*p < '0' || *p > '9') {
+                shell_print_line("chown: bad uid");
+                return;
+            }
+            uid = uid * 10u + (uint32_t) (*p - '0');
+        }
+        if (!shell_resolve_path(argv[2], resolved_path)) {
+            shell_print_line("invalid path");
+            return;
+        }
+        if (sys_chown(resolved_path, uid, (uint32_t) -1) == 0) {
+            shell_print_line("chown ok");
+        } else {
+            shell_print_line("chown failed");
         }
         return;
     }
@@ -2743,6 +2918,7 @@ static void shell_run_command(char *line, bool admin_once)
             shell_print_line("login failed");
             return;
         }
+        efs_set_user(user->name);
         strcpy(pair, "USER=");
         strcat(pair, user->name);
         shell_env_set_pair(pair);
@@ -2828,18 +3004,38 @@ static void shell_run_command(char *line, bool admin_once)
         return;
     }
 
-    if (strcmp(argv[0], "shutdown") == 0) {
-        if (argc >= 2 && strcmp(argv[1], "poweroff") == 0) {
-            kernel_request_shutdown();
-            shell_print_line("shutdown requested");
+    if (strcmp(argv[0], "shutdown") == 0 ||
+        strcmp(argv[0], "poweroff") == 0 ||
+        strcmp(argv[0], "reboot") == 0 ||
+        strcmp(argv[0], "halt") == 0) {
+        bool do_poweroff = false;
+        bool do_reboot = false;
+        bool do_sleep = false;
+
+        if (strcmp(argv[0], "poweroff") == 0 || strcmp(argv[0], "halt") == 0) {
+            do_poweroff = true;
+        } else if (strcmp(argv[0], "reboot") == 0) {
+            do_reboot = true;
+        } else if (argc >= 2 && strcmp(argv[1], "poweroff") == 0) {
+            do_poweroff = true;
         } else if (argc >= 2 && strcmp(argv[1], "reboot") == 0) {
-            kernel_request_reboot();
-            shell_print_line("reboot requested");
+            do_reboot = true;
         } else if (argc >= 2 && strcmp(argv[1], "sleep") == 0) {
+            do_sleep = true;
+        } else {
+            shell_print_line("usage: shutdown [poweroff/reboot/sleep] | poweroff | reboot | halt");
+            return;
+        }
+
+        if (do_poweroff) {
+            kernel_request_shutdown();
+            shell_print_line("poweroff requested (sync + unmount + acpi)");
+        } else if (do_reboot) {
+            kernel_request_reboot();
+            shell_print_line("reboot requested (sync + unmount + acpi)");
+        } else if (do_sleep) {
             kernel_request_sleep();
             shell_print_line("sleep requested");
-        } else {
-            shell_print_line("usage: shutdown [poweroff/reboot/sleep]");
         }
         return;
     }
@@ -3116,6 +3312,101 @@ static void shell_run_command(char *line, bool admin_once)
         shell_print_line(bluetooth_status());
         shell_print_line(info->usb_transport_ready ? "transport: usb" : "transport: none");
         shell_print_u32_prefixed("controllers: ", info->controllers);
+        return;
+    }
+
+    if (strcmp(argv[0], "bt") == 0) {
+        if (!bt_hci_is_ready()) {
+            shell_print_line("bluetooth: not found");
+            return;
+        }
+        if (argc < 2 || strcmp(argv[1], "help") == 0) {
+            shell_print_line("usage: bt <scan|list|pair <mac> [pin]|connect <mac>>");
+            shell_print_line("  scan              start discovery and list found devices");
+            shell_print_line("  list              list known devices with state");
+            shell_print_line("  pair <mac> [pin]  pair with a device");
+            shell_print_line("  connect <mac>     connect to a device");
+            return;
+        }
+        if (strcmp(argv[1], "scan") == 0) {
+            bt_device_t devs[BT_MAX_DEVICES];
+            int n;
+
+            bt_scan_start();
+            shell_print_line("scanning...");
+            n = bt_get_devices(devs, BT_MAX_DEVICES);
+            if (n <= 0) {
+                shell_print_line("no devices found");
+                return;
+            }
+            for (int i = 0; i < n; i++) {
+                char mac[BT_ADDR_STR_LEN];
+
+                shell_print_line(devs[i].name[0] != '\0' ? devs[i].name : "(unknown)");
+                bt_addr_to_string(devs[i].addr, mac, sizeof(mac));
+                shell_print_line(mac);
+                shell_print_i32_prefixed("  rssi: ", devs[i].rssi);
+            }
+            return;
+        }
+        if (strcmp(argv[1], "list") == 0) {
+            bt_device_t devs[BT_MAX_DEVICES];
+            int n;
+
+            n = bt_get_devices(devs, BT_MAX_DEVICES);
+            if (n <= 0) {
+                shell_print_line("no devices");
+                return;
+            }
+            for (int i = 0; i < n; i++) {
+                char mac[BT_ADDR_STR_LEN];
+
+                shell_print_line(devs[i].name[0] != '\0' ? devs[i].name : "(unknown)");
+                bt_addr_to_string(devs[i].addr, mac, sizeof(mac));
+                shell_print_line(mac);
+                if (devs[i].paired) {
+                    shell_print_line("  paired");
+                }
+                if (devs[i].connected) {
+                    shell_print_line("  connected");
+                }
+            }
+            return;
+        }
+        if (strcmp(argv[1], "pair") == 0) {
+            uint8_t addr[BT_ADDR_LEN];
+            const char *pin = (argc >= 4) ? argv[3] : NULL;
+            int rc;
+
+            if (argc < 3) {
+                shell_print_line("usage: bt pair <mac> [pin]");
+                return;
+            }
+            if (bt_string_to_addr(argv[2], addr) != 0) {
+                shell_print_line("bt: invalid mac");
+                return;
+            }
+            rc = bt_pair(addr, pin);
+            shell_print_i32_prefixed("pair result: ", rc);
+            return;
+        }
+        if (strcmp(argv[1], "connect") == 0) {
+            uint8_t addr[BT_ADDR_LEN];
+            int rc;
+
+            if (argc < 3) {
+                shell_print_line("usage: bt connect <mac>");
+                return;
+            }
+            if (bt_string_to_addr(argv[2], addr) != 0) {
+                shell_print_line("bt: invalid mac");
+                return;
+            }
+            rc = bt_connect(addr);
+            shell_print_i32_prefixed("connect result: ", rc);
+            return;
+        }
+        shell_print_line("bt: unknown subcommand (try: bt help)");
         return;
     }
 
@@ -3549,6 +3840,33 @@ static void shell_run_command(char *line, bool admin_once)
                 return;
             }
             shell_print_line(i3c_set_frequency(0, freq) == 0 ? i3c_status() : i3c_status());
+            return;
+        }
+        if (argc >= 2 && strcmp(argv[1], "daa") == 0) {
+            /* 跑一次 ENTDAA：有控制器后端时走真实动态地址分配，
+             * 没有后端时退回 I2C 兼容枚举（不会伪造动态地址）。 */
+            i3c_device_t found[I3C_MAX_DEVICES];
+            int32_t n;
+
+            memset(found, 0, sizeof(found));
+            n = i3c_do_daa(0, found, I3C_MAX_DEVICES);
+            shell_print_line(i3c_status());
+            if (n <= 0) {
+                shell_print_u32_prefixed("devices: ", 0);
+                return;
+            }
+            shell_print_u32_prefixed("devices: ", (uint32_t) n);
+            for (int32_t i = 0; i < n; i++) {
+                if (found[i].dynamic_addr != 0) {
+                    shell_print_hex_u32_prefixed("dyn addr: ", found[i].dynamic_addr);
+                    shell_print_hex_u32_prefixed("pid lo: 0x", found[i].pid_lo);
+                    shell_print_hex_u32_prefixed("pid hi: 0x", found[i].pid_hi);
+                    shell_print_hex_u32_prefixed("bcr: 0x", found[i].bcr);
+                    shell_print_hex_u32_prefixed("dcr: 0x", found[i].dcr);
+                } else {
+                    shell_print_hex_u32_prefixed("i2c addr: ", found[i].static_addr);
+                }
+            }
             return;
         }
         shell_print_line(i3c_status());
@@ -4502,7 +4820,11 @@ static void shell_run_command(char *line, bool admin_once)
     if (strcmp(argv[0], "mkdir") == 0) {
         if (argc < 2) {
             shell_print_line("usage: mkdir <path>");
-        } else if (shell_resolve_path(argv[1], resolved_path) && file_mkdir(resolved_path)) {
+        } else if (!shell_resolve_path(argv[1], resolved_path)) {
+            shell_print_line("invalid path");
+        } else if (!fs_perm_check(resolved_path, true, false)) {
+            shell_print_line("Permission denied");
+        } else if (file_mkdir(resolved_path)) {
             shell_print_line("mkdir ok");
         } else {
             shell_print_line("mkdir failed");
@@ -4516,6 +4838,10 @@ static void shell_run_command(char *line, bool admin_once)
         } else {
             if (!shell_resolve_path(argv[1], resolved_path)) {
                 shell_print_line("invalid path");
+                return;
+            }
+            if (!fs_perm_check(resolved_path, true, false)) {
+                shell_print_line("Permission denied");
                 return;
             }
             shell_touch_file(resolved_path);
@@ -4547,23 +4873,42 @@ static void shell_run_command(char *line, bool admin_once)
             shell_print_line("invalid path");
             return;
         }
+        if (!fs_perm_check(resolved_path, true, false)) {
+            shell_print_line("Permission denied");
+            return;
+        }
         shell_write_file(resolved_path, text);
         return;
     }
 
     if (strcmp(argv[0], "rm") == 0) {
+        const char *target_arg;
+
         if (argc < 2) {
             shell_print_line("usage: rm <path>");
-        } else if (argc >= 3 && shell_rm_option_is_recursive_force(argv[1])) {
-            if (!shell_resolve_path(argv[2], resolved_path)) {
-                shell_print_line("invalid path");
-            } else if (shell_remove_recursive(resolved_path)) {
+            return;
+        }
+        if (argc >= 3 && shell_rm_option_is_recursive_force(argv[1])) {
+            target_arg = argv[2];
+        } else {
+            target_arg = argv[1];
+        }
+        if (!shell_resolve_path(target_arg, resolved_path)) {
+            shell_print_line("invalid path");
+            return;
+        }
+        if (!fs_perm_check(resolved_path, true, false)) {
+            shell_print_line("Permission denied");
+            return;
+        }
+        if (argc >= 3 && shell_rm_option_is_recursive_force(argv[1])) {
+            if (shell_remove_recursive(resolved_path)) {
                 shell_check_boot_files_or_panic();
                 shell_print_line("rm -rf ok");
             } else {
                 shell_print_line("rm -rf failed");
             }
-        } else if (shell_resolve_path(argv[1], resolved_path) && file_delete(resolved_path)) {
+        } else if (file_delete(resolved_path)) {
             shell_check_boot_files_or_panic();
             shell_print_line("rm ok");
         } else {
@@ -4575,10 +4920,73 @@ static void shell_run_command(char *line, bool admin_once)
     if (strcmp(argv[0], "rmdir") == 0) {
         if (argc < 2) {
             shell_print_line("usage: rmdir <path>");
-        } else if (shell_resolve_path(argv[1], resolved_path) && file_rmdir(resolved_path)) {
+        } else if (!shell_resolve_path(argv[1], resolved_path)) {
+            shell_print_line("invalid path");
+        } else if (!fs_perm_check(resolved_path, true, false)) {
+            shell_print_line("Permission denied");
+        } else if (file_rmdir(resolved_path)) {
             shell_print_line("rmdir ok");
         } else {
             shell_print_line("rmdir failed");
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "ren") == 0 || strcmp(argv[0], "rename") == 0 || strcmp(argv[0], "move") == 0) {
+        char old_resolved[PATH_MAX_LEN];
+        char new_resolved[PATH_MAX_LEN];
+
+        if (argc < 3) {
+            shell_print_line("usage: ren <oldpath> <newpath>");
+            return;
+        }
+        if (!shell_resolve_path(argv[1], old_resolved)) {
+            shell_print_line("invalid old path");
+            return;
+        }
+        if (!shell_resolve_path(argv[2], new_resolved)) {
+            shell_print_line("invalid new path");
+            return;
+        }
+        if (file_rename(old_resolved, new_resolved)) {
+            shell_print_line("rename ok");
+        } else {
+            shell_print_line("rename failed");
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "emptytrash") == 0 || strcmp(argv[0], "clearrecycle") == 0) {
+        uint64_t before = file_recycle_bin_size('C');
+        file_empty_recycle_bin('C');
+        file_recycle_maintenance('C');
+        shell_print_line("Recycle Bin emptied");
+        (void) before;
+        return;
+    }
+
+    if (strcmp(argv[0], "recyclebin") == 0 || strcmp(argv[0], "recycle") == 0 || strcmp(argv[0], "trash") == 0) {
+        static char recycle_list[4096];
+        uint32_t n = file_recycle_list('C', recycle_list, sizeof(recycle_list));
+        if (n == 0) {
+            shell_print_line("Recycle Bin is empty");
+        } else {
+            shell_print_line(recycle_list);
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "restore") == 0) {
+        if (argc < 2) {
+            shell_print_line("usage: restore <filename-in-recycle-bin>");
+            shell_print_line("type: recyclebin  to list filenames");
+        } else {
+            int32_t r = file_recycle_restore_by_name(argv[1]);
+            if (r == 0) {
+                shell_print_line("file restored");
+            } else {
+                shell_print_line("restore failed (not found? original missing?)");
+            }
         }
         return;
     }
@@ -4590,6 +4998,87 @@ static void shell_run_command(char *line, bool admin_once)
     }
 
     if (argc == 1 && shell_open_with_default_app(argv[0])) {
+        return;
+    }
+
+    if (strcmp(argv[0], "auditlog") == 0) {
+        if (!allow_admin) { shell_print_line("auditlog: admin only"); return; }
+        if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+            audit_flush();
+            audit_clear();
+            audit_log(AUDIT_OTHER, user_session_name(), "auditlog cleared", true);
+            shell_print_line("audit log cleared");
+            return;
+        }
+        {
+            static char audit_view[16384];
+            audit_flush();
+            uint32_t n = audit_dump(audit_view, sizeof(audit_view) - 1);
+            audit_view[n] = '\0';
+            if (n == 0) { shell_print_line("(no audit entries)"); return; }
+            {
+                /* 按行打印，避免一条超长刷屏 */
+                char *cur = audit_view;
+                while (*cur != '\0') {
+                    char *nl = cur;
+                    while (*nl != '\0' && *nl != '\n') nl++;
+                    char saved = *nl;
+                    *nl = '\0';
+                    shell_print_line(cur);
+                    *nl = saved;
+                    cur = (*nl == '\n') ? nl + 1 : nl;
+                }
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[0], "unlock") == 0) {
+        if (!allow_admin) { shell_print_line("unlock: admin only"); return; }
+        if (argc < 2) { shell_print_line("usage: unlock <username>"); return; }
+        shell_print_line(user_admin_unlock(argv[1]) ? "unlocked" : "no such user");
+        return;
+    }
+
+    if (strcmp(argv[0], "encrypt") == 0) {
+        if (argc < 2) { shell_print_line("usage: encrypt <file>"); return; }
+        if (!shell_resolve_path(argv[1], resolved_path)) { shell_print_line("invalid path"); return; }
+        shell_print_line(efs_encrypt_file(resolved_path) ? "encrypted" : "encrypt failed");
+        return;
+    }
+
+    if (strcmp(argv[0], "decrypt") == 0) {
+        if (argc < 2) { shell_print_line("usage: decrypt <file>"); return; }
+        if (!shell_resolve_path(argv[1], resolved_path)) { shell_print_line("invalid path"); return; }
+        shell_print_line(efs_decrypt_file(resolved_path) ? "decrypted" : "decrypt failed");
+        return;
+    }
+
+    if (strcmp(argv[0], "play") == 0) {
+        uint32_t path_len;
+
+        if (argc < 2) { shell_print_line("usage: play <file.wav|file.mp3>"); return; }
+        if (!shell_resolve_path(argv[1], resolved_path)) { shell_print_line("invalid path"); return; }
+        path_len = (uint32_t) strlen(resolved_path);
+
+        if (path_len >= 4 && strcasecmp(resolved_path + path_len - 4, ".mp3") == 0) {
+            shell_print_line("decoding mp3...");
+            if (mp3_play_file(resolved_path)) {
+                const mp3_dec_info_t *mi = mp3_dec_last_info();
+
+                shell_print_line("mp3 playback started");
+                shell_print_line(mp3_dec_status());
+                shell_print_u32_prefixed("decoded frames: ", mi->frames_decoded);
+                shell_print_u32_prefixed("duration ms: ", mi->duration_ms);
+            } else {
+                shell_print_line(mp3_dec_status());
+            }
+        } else if (path_len >= 4 && strcasecmp(resolved_path + path_len - 4, ".wav") == 0) {
+            shell_print_line(wav_play_file(resolved_path) ? "wav playback started"
+                                                         : "wav playback failed");
+        } else {
+            shell_print_line("play: only .wav and .mp3 are supported");
+        }
         return;
     }
 
@@ -4871,9 +5360,10 @@ void shell_handle_key_event(const key_event_t *event)
         return;
     }
     if (event->ch == '\n') {
-        bool ok = shell_authenticate_password(g_password);
+        bool ok;
         console_write("\r\n");
         if (g_shell_state == SHELL_STATE_SU_PASSWORD) {
+            ok = shell_authenticate_password(g_password);
             if (ok) {
                 g_shell_privilege = SHELL_PRIV_R2;
                 shell_print_line("switched to R2");
@@ -4881,12 +5371,23 @@ void shell_handle_key_event(const key_event_t *event)
                 shell_print_line("authentication failed");
             }
         } else if (g_shell_state == SHELL_STATE_SUDO_PASSWORD) {
+            /* sudo authenticates against the root account in the passwd db. */
+            ok = user_authenticate("root", g_password);
             if (ok) {
                 char command[SHELL_LINE_MAX];
+                uint32_t old_uid = user_session_uid();
+                uint32_t old_gid = user_session_gid();
                 strcpy(command, g_pending_sudo);
+                /* Temporarily elevate the login session to root (uid 0/gid 0)
+                 * for the duration of the command, then restore the original
+                 * identity.  Builtin privilege gating is already enabled via
+                 * admin_once=true; the session elevation also makes any
+                 * processes spawned through exec_run inherit root creds. */
+                user_set_session(0, 0);
                 shell_execute_line(command, true);
+                user_set_session(old_uid, old_gid);
             } else {
-                shell_print_line("authentication failed");
+                shell_print_line("sudo: authentication failed");
             }
         }
         g_shell_state = SHELL_STATE_COMMAND;

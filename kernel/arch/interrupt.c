@@ -9,6 +9,8 @@
 #include "kernel.h"
 #include "mmu.h"
 #include "mouse.h"
+#include "pcb.h"
+#include "vm.h"
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA    0x21
@@ -193,6 +195,17 @@ uint64_t cpu_exception_dispatch(cpu_exception_frame_t *frame)
         (uint64_t)info.rip, (uint64_t)frame->rsp, 0 /* rbp n/a in frame */,
         (uint64_t)info.rflags);
 
+    /* Demand paging: a non-present user page fault in the user address range
+     * gets resolved on the spot (allocate a frame, map it) and we return 2 so
+     * the asm resume path re-ires to the faulting instruction. */
+    if (info.vector == 14 && from_user) {
+        uint64_t cr2;
+        asm volatile ("mov %%cr2, %0" : "=r" (cr2));
+        if (vm_handle_page_fault(cr2, info.error_code)) {
+            return 2;
+        }
+    }
+
     if ((from_user || exec_address_in_active_image(info.rip)) && exec_active()) {
         char msg[64] = "process exception vector=0x";
         static const char hex[] = "0123456789ABCDEF";
@@ -266,6 +279,11 @@ void timer_interrupt_dispatch(void)
     if (!tick_paused) {
         tick_count++;
     }
+    /* Preemptive scheduling: account the tick against the currently running
+     * process's time slice.  Returns true if the slice expired and another
+     * READY process is waiting — the assembly resume path can use this to
+     * trigger a context switch at the next safe boundary. */
+    (void) scheduler_tick();
     if (exec_active()) {
         kernel_run_exec_periodic_work();
     }

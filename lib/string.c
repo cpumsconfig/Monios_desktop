@@ -129,6 +129,28 @@ char *strrchr(const char *str, int ch)
     return (char *) last;
 }
 
+char *strstr(const char *haystack, const char *needle)
+{
+    if (haystack == NULL || needle == NULL) {
+        return NULL;
+    }
+    if (*needle == '\0') {
+        return (char *) haystack;
+    }
+    for (const char *h = haystack; *h != '\0'; h++) {
+        const char *a = h;
+        const char *b = needle;
+        while (*a != '\0' && *b != '\0' && *a == *b) {
+            a++;
+            b++;
+        }
+        if (*b == '\0') {
+            return (char *) h;
+        }
+    }
+    return NULL;
+}
+
 char *strcat(char *dst_, const char *src_)
 {
     char *ret = dst_;

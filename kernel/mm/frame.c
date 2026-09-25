@@ -2,13 +2,21 @@
 #include "bitmap.h"
 #include "common.h"
 
+/* Physical frame pool: 16 MiB .. 80 MiB (64 MiB total = 16384 pages).
+ * Expanded from the original 16 MiB (4096 pages) to support more concurrent
+ * processes and COW page sharing.  The pool sits below the BIOS kernel heap
+ * at 0x05000000..0x07000000 and the per-process user-region arena at
+ * 0x08000000+, so there is no overlap. */
 #define FRAME_BASE_PHYS 0x01000000ULL
-#define FRAME_TOTAL_COUNT 4096U
+#define FRAME_TOTAL_COUNT 16384U
 
 static uint32_t g_frame_storage[(FRAME_TOTAL_COUNT + BITMAP_WORD_BITS - 1u) / BITMAP_WORD_BITS];
 static bitmap_t g_frame_bitmap;
 static frame_info_t g_frame_info;
 static char g_frame_status[64];
+/* Next-fit allocation cursor: reduces fragmentation by searching from the
+ * last allocation point instead of always scanning from frame 0. */
+static uint32_t g_frame_next_cursor;
 
 static bool frame_range_valid(uint32_t index, uint32_t frame_count)
 {
@@ -59,7 +67,8 @@ void frame_init(void)
     bitmap_bind(&g_frame_bitmap, g_frame_storage, FRAME_TOTAL_COUNT);
     g_frame_info.base = FRAME_BASE_PHYS;
     g_frame_info.total_frames = FRAME_TOTAL_COUNT;
-    strcpy(g_frame_status, "frame: ready");
+    g_frame_next_cursor = 0;
+    strcpy(g_frame_status, "frame: ready (64 MiB pool)");
 }
 
 uint64_t frame_alloc(uint32_t frame_count)
@@ -74,10 +83,23 @@ uint64_t frame_alloc_aligned(uint32_t frame_count, uint32_t align_frames)
     if (frame_count == 0) {
         return 0;
     }
-    start_index = bitmap_find_run_zero(&g_frame_bitmap, 0, frame_count, align_frames);
+    /* Next-fit: search from the cursor first, then wrap to the beginning.
+     * This spreads allocations across the pool and reduces fragmentation
+     * compared to always-first-fit. */
+    start_index = bitmap_find_run_zero(&g_frame_bitmap, g_frame_next_cursor,
+                                        frame_count, align_frames);
+    if (start_index < 0) {
+        start_index = bitmap_find_run_zero(&g_frame_bitmap, 0,
+                                            frame_count, align_frames);
+    }
     if (start_index < 0 || !frame_mark_range((uint32_t) start_index, frame_count, true)) {
         strcpy(g_frame_status, "frame: no free run");
         return 0;
+    }
+    /* Advance cursor past this allocation for next time. */
+    g_frame_next_cursor = (uint32_t) start_index + frame_count;
+    if (g_frame_next_cursor >= FRAME_TOTAL_COUNT) {
+        g_frame_next_cursor = 0;
     }
     g_frame_info.used_frames += frame_count;
     g_frame_info.alloc_requests++;
@@ -131,4 +153,22 @@ const frame_info_t *frame_info(void)
 const char *frame_status(void)
 {
     return g_frame_status;
+}
+
+/* ── Crash-dump read-only accessors ───────────────────────────── */
+uint64_t frame_base_phys(void)
+{
+    return FRAME_BASE_PHYS;
+}
+
+uint32_t frame_total_frames(void)
+{
+    return FRAME_TOTAL_COUNT;
+}
+
+bool frame_is_used(uint64_t phys)
+{
+    uint32_t index;
+    if (!frame_index_from_base(phys, &index)) return false;
+    return bitmap_test(&g_frame_bitmap, index);
 }

@@ -81,15 +81,13 @@ void registry_init(void)
     registry_set("shell.desktop", UI_ROOT_DESKTOP);
     registry_set("ui.wallpaper", UI_WALLPAPER_PATH);
     registry_set("ui.cursor", UI_CURSOR_ASSET_PATH);
+    registry_set("ui.osui", UI_OSUI_DLL_PATH);
+    registry_set("ui.osui.theme", "MoniOS OSUI");
     registry_set("default.filemanager", UI_EXPLORER_PATH);
     registry_set("default.player", UI_PLAYER_PATH);
+    registry_set("default.browser", UI_BROWSER_PATH);
     registry_set("default.editor", UI_NOTEPAD_PATH);
-    if (file_exists(UI_RZDRV_PATH) && !file_is_dir(UI_RZDRV_PATH)) {
-        registry_set("drivers.boot.count", "1");
-        registry_set("drivers.boot.0", UI_RZDRV_PATH);
-    } else {
-        registry_set("drivers.boot.count", "0");
-    }
+    registry_set("drivers.boot.count", "0");
     registry_set_default_app(".sys", UI_SYSINST_PATH);
     registry_set_default_app(".wav", UI_PLAYER_PATH);
     registry_set_default_app(".m4a", UI_PLAYER_PATH);

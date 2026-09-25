@@ -1,6 +1,6 @@
 # MoniOS App API
 
-MoniOS user applications should include `appsys.h` and link with the user runtime objects plus `console.dll`, `windows.dll`, and `monios.dll` import libraries from the Makefile. User images are PE32+ files (`.exe`, `.dll`, `.sys`). The runtime starts applications in the app address window (`0x04000000` to `0x04400000`) and passes an `app_launch_info_t` with argv, environment, cwd, user, privilege, subsystem, image flags, and standard handles.
+MoniOS user applications should include `appsys.h` and link with the user runtime objects plus `console.dll`, `windows.dll`, `osui.dll`, and `monios.dll` import libraries from the Makefile. User images are PE32+ files (`.exe`, `.dll`, `.sys`). The runtime starts applications in the app address window (`0x04000000` to `0x04400000`) and passes an `app_launch_info_t` with argv, environment, cwd, user, privilege, subsystem, image flags, and standard handles.
 
 The stable app ABI is `APP_ABI_VERSION` (currently `5`). Rebuild apps when this value changes.
 
@@ -11,6 +11,7 @@ Core helpers:
 - `console_set_title()` changes the current Console process window title.
 - `app_ticks()`, `app_sleep_ticks()` and `app_log()` provide basic runtime services.
 - `app_getcwd()`, `app_get_mouse()` and `app_get_system_status()` read system state.
+- `app_http_get_url()` fetches an HTTP/HTTPS URL through the kernel HTTP client and the active network driver. Responses are copied into a user buffer and remain bounded by `MONIOS_HTTP_RESPONSE_MAX`.
 - `app_file_read()`, `app_file_write()`, `app_file_size()`, `app_file_exists()`, `app_file_mkdir()`, `app_file_delete()` and `app_file_list_dir()` wrap filesystem calls through `monios.dll`.
 - `app_graphics_fill_rect()` and `app_graphics_present()` provide a minimal graphics API.
 - `app_socket_*()`, `app_ipc_*()`, `app_futex_*()` and `app_signal_*()` provide networking and coordination primitives.
@@ -24,15 +25,21 @@ Default apps:
 - `.sys` defaults to `C:\Monios\Apps\sysinst.exe`; double-clicking a driver opens the installer first.
 - `.wav` and `.m4a` default to `C:\Monios\Apps\player.exe`.
 - `.txt` defaults to `C:\Monios\Apps\notepad.exe`.
+- `browser.exe` is the user-mode HTML browser and defaults to `https://example.com` when no URL argument is supplied.
 - Shell commands `assoc .sys`, `assoc .sys C:\Monios\Apps\sysinst.exe`, `reg get <key>` and `reg set <key> <value>` are available for developers.
 
 Driver packages:
 
 - `.sys` files are PE32+ AMD64 Native subsystem images and are not launched as normal apps.
-- Build output signs drivers with `tools/sign_driver_sys.py`, using `D:/qm/makecert.exe` and `D:/qm/signtool.exe` to create an Authenticode-style PE Security Directory.
+- Build output signs drivers with `tools/sign_driver_sys.py`. Windows uses
+  `D:/qm/makecert.exe` and `D:/qm/signtool.exe`; Linux uses a deterministic
+  development signature that the MoniOS kernel can verify without Windows tools.
 - Signed drivers are stored under `C:\Monios\driver`, for example `C:\Monios\driver\rzdrv.sys`; they are no longer copied into `C:\Monios\Apps`.
-- The standalone kernel image is the signed PE32+ Native image `C:\Monios\kernel.exe`. Boot driver loading is controlled by `drivers.boot.count` and `drivers.boot.N` registry keys. The default boot driver is `C:\Monios\driver\rzdrv.sys`.
-- The kernel verifies the `.sys` PE type, `WIN_CERTIFICATE` table, and Authenticode SHA-256 digest before registering a boot driver. Missing, malformed, tampered, or unsigned drivers call the BSOD path.
+- The standalone kernel image is the signed PE32+ Native image `C:\Monios\kernel.exe`. Boot driver loading is controlled by `drivers.boot.count` and `drivers.boot.N` registry keys; the base image starts with no optional external driver.
+- A loadable native driver must export `DriverEntry(const monios_driver_runtime_t *)` and `DriverUnload(void)`, must have no user-mode imports, and is kept resident until shutdown.
+- The kernel verifies the `.sys` PE type, `WIN_CERTIFICATE` table, Authenticode SHA-256 digest, signer identity, native entry exports, section layout, and relocation/import policy before loading it. Missing, malformed, tampered, or unsigned boot drivers remain rejected.
+- `driver list`, `driver load <file.sys>`, and `driver unload <name> [--force]` manage the lifecycle from the shell. Elevated apps can use `app_driver_load()`, `app_driver_unload()`, and `app_driver_query()`.
+- `driver_manager_shutdown()` runs on both poweroff and reboot, unloads external modules and built-in drivers in reverse registration order, then releases resident images.
 - The kernel verifies its own PE signature before boot-driver registration and compares the signer id with every registered boot `.sys`; an invalid kernel signature or signer mismatch calls the BSOD path.
 
 PE subsystems:
@@ -47,9 +54,21 @@ PE subsystems:
 DLL layers:
 
 - `monios.dll` is the lowest user-mode DLL under `C:\Monios\System\Lib` and exposes raw syscall, handle, file, and process helpers.
+- `monios.dll` also exposes the bounded `monios_http_get_url()` bridge; the network driver and TCP/TLS implementation remain in the kernel.
 - `console.dll` is the console layer and imports `monios.dll` for stdin/stdout/stderr helpers.
 - `windows.dll` is the window/graphics layer and imports `monios.dll` for graphics syscalls.
+- `osui.dll` is the visual toolkit layered on top of `windows.dll`. ABI version 3 provides the shared MoniOS palette, panels, cards, title bars, labels, inputs, buttons with hover/pressed/focus states, progress bars, avatars, callouts, badges, chips, checkboxes, toggles, radio controls, sliders, tab bars, navigation rails, command bars, status bars, list items, separators, and presentation.
+- OSUI keeps the low-level window backend separate while defining its own native visual language: neutral surfaces, teal semantic accents, compact navigation, explicit command regions, and visible feedback states.
+- OSUI state flags are composable. Use `OSUI_STATE_DISABLED`, `OSUI_STATE_HOVERED`, `OSUI_STATE_PRESSED`, `OSUI_STATE_FOCUSED`, `OSUI_STATE_SELECTED`, `OSUI_STATE_CHECKED`, `OSUI_STATE_MIXED`, `OSUI_STATE_READONLY`, `OSUI_STATE_PRIMARY`, `OSUI_STATE_DANGER`, `OSUI_STATE_SUCCESS`, `OSUI_STATE_WARNING`, and `OSUI_STATE_MUTED` to describe the visual state passed to the state-aware controls.
+- Kernel OSUI components can be tagged with `builtin`, `custom`, `desktop`, `secure`, `widget`, `layout`, `theme`, `navigation`, `command`, and `feedback`; custom `.osc` manifests use the same comma-separated flag names.
+- `osui_button()` remains the compatibility wrapper for a neutral button. Use `osui_button_state()` when the application needs explicit interaction feedback or semantic coloring.
 - The kernel PE loader binds each app's Import Directory before entry, loads these DLLs from `C:\Monios\System\Lib`, and patches the IAT by exported symbol name.
+
+User-mode browser:
+
+- `user/apps/browser.c` is a freestanding windowed app. It fetches a URL through `app_http_get_url()`, strips the HTTP response headers, and parses HTML in user space.
+- The first renderer supports titles, headings, paragraphs, block elements, lists, links, line breaks, horizontal rules, comments, `script`/`style` suppression, and common HTML entities.
+- The current OSUI page is intentionally static: it renders the address field, request status, page title, and a bounded text layout. Navigation, CSS, images, forms, and JavaScript are later browser layers.
 
 Privilege model:
 
@@ -101,12 +120,12 @@ Build the Hello World sample manually:
 
 ```bash
 make app-runtime
-python tools/monios-gcc.py -c examples/hello.c -o out/hello.o
-python tools/monios-ld.py --subsystem console -o out/hello.exe out/hello.o
+python3 tools/monios-gcc.py -c examples/hello.c -o out/hello.o
+python3 tools/monios-ld.py --subsystem console -o out/hello.exe out/hello.o
 ```
 
 The linker driver adds the MoniOS startup object, user runtime objects,
-`console.dll`, `windows.dll`, and `monios.dll`. The normal project target is:
+`console.dll`, `windows.dll`, `osui.dll`, and `monios.dll`. The normal project target is:
 
 ```bash
 make hello

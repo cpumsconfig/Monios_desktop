@@ -1,5 +1,8 @@
 #include "common.h"
 #include "extfs.h"
+#include "file.h"
+#include "blockdev.h"
+#include "kernel.h"
 #include "string.h"
 
 #define ATA_DATA_PORT         0x1F0
@@ -13,6 +16,7 @@
 
 #define ATA_CMD_READ_SECTORS  0x20
 #define ATA_CMD_WRITE_SECTORS 0x30
+#define ATA_CMD_FLUSH_CACHE   0xE7
 #define ATA_STATUS_BSY        0x80
 #define ATA_STATUS_DRQ        0x08
 #define ATA_WAIT_LIMIT        1000000U
@@ -43,13 +47,14 @@
 
 static extfs_info_t g_extfs_info;
 static uint8_t g_extfs_block[4096];
-static uint8_t g_extfs_inode_buf[256];
+static uint8_t g_extfs_inode_buf[4096];
 
 static uint32_t g_cache_block[EXTFS_CACHE_SIZE];
 static uint8_t g_cache_data[EXTFS_CACHE_SIZE][4096];
 static uint32_t g_cache_lru[EXTFS_CACHE_SIZE];
 static bool g_cache_dirty[EXTFS_CACHE_SIZE];
 static uint32_t g_cache_counter = 0;
+static bool g_write_rejected;
 
 static uint32_t g_symlink_count = 0;
 
@@ -115,9 +120,9 @@ static bool extfs_parent_path_for_cursor(const char *path, const char *cursor, c
 }
 
 /* 组描述符缓存 */
-static uint8_t g_group_desc[EXTFS_MAX_GROUP_DESC * 32];
-static bool g_group_desc_loaded = false;
-static uint32_t g_group_count = 0;
+__attribute__((unused)) static uint8_t g_group_desc[EXTFS_MAX_GROUP_DESC * 32];  /* reserved group descriptor cache, not wired yet */
+__attribute__((unused)) static bool g_group_desc_loaded = false;
+__attribute__((unused)) static uint32_t g_group_count = 0;
 
 typedef struct {
     uint32_t inode;
@@ -148,6 +153,18 @@ typedef struct {
     uint8_t osd2[12];
 } ext_inode_t;
 
+/* 本卷所在的块设备序号，由 extfs_init() 从 file_blockdev_hint() 取。
+ * >= 0 时所有扇区 I/O 走 drivers/storage/blockdev.c 的块设备抽象；
+ * < 0（未知）时回退到下面的 legacy ATA PIO。
+ *
+ * 为什么必须走块设备层：这些驱动过去直接读写 0x1F0 端口，在没有 legacy IDE
+ * 控制器的机器上（AHCI/NVMe-only，含 QEMU -machine q35）端口读回全 0，
+ * 文件系统完全挂不上。 */
+static int32_t g_extfs_blockdev = -1;
+
+/* 写失败只报一次，避免坏设备上刷屏。 */
+static bool g_extfs_write_warned;
+
 static bool ata_wait_not_busy(void)
 {
     for (uint32_t i = 0; i < ATA_WAIT_LIMIT; i++) {
@@ -164,7 +181,10 @@ static bool ata_wait_data_ready(void)
         return false;
     }
     for (uint32_t i = 0; i < ATA_WAIT_LIMIT; i++) {
-        if ((inb(ATA_STATUS_PORT) & ATA_STATUS_DRQ) != 0) {
+        uint8_t status = inb(ATA_STATUS_PORT);
+        if (status & ATA_STATUS_BSY) continue;
+        if (status & (ATA_STATUS_ERR | 0x20)) return false;
+        if ((status & ATA_STATUS_DRQ) != 0) {
             return true;
         }
     }
@@ -173,6 +193,13 @@ static bool ata_wait_data_ready(void)
 
 static void ata_read_sector(uint32_t lba, void *buffer)
 {
+    if (g_extfs_blockdev >= 0) {
+        if (!blockdev_raw_read_sectors(g_extfs_blockdev, lba, 1, buffer)) {
+            memset(buffer, 0, 512);
+        }
+        return;
+    }
+
     uint16_t *dst = (uint16_t *) buffer;
 
     if (!ata_wait_not_busy()) {
@@ -195,12 +222,44 @@ static void ata_read_sector(uint32_t lba, void *buffer)
     }
 }
 
-static void ata_write_sector(uint32_t lba, const void *buffer)
+/* Completion requires the data phase to end as well as BSY to clear. */
+static bool ata_wait_command_complete(void)
 {
+    for (uint32_t i = 0; i < ATA_WAIT_LIMIT; i++) {
+        uint8_t status = inb(ATA_STATUS_PORT);
+        if (status == 0 || status == 0xFF) return false;
+        if (status & ATA_STATUS_BSY) continue;
+        if (status & (ATA_STATUS_ERR | 0x20)) return false;
+        if (!(status & ATA_STATUS_DRQ)) return true;
+    }
+    return false;
+}
+
+static bool ata_flush_device_cache(void)
+{
+    if (!ata_wait_command_complete()) return false;
+    outb(ATA_COMMAND_PORT, ATA_CMD_FLUSH_CACHE);
+    /* Allow the device to assert BSY before sampling completion. */
+    for (uint32_t i = 0; i < 4; i++) (void)inb(0x3F6);
+    return ata_wait_command_complete();
+}
+
+static bool ata_write_sector(uint32_t lba, const void *buffer)
+{
+    if (g_extfs_blockdev >= 0) {
+        bool ok = blockdev_raw_write_sectors(g_extfs_blockdev, lba, 1, buffer);
+
+        if (!ok && !g_extfs_write_warned) {
+            g_extfs_write_warned = true;
+            log_write("fs: warning - block device rejected write (volume read-only)");
+        }
+        return ok;
+    }
+
     const uint16_t *src = (const uint16_t *) buffer;
 
-    if (!ata_wait_not_busy()) {
-        return;
+    if (lba > 0x0FFFFFFFu || !ata_wait_not_busy()) {
+        return false;
     }
     outb(ATA_DRIVE_PORT, (uint8_t) (0xE0 | ((lba >> 24) & 0x0F)));
     outb(ATA_SECTOR_COUNT_PORT, 1);
@@ -210,14 +269,15 @@ static void ata_write_sector(uint32_t lba, const void *buffer)
     outb(ATA_COMMAND_PORT, ATA_CMD_WRITE_SECTORS);
 
     if (!ata_wait_data_ready()) {
-        return;
+        return false;
     }
     for (uint32_t i = 0; i < 256; i++) {
         outw(ATA_DATA_PORT, src[i]);
     }
 
     /* 等待写入完成 */
-    (void) ata_wait_not_busy();
+    for (uint32_t i = 0; i < 4; i++) (void)inb(0x3F6);
+    return ata_wait_command_complete();
 }
 
 static uint16_t read_le16(const uint8_t *data)
@@ -240,6 +300,7 @@ static bool ext_partition_type(uint8_t type)
 
 static void extfs_cache_init(void)
 {
+    g_write_rejected = false;
     for (int i = 0; i < EXTFS_CACHE_SIZE; i++) {
         g_cache_block[i] = 0xFFFFFFFF;
         g_cache_lru[i] = 0;
@@ -271,29 +332,36 @@ static int extfs_cache_find_victim(void)
     return victim;
 }
 
-static void extfs_flush_block(uint32_t block, const uint8_t *data)
+static bool extfs_flush_block(uint32_t block, const uint8_t *data)
 {
-    uint32_t lba = g_extfs_info.volume_lba + block * (g_extfs_info.block_size / 512);
     uint32_t sectors = g_extfs_info.block_size / 512;
+    uint64_t lba = (uint64_t)g_extfs_info.volume_lba + (uint64_t)block * sectors;
+    if (sectors == 0 || sectors > sizeof(g_cache_data[0]) / 512 ||
+        lba + sectors > 0x10000000ULL) return false;
 
     for (uint32_t i = 0; i < sectors; i++) {
-        ata_write_sector(lba + i, data + i * 512);
+        if (!ata_write_sector((uint32_t)lba + i, data + i * 512)) return false;
     }
+    /* Keep the dirty RAM copy until device-cache flush is acknowledged. */
+    return ata_flush_device_cache();
 }
 
-static void extfs_cache_flush_idx(int idx)
+static bool extfs_cache_flush_idx(int idx)
 {
     if (g_cache_dirty[idx] && g_cache_block[idx] != 0xFFFFFFFF) {
-        extfs_flush_block(g_cache_block[idx], g_cache_data[idx]);
+        if (!extfs_flush_block(g_cache_block[idx], g_cache_data[idx])) return false;
         g_cache_dirty[idx] = false;
     }
+    return true;
 }
 
-void extfs_sync(void)
+bool extfs_sync(void)
 {
+    bool ok = !g_write_rejected;
     for (int i = 0; i < EXTFS_CACHE_SIZE; i++) {
-        extfs_cache_flush_idx(i);
+        if (!extfs_cache_flush_idx(i)) ok = false;
     }
+    return ok;
 }
 
 static void extfs_read_block_cached(uint32_t block, uint8_t *buffer)
@@ -316,7 +384,7 @@ static void extfs_read_block_cached(uint32_t block, uint8_t *buffer)
 
     /* 加入缓存 */
     cache_idx = extfs_cache_find_victim();
-    extfs_cache_flush_idx(cache_idx);  /* 先刷新旧的 dirty 块 */
+    if (!extfs_cache_flush_idx(cache_idx)) return; /* Keep dirty victim; skip caching read. */
     g_cache_block[cache_idx] = block;
     g_cache_lru[cache_idx] = ++g_cache_counter;
     g_cache_dirty[cache_idx] = false;
@@ -336,7 +404,12 @@ static void extfs_write_block_cached(uint32_t block, const uint8_t *buffer)
 
     /* 未命中，加入缓存 */
     cache_idx = extfs_cache_find_victim();
-    extfs_cache_flush_idx(cache_idx);  /* 先刷新旧的 dirty 块 */
+    if (!extfs_cache_flush_idx(cache_idx)) {
+        /* Existing mutation APIs cannot all return I/O errors yet. Latch this
+         * rejection so later sync cannot certify an incomplete operation. */
+        g_write_rejected = true;
+        return;
+    }
     g_cache_block[cache_idx] = block;
     g_cache_lru[cache_idx] = ++g_cache_counter;
     g_cache_dirty[cache_idx] = true;
@@ -384,6 +457,13 @@ static bool extfs_parse_super(uint32_t volume_lba, const uint8_t super[1024])
     if (g_extfs_info.inode_size == 0) {
         g_extfs_info.inode_size = 128;
     }
+    if (log_block_size > 2 || g_extfs_info.inodes_per_group == 0 ||
+        g_extfs_info.blocks_per_group == 0 ||
+        g_extfs_info.inode_size < sizeof(ext_inode_t) ||
+        g_extfs_info.inode_size > g_extfs_info.block_size ||
+        (g_extfs_info.inode_size & (g_extfs_info.inode_size - 1u)) != 0 ||
+        g_extfs_info.inodes_per_group > 0xFFFFFFFFu / g_extfs_info.inode_size)
+        return false;
     g_extfs_info.feature_compat = read_le32(super + 92);
     g_extfs_info.feature_incompat = read_le32(super + 96);
     g_extfs_info.feature_ro_compat = read_le32(super + 100);
@@ -710,7 +790,9 @@ static bool extfs_write_inode_raw(uint32_t inode_num, const ext_inode_t *inode)
     extfs_read_block(inode_table_block + block_offset, g_extfs_inode_buf);
 
     /* 写入 inode 数据 */
-    memcpy(g_extfs_inode_buf + byte_offset, &raw_inode, g_extfs_info.inode_size);
+    /* The disk inode may contain extended fields beyond our 128-byte struct.
+     * Preserve those bytes from the block read above, never copy stack bytes. */
+    memcpy(g_extfs_inode_buf + byte_offset, &raw_inode, sizeof(raw_inode));
 
     /* 写回块 */
     extfs_write_block(inode_table_block + block_offset, g_extfs_inode_buf);
@@ -773,7 +855,7 @@ static bool extfs_inode_is_directory(const ext_inode_t *inode)
     return (inode->mode & EXT_INODE_MODE_FMT) == EXT_INODE_MODE_DIR;
 }
 
-static bool extfs_inode_is_file(const ext_inode_t *inode)
+__attribute__((unused)) static bool extfs_inode_is_file(const ext_inode_t *inode)
 {
     return (inode->mode & EXT_INODE_MODE_FMT) == EXT_INODE_MODE_REG;
 }
@@ -1107,9 +1189,21 @@ bool extfs_init(void)
 {
     uint8_t sector[512];
     uint8_t super[1024];
+    int32_t mount_hint = file_mount_partition_hint();
+    g_extfs_blockdev = file_blockdev_hint();
+    g_extfs_write_warned = false;
 
     memset(&g_extfs_info, 0, sizeof(g_extfs_info));
     strcpy(g_extfs_info.status, "extfs: not found");
+
+    if (mount_hint >= 0) {
+        if (extfs_read_super((uint32_t) mount_hint, super) &&
+            extfs_parse_super((uint32_t) mount_hint, super)) {
+            return true;
+        }
+        strcpy(g_extfs_info.status, "extfs: no volume detected");
+        return false;
+    }
 
     if (extfs_read_super(0, super) && extfs_parse_super(0, super)) {
         return true;
@@ -2098,4 +2192,177 @@ const extfs_info_t *extfs_info(void)
 const char *extfs_status(void)
 {
     return g_extfs_info.status;
+}
+
+bool extfs_stat(const char *path, extfs_stat_t *stat_out)
+{
+    uint32_t inode_num;
+    ext_inode_t inode;
+
+    if (!g_extfs_info.present || path == NULL || stat_out == NULL) {
+        return false;
+    }
+    memset(stat_out, 0, sizeof(*stat_out));
+
+    if (!extfs_resolve_path(path, &inode_num)) {
+        return false;
+    }
+    if (!extfs_read_inode_raw(inode_num, &inode)) {
+        return false;
+    }
+
+    stat_out->file_size = inode.size;
+    stat_out->mode = inode.mode;
+    stat_out->uid = inode.uid;
+    stat_out->gid = inode.gid;
+    stat_out->is_dir = extfs_inode_is_directory(&inode);
+    stat_out->create_time = inode.ctime;
+    stat_out->modify_time = inode.mtime;
+    stat_out->access_time = inode.atime;
+
+    return true;
+}
+
+bool extfs_rename(const char *oldpath, const char *newpath)
+{
+    uint32_t old_inode_num;
+    ext_inode_t old_inode;
+    const char *old_name;
+    const char *new_name;
+    char old_parent_path[256];
+    char new_parent_path[256];
+    uint32_t split_len;
+    uint32_t old_parent;
+    uint32_t new_parent;
+    uint32_t found_inode;
+    bool is_dir;
+    uint8_t ftype;
+
+    if (!g_extfs_info.present || oldpath == NULL || newpath == NULL) {
+        return false;
+    }
+    if (oldpath[0] != '/' || newpath[0] != '/') {
+        return false;
+    }
+    if (oldpath[1] == '\0') {
+        return false;  /* 不能重命名根目录 */
+    }
+
+    /* 解析源文件。 */
+    if (!extfs_resolve_path(oldpath, &old_inode_num)) {
+        return false;
+    }
+    if (!extfs_read_inode_raw(old_inode_num, &old_inode)) {
+        return false;
+    }
+    is_dir = extfs_inode_is_directory(&old_inode);
+    ftype = is_dir ? EXT_DIR_DIR_TYPE : EXT_DIR_FILE_TYPE;
+
+    /* 拆分 oldpath。 */
+    old_name = strrchr(oldpath, '/');
+    if (old_name == NULL) {
+        return false;
+    }
+    old_name++;
+    if (*old_name == '\0') {
+        return false;
+    }
+    split_len = (uint32_t) (old_name - oldpath - 1);
+    if (split_len >= sizeof(old_parent_path)) {
+        return false;
+    }
+    memcpy(old_parent_path, oldpath, split_len);
+    old_parent_path[split_len] = '\0';
+    if (split_len == 0) {
+        strcpy(old_parent_path, "/");
+    }
+
+    /* 拆分 newpath。 */
+    new_name = strrchr(newpath, '/');
+    if (new_name == NULL) {
+        return false;
+    }
+    new_name++;
+    if (*new_name == '\0') {
+        return false;
+    }
+    split_len = (uint32_t) (new_name - newpath - 1);
+    if (split_len >= sizeof(new_parent_path)) {
+        return false;
+    }
+    memcpy(new_parent_path, newpath, split_len);
+    new_parent_path[split_len] = '\0';
+    if (split_len == 0) {
+        strcpy(new_parent_path, "/");
+    }
+
+    /* 解析新旧父目录。 */
+    if (!extfs_resolve_path(old_parent_path, &old_parent)) {
+        return false;
+    }
+    if (!extfs_resolve_path(new_parent_path, &new_parent)) {
+        return false;
+    }
+
+    /* 同父同名直接成功。 */
+    if (old_parent == new_parent && strcmp(old_name, new_name) == 0) {
+        return true;
+    }
+
+    /* 目标名在新父目录中已存在则失败。 */
+    if (extfs_find_in_dir(new_parent, new_name, &found_inode, NULL)) {
+        return false;
+    }
+
+    /* 从旧父目录移除旧目录项。 */
+    if (!extfs_remove_dir_entry(old_parent, old_name)) {
+        return false;
+    }
+
+    /* 在新父目录添加新目录项；失败则回滚旧目录项。 */
+    if (!extfs_add_dir_entry(new_parent, new_name, old_inode_num, ftype)) {
+        extfs_add_dir_entry(old_parent, old_name, old_inode_num, ftype);
+        return false;
+    }
+
+    /* 移动目录时：更新被移动目录内 ".." 目录项指向新父目录。
+     * 由 extfs_mkdir 建立的布局：块0 偏移0 为 "."（rec_len=12），偏移12 为 ".."。 */
+    if (is_dir) {
+        uint32_t dotdot_block = extfs_get_block_at(&old_inode, 0);
+
+        if (dotdot_block != 0) {
+            extfs_read_block(dotdot_block, g_extfs_block);
+            ext_dir_entry_t *dotdot =
+                (ext_dir_entry_t *) (g_extfs_block + 12);
+
+            if (dotdot->name_len == 2 &&
+                dotdot->name[0] == '.' && dotdot->name[1] == '.') {
+                dotdot->inode = new_parent;
+                extfs_write_block(dotdot_block, g_extfs_block);
+            }
+        }
+
+        /* 跨父目录移动时调整父目录链接计数（mkdir 时新子目录对父 +1）。 */
+        if (old_parent != new_parent) {
+            ext_inode_t pi;
+
+            if (extfs_read_inode_raw(old_parent, &pi)) {
+                if (pi.links_count > 0) {
+                    pi.links_count--;
+                }
+                extfs_write_inode_raw(old_parent, &pi);
+            }
+            if (extfs_read_inode_raw(new_parent, &pi)) {
+                pi.links_count++;
+                extfs_write_inode_raw(new_parent, &pi);
+            }
+        }
+    }
+
+    /* 更新被移动文件/目录自身的时间戳。 */
+    old_inode.mtime = extfs_get_current_time();
+    old_inode.ctime = extfs_get_current_time();
+    extfs_write_inode_raw(old_inode_num, &old_inode);
+
+    return true;
 }

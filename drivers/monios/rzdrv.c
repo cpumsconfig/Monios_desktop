@@ -1,28 +1,44 @@
-#include "appsys.h"
-#include "stdio.h"
+#include "driver_api.h"
 
-static void write_line(const char *text)
+static monios_driver_log_fn_t g_log;
+static bool g_loaded;
+static uint64_t g_last_tick;
+
+__declspec(dllexport)
+bool DriverEntry(const monios_driver_runtime_t *runtime)
 {
-    fputs(text);
-    fputs("\r\n");
+    if (runtime == 0 ||
+        runtime->abi_version != MONIOS_DRIVER_ABI_VERSION ||
+        runtime->log == 0) {
+        return false;
+    }
+    g_log = runtime->log;
+    g_loaded = true;
+    g_last_tick = 0;
+    g_log("rzdrv native compatibility driver online");
+    return true;
 }
 
-int main(int argc, char **argv)
+__declspec(dllexport)
+void DriverTick(uint64_t now_ticks)
 {
-    const app_launch_info_t *info = app_launch_info();
+    if (!g_loaded || g_log == 0 || now_ticks < g_last_tick + 300U) {
+        return;
+    }
+    g_last_tick = now_ticks;
+    g_log("rzdrv periodic health tick");
+}
 
-    write_line("rzdrv.sys");
-    if (argc >= 2 && argv[1] != 0) {
-        fputs("package: ");
-        write_line(argv[1]);
+__declspec(dllexport)
+void DriverUnload(void)
+{
+    if (!g_loaded) {
+        return;
     }
-    if (info == 0 || info->privilege_level > APP_PRIV_R2) {
-        if (!app_request_r2("driver install requests R2")) {
-            write_line("R2 denied");
-            return 1;
-        }
+    if (g_log != 0) {
+        g_log("rzdrv native compatibility driver offline");
     }
-    write_line("runtime R0 elevation is disabled");
-    write_line("driver package verified at R2");
-    return 0;
+    g_log = 0;
+    g_loaded = false;
+    g_last_tick = 0;
 }

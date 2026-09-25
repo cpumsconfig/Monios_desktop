@@ -289,6 +289,220 @@ void bignum_modpow(bignum_t *result, const bignum_t *base, const bignum_t *exp, 
     }
 }
 
+static int32_t rsa_words_compare(const uint32_t *left,
+                                 const uint32_t *right,
+                                 uint32_t words)
+{
+    for (uint32_t i = words; i > 0; i--) {
+        if (left[i - 1U] != right[i - 1U]) {
+            return left[i - 1U] > right[i - 1U] ? 1 : -1;
+        }
+    }
+    return 0;
+}
+
+static void rsa_words_sub(uint32_t *result,
+                          const uint32_t *left,
+                          const uint32_t *right,
+                          uint32_t words)
+{
+    uint64_t borrow = 0;
+
+    for (uint32_t i = 0; i < words; i++) {
+        uint64_t right_value = (uint64_t) right[i] + borrow;
+        result[i] = (uint32_t) ((uint64_t) left[i] - right_value);
+        borrow = (uint64_t) left[i] < right_value ? 1U : 0U;
+    }
+}
+
+static bool rsa_words_double_mod(uint32_t *value,
+                                 const uint32_t *modulus,
+                                 uint32_t words)
+{
+    uint32_t carry = 0;
+    uint32_t shifted[RSA_MAX_MODULUS_WORDS];
+
+    if (value == NULL || modulus == NULL ||
+        words == 0 || words > RSA_MAX_MODULUS_WORDS) {
+        return false;
+    }
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t next_carry = value[i] >> 31;
+        shifted[i] = (value[i] << 1) | carry;
+        carry = next_carry;
+    }
+    if (carry != 0 ||
+        rsa_words_compare(shifted, modulus, words) >= 0) {
+        rsa_words_sub(value, shifted, modulus, words);
+    } else {
+        memcpy(value, shifted, words * sizeof(uint32_t));
+    }
+    return true;
+}
+
+static uint32_t rsa_montgomery_n0_inverse(uint32_t n0)
+{
+    uint32_t inverse = 1;
+
+    /*
+     * Newton iteration modulo 2^32. RSA moduli are odd, so the inverse
+     * exists. The negated result is the Montgomery reduction coefficient.
+     */
+    for (uint32_t i = 0; i < 5; i++) {
+        inverse *= 2U - n0 * inverse;
+    }
+    return 0U - inverse;
+}
+
+static bool rsa_montgomery_multiply(uint32_t *result,
+                                    const uint32_t *left,
+                                    const uint32_t *right,
+                                    const uint32_t *modulus,
+                                    uint32_t words,
+                                    uint32_t n0_inverse)
+{
+    uint32_t product[RSA_MAX_MODULUS_WORDS * 2U + 2U];
+
+    if (result == NULL || left == NULL || right == NULL ||
+        modulus == NULL || words == 0 ||
+        words > RSA_MAX_MODULUS_WORDS) {
+        return false;
+    }
+    memset(product, 0, sizeof(product));
+
+    for (uint32_t i = 0; i < words; i++) {
+        uint64_t carry = 0;
+
+        for (uint32_t j = 0; j < words; j++) {
+            uint64_t value = (uint64_t) left[i] * right[j] +
+                             product[i + j] +
+                             carry;
+            product[i + j] = (uint32_t) value;
+            carry = value >> 32;
+        }
+        for (uint32_t j = i + words; carry != 0 && j < sizeof(product) / sizeof(product[0]); j++) {
+            uint64_t value = (uint64_t) product[j] + carry;
+            product[j] = (uint32_t) value;
+            carry = value >> 32;
+        }
+        if (carry != 0) {
+            return false;
+        }
+    }
+
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t factor = product[i] * n0_inverse;
+        uint64_t carry = 0;
+
+        for (uint32_t j = 0; j < words; j++) {
+            uint64_t value = (uint64_t) factor * modulus[j] +
+                             product[i + j] +
+                             carry;
+            product[i + j] = (uint32_t) value;
+            carry = value >> 32;
+        }
+        for (uint32_t j = i + words; carry != 0 && j < sizeof(product) / sizeof(product[0]); j++) {
+            uint64_t value = (uint64_t) product[j] + carry;
+            product[j] = (uint32_t) value;
+            carry = value >> 32;
+        }
+        if (carry != 0) {
+            return false;
+        }
+    }
+
+    if (product[words * 2U] != 0 ||
+        rsa_words_compare(product + words, modulus, words) >= 0) {
+        rsa_words_sub(result, product + words, modulus, words);
+    } else {
+        memcpy(result,
+               product + words,
+               words * sizeof(uint32_t));
+    }
+    return true;
+}
+
+static int32_t rsa_montgomery_modpow(const rsa_pubkey_t *key,
+                                     const uint8_t *input,
+                                     uint8_t *output)
+{
+    uint32_t words;
+    uint32_t modulus[RSA_MAX_MODULUS_WORDS];
+    uint32_t base[RSA_MAX_MODULUS_WORDS];
+    uint32_t result[RSA_MAX_MODULUS_WORDS];
+    uint32_t one[RSA_MAX_MODULUS_WORDS];
+    uint32_t normal_one[RSA_MAX_MODULUS_WORDS];
+    uint32_t exponent_bit;
+    uint32_t n0_inverse;
+    bignum_t input_number;
+    bignum_t result_number;
+
+    if (key == NULL || input == NULL || output == NULL) {
+        return -1;
+    }
+    words = key->n.length;
+    if (words == 0 || words > RSA_MAX_MODULUS_WORDS ||
+        (key->n.words[0] & 1U) == 0) {
+        return -1;
+    }
+    memset(modulus, 0, sizeof(modulus));
+    memcpy(modulus, key->n.words, words * sizeof(uint32_t));
+    bignum_from_bytes(&input_number, input, key->bits / 8U);
+    if (input_number.length > words ||
+        (input_number.length == words &&
+         rsa_words_compare(input_number.words, modulus, words) >= 0)) {
+        return -1;
+    }
+    memset(base, 0, sizeof(base));
+    memcpy(base, input_number.words, input_number.length * sizeof(uint32_t));
+    memset(one, 0, sizeof(one));
+    one[0] = 1;
+    memset(normal_one, 0, sizeof(normal_one));
+    normal_one[0] = 1;
+    for (uint32_t i = 0; i < words * 32U; i++) {
+        if (!rsa_words_double_mod(one, modulus, words) ||
+            !rsa_words_double_mod(base, modulus, words)) {
+            return -1;
+        }
+    }
+
+    memcpy(result, one, sizeof(result));
+    n0_inverse = rsa_montgomery_n0_inverse(modulus[0]);
+    for (uint32_t bit = 0; bit < key->e.length * 32U; bit++) {
+        exponent_bit = (key->e.words[bit / 32U] >> (bit % 32U)) & 1U;
+        if (exponent_bit != 0 &&
+            !rsa_montgomery_multiply(result,
+                                     result,
+                                     base,
+                                     modulus,
+                                     words,
+                                     n0_inverse)) {
+            return -1;
+        }
+        if (!rsa_montgomery_multiply(base,
+                                     base,
+                                     base,
+                                     modulus,
+                                     words,
+                                     n0_inverse)) {
+            return -1;
+        }
+    }
+    if (!rsa_montgomery_multiply(result,
+                                 result,
+                                 normal_one,
+                                 modulus,
+                                 words,
+                                 n0_inverse)) {
+        return -1;
+    }
+    memset(&result_number, 0, sizeof(result_number));
+    result_number.length = words;
+    memcpy(result_number.words, result, words * sizeof(uint32_t));
+    bignum_to_bytes(&result_number, output, key->bits / 8U);
+    return (int32_t) (key->bits / 8U);
+}
+
 /* ============================================================
  *  RSA operations
  * ============================================================ */
@@ -334,8 +548,6 @@ int32_t rsa_public_encrypt(const rsa_pubkey_t *key, const uint8_t *input, uint32
 int32_t rsa_public_decrypt(const rsa_pubkey_t *key, const uint8_t *input, uint32_t input_len,
                            uint8_t *output, uint32_t output_len)
 {
-    bignum_t c, m;
-
     if (key == NULL || input == NULL || output == NULL) {
         return -1;
     }
@@ -346,11 +558,7 @@ int32_t rsa_public_decrypt(const rsa_pubkey_t *key, const uint8_t *input, uint32
         return -1;
     }
 
-    bignum_from_bytes(&c, input, input_len);
-    bignum_modpow(&m, &c, &key->e, &key->n);
-    bignum_to_bytes(&m, output, key->bits / 8);
-
-    return key->bits / 8;
+    return rsa_montgomery_modpow(key, input, output);
 }
 
 /* PKCS#1 v1.5 DigestInfo prefixes */

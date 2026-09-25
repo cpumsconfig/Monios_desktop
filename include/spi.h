@@ -53,4 +53,16 @@ int32_t spi_set_cs(uint8_t bus, uint8_t cs, bool assert);
 const spi_info_t *spi_info(void);
 const char *spi_status(void);
 
+/* ── New unified SPI driver interface ────────────────────────────── */
+/* Detect/initialize the SPI controller. Returns false and prints
+ * "spi: not found" when no controller is present. */
+bool spi_probe(void);
+void spi_shutdown(void);
+/* Chip-select helper controlling the active chip select. */
+int32_t spi_chip_select(bool assert);
+/* Clock frequency / mode setters (front-ends over spi_setup). */
+int32_t spi_set_speed(uint32_t speed_hz);
+int32_t spi_set_mode(uint8_t mode);
+uint32_t spi_error_count(void);
+
 #endif

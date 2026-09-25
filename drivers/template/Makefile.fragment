@@ -1,0 +1,37 @@
+# =============================================================================
+# Makefile.fragment - 新驱动接入 Monios 构建的片段（Task 27a）
+#
+# 用法：把下面片段按需复制到 Monios 根 Makefile 中，并把 mydriver 改成你的
+# 驱动名。模板默认不参与构建，只作脚手架；真正开发时才把它接进来。
+#
+# 假设新驱动位于 drivers/mydriver/mydriver.c（PE .sys 驱动，mingw 编译）。
+# =============================================================================
+
+# 1) 目标变量（加入现有列表附近）：
+#    DRIVER_PACKAGE_NAMES 已有；若要把新驱动打进 hd.img，追加：
+# DRIVER_PACKAGE_NAMES += mydriver
+#
+#    若你的驱动是独立 .sys（不走 monios_%.sys 模板），参考 rzdrv：
+# DRIVER_MYDRV_OBJS = out/driver_mydriver.pe.o
+
+# 2) 编译规则：driver_%.pe.o 已有通配规则（drivers/monios/%.c）。
+#    如果新驱动放在 drivers/mydriver/mydriver.c，需要加一条显式规则：
+# out/driver_mydriver.pe.o : drivers/mydriver/mydriver.c
+# 	$(APP_CC) $(APP_CFLAGS) -o out/driver_mydriver.pe.o drivers/mydriver/mydriver.c
+
+# 3) 链接未签名 .sys（参考 rzdrv）：
+# out/mydriver.unsigned.sys : user/apps/driver.ld out/driver_mydriver.pe.o out/sysstub.pe.o
+# 	$(APP_LD) $(DRIVER_LDFLAGS) -Wl,--subsystem,native -o out/mydriver.unsigned.sys out/sysstub.pe.o out/driver_mydriver.pe.o
+
+# 4) 签名（复用现有 out/%.sys 规则即可，无需重复）：
+# out/mydriver.sys : out/mydriver.unsigned.sys tools/sign_driver_sys.py
+# 	$(PYTHON) tools/sign_driver_sys.py out/mydriver.unsigned.sys out/mydriver.sys --qm-dir D:/qm --subject "MoniOS Driver Signing"
+
+# 5) 打进 hd.img：把 out/mydriver.sys 加到 hd.img / hd_uefi.img 的 --copy 列表：
+#    --copy out/mydriver.sys:/Monios/driver/mydriver.sys
+#    （若已加入 DRIVER_PACKAGE_NAMES，DRIVER_IMAGE_COPIES 会自动带上。）
+
+# 6) 构建验证：
+#    make -j2 out/mydriver.sys     # 单独构建
+#    make -j2                       # 全量构建出 hd.img
+# =============================================================================

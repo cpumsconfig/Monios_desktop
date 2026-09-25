@@ -66,6 +66,33 @@ static volatile uint32_t g_head;   /* producer index */
 static uint32_t         g_tail;   /* consumer index (dump) */
 static volatile uint32_t g_total_lost;
 
+/* ── Feature 30: performance profiler state ─────────────────── */
+static ftrace_profile_t g_profile[FTRACE_MAX_FUNCTIONS];
+static volatile int     g_profile_on;
+static volatile int     g_sampling_on;
+
+/* Shadow call stack: stores symbol index + entry TSC. */
+typedef struct { uint32_t sym_idx; uint64_t tsc; } fframe_t;
+static fframe_t g_fstack[FSTACK_DEPTH];
+static volatile uint32_t g_fstack_top;
+
+static uint64_t ftrace_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Resolve a low-32 func address to a symbol index, or -1. */
+static int ftrace_sym_idx(uint32_t func)
+{
+    uint32_t abs = func + (uint32_t)g_base_offset;
+    for (uint32_t i = 0; i < g_symbol_count; i++) {
+        if (g_symbols[i].addr == abs) return (int)i;
+    }
+    return -1;
+}
+
 /* ── Name lookup ─────────────────────────────────────────────── */
 static const char *ftrace_lookup_name(uint32_t addr)
 {
@@ -88,6 +115,9 @@ void ftrace_init(void)
     g_symbol_count = 0;
     g_base_offset = 0;
     g_lost_count  = 0;
+    g_profile_on = 0;
+    g_sampling_on = 0;
+    g_fstack_top = 0;
 }
 
 void ftrace_set_symbols(const uint64_t *addrs, const char * const *names,
@@ -124,15 +154,7 @@ int ftrace_is_enabled(void)
     return g_enabled;
 }
 
-/* ── Ring-buffer producers ─────────────────────────────────────
- * Memory barrier sequence:
- *   1. Read g_head (consumer view)   → SFENCE afterwards
- *   2. Write event fields             → MFENCE afterwards
- *   3. Increment g_head              → SFENCE afterwards
- * This ensures the event data is globally visible before
- * the index update, preventing a consumer from reading
- * stale data after observing a new head value.
- */
+/* ── Ring-buffer producers ───────────────────────────────────── */
 void ftrace_record_entry(uint32_t func, uint32_t parent)
 {
     if (!g_enabled) return;
@@ -153,6 +175,17 @@ void ftrace_record_entry(uint32_t func, uint32_t parent)
     g_event_buf[idx].padding[0] = 0;
     g_event_buf[idx].padding[1] = 0;
     g_event_buf[idx].padding[2] = 0;
+
+    /* Profiler: push shadow frame for timing + count invocation. */
+    if (g_profile_on && g_fstack_top < FSTACK_DEPTH) {
+        int si = ftrace_sym_idx(func);
+        if (si >= 0) {
+            g_fstack[g_fstack_top].sym_idx = (uint32_t)si;
+            g_fstack[g_fstack_top].tsc = ftrace_rdtsc();
+            g_fstack_top++;
+            g_profile[si].call_count++;
+        }
+    }
 
     /* Publish event: MFENCE before head update prevents a producer
      * from publishing a partial event that a consumer could observe
@@ -185,6 +218,15 @@ void ftrace_record_exit(uint32_t func)
     g_event_buf[idx].padding[0] = 0;
     g_event_buf[idx].padding[1] = 0;
     g_event_buf[idx].padding[2] = 0;
+
+    /* Profiler: pop shadow frame and accumulate on-CPU cycles. */
+    if (g_profile_on && g_fstack_top > 0) {
+        g_fstack_top--;
+        uint64_t dt = ftrace_rdtsc() - g_fstack[g_fstack_top].tsc;
+        uint32_t si = g_fstack[g_fstack_top].sym_idx;
+        g_profile[si].total_cycles += dt;
+        if (dt > g_profile[si].max_cycles) g_profile[si].max_cycles = dt;
+    }
 
     FTRACE_MFENCE();
     g_head++;
@@ -267,6 +309,7 @@ void ftrace_dump_serial(void)
         } else {
             type_str = "LOST !"; type_ch = '!';
         }
+        (void)type_ch; /* type encoded via type_str above; char reserved for future compact output */
         ftrace_serial_write(type_str);
         ftrace_serial_putc(' ');
 
@@ -285,12 +328,7 @@ void ftrace_dump_serial(void)
     ftrace_serial_write("\r\n====== END FTRACE =======\r\n");
 }
 
-/* ── Serial dump: compact crash-dump style ───────────────────────
- * Output format (one line per event):
- *   TTTTTTTT ENTRY  PPPP  FUNC_NAME
- *   TTTTTTTT EXIT   ----  FUNC_NAME
- * No ASCII table borders – minimal for serial output under panic.
- */
+/* ── Serial dump: compact crash-dump style ─────────────────────── */
 void ftrace_dump_serial_compact(void)
 {
     FTRACE_MFENCE();
@@ -398,5 +436,93 @@ void ftrace_shell_cmd(const char *args)
             ftrace_serial_putc(p[i++]);
         }
         ftrace_serial_write("'\r\n");
+    }
+}
+
+/* ── Feature 30: profiler report (sorted by total cycles) ────── */
+static void ftrace_report_row(uint32_t idx)
+{
+    ftrace_serial_hex64(g_profile[idx].total_cycles);
+    ftrace_serial_putc(' ');
+    ftrace_serial_hex64(g_profile[idx].call_count);
+    ftrace_serial_putc(' ');
+    ftrace_serial_hex64(g_profile[idx].sample_count);
+    ftrace_serial_putc(' ');
+    const char *nm = g_symbols[idx].name;
+    uint32_t n = 0;
+    while (nm[n] && n < 28) ftrace_serial_putc(nm[n++]);
+    ftrace_serial_write("\r\n");
+}
+
+void ftrace_profile_report(void)
+{
+    ftrace_serial_write("\r\n====== PROFILE REPORT ======\r\n");
+    ftrace_serial_write("TOTALCYCLES  CALLS   SAMPLES  NAME\r\n");
+    uint32_t order[FTRACE_MAX_FUNCTIONS];
+    uint32_t n = g_symbol_count;
+    if (n > FTRACE_MAX_FUNCTIONS) n = FTRACE_MAX_FUNCTIONS;
+    for (uint32_t i = 0; i < n; i++) order[i] = i;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1; j < n; j++) {
+            if (g_profile[order[j]].total_cycles > g_profile[order[best]].total_cycles)
+                best = j;
+        }
+        if (best != i) { uint32_t t = order[i]; order[i] = order[best]; order[best] = t; }
+    }
+    for (uint32_t i = 0; i < n && i < 40; i++) ftrace_report_row(order[i]);
+    ftrace_serial_write("====== END PROFILE ======\r\n");
+}
+
+void ftrace_sample_pc(uint64_t pc)
+{
+    if (!g_sampling_on) return;
+    uint32_t low = (uint32_t)pc;
+    int si = ftrace_sym_idx(low);
+    if (si >= 0) g_profile[si].sample_count++;
+}
+
+uint64_t profile_ctl(uint64_t op, uint64_t arg1, uint64_t arg2)
+{
+    (void)arg2;
+    switch (op) {
+    case PROFILE_START:
+        memset(g_profile, 0, sizeof(g_profile));
+        g_fstack_top = 0;
+        g_profile_on = 1;
+        ftrace_enable();
+        return 0;
+    case PROFILE_STOP:
+        g_profile_on = 0;
+        return 0;
+    case PROFILE_RESET:
+        memset(g_profile, 0, sizeof(g_profile));
+        g_fstack_top = 0;
+        return 0;
+    case PROFILE_REPORT:
+        ftrace_profile_report();
+        return 0;
+    case PROFILE_GET_COUNT: {
+        int si = ftrace_sym_idx((uint32_t)arg1);
+        return (si >= 0) ? g_profile[si].call_count : (uint64_t)-1;
+    }
+    case PROFILE_GET_CYCLES: {
+        int si = ftrace_sym_idx((uint32_t)arg1);
+        return (si >= 0) ? g_profile[si].total_cycles : (uint64_t)-1;
+    }
+    case PROFILE_SAMPLE_ON:
+        g_sampling_on = 1;
+        return 0;
+    case PROFILE_SAMPLE_OFF:
+        g_sampling_on = 0;
+        return 0;
+    case PROFILE_STATUS: {
+        uint64_t st = 0;
+        if (g_profile_on) st |= 1;
+        if (g_sampling_on) st |= 2;
+        return st;
+    }
+    default:
+        return (uint64_t)-1;
     }
 }

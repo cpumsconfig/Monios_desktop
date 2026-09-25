@@ -19,13 +19,17 @@
 #define TCP_STATE_CLOSE_WAIT   5
 #define TCP_STATE_LAST_ACK     6
 #define TCP_STATE_TIME_WAIT    7
+#define TCP_STATE_SYN_RCVD     8
 
 #define TCP_MAX_CONNECTIONS    4
+#define TCP_MAX_LISTENERS      4
 #define TCP_MAX_SEGMENT_SIZE   1460
 #define TCP_WINDOW_SIZE        65535
 
 typedef struct {
     bool used;
+    bool passive;       /* created by an inbound SYN (server side) */
+    bool accepted;       /* handed out to an app via tcp_accept() */
     uint8_t state;
     uint8_t remote_ip[4];
     uint16_t remote_port;
@@ -50,5 +54,13 @@ int32_t tcp_send(int32_t handle, const uint8_t *data, uint32_t len);
 int32_t tcp_recv(int32_t handle, uint8_t *buffer, uint32_t buffer_size);
 bool tcp_is_connected(int32_t handle);
 bool tcp_has_data(int32_t handle);
+
+/* Server side: register a listening port and harvest established inbound
+ * connections. tcp_listen_port() returns 0 on success, <0 on error.
+ * tcp_accept_ready() returns the handle of the next established, unclaimed
+ * passive connection on <local_port>, or -1 if none is pending. */
+int32_t tcp_listen_port(uint16_t local_port);
+void tcp_unlisten_port(uint16_t local_port);
+int32_t tcp_accept_ready(uint16_t local_port, uint8_t remote_ip_out[4], uint16_t *remote_port_out);
 
 #endif

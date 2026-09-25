@@ -1,4 +1,7 @@
 #include "common.h"
+#include "file.h"
+#include "blockdev.h"
+#include "kernel.h"
 #include "fat16.h"
 
 #define ATA_DATA_PORT         0x1F0
@@ -74,6 +77,7 @@ typedef struct {
 } fat16_dir_slot_t;
 
 static fat16_bpb_t g_bpb;
+static uint32_t g_volume_lba;
 static uint32_t g_fat_lba;
 static uint32_t g_root_lba;
 static uint32_t g_root_sectors;
@@ -98,6 +102,18 @@ static uint32_t fat16_total_sectors(void)
 {
     return g_bpb.total_sectors_16 != 0 ? g_bpb.total_sectors_16 : g_bpb.total_sectors_32;
 }
+
+/* 本卷所在的块设备序号，由 fat16_init() 从 file_blockdev_hint() 取。
+ * >= 0 时所有扇区 I/O 走 drivers/storage/blockdev.c 的块设备抽象；
+ * < 0（未知）时回退到下面的 legacy ATA PIO。
+ *
+ * 为什么必须走块设备层：这些驱动过去直接读写 0x1F0 端口，在没有 legacy IDE
+ * 控制器的机器上（AHCI/NVMe-only，含 QEMU -machine q35）端口读回全 0，
+ * 文件系统完全挂不上。 */
+static int32_t g_fat16_blockdev = -1;
+
+/* 写失败只报一次，避免坏设备上刷屏。 */
+static bool g_fat16_write_warned;
 
 static bool ata_wait_not_busy(void)
 {
@@ -124,6 +140,13 @@ static bool ata_wait_data_ready(void)
 
 static void ata_read_sector(uint32_t lba, void *buffer)
 {
+    if (g_fat16_blockdev >= 0) {
+        if (!blockdev_raw_read_sectors(g_fat16_blockdev, lba, 1, buffer)) {
+            memset(buffer, 0, 512);
+        }
+        return;
+    }
+
     uint16_t *dst = (uint16_t *) buffer;
 
     if (!ata_wait_not_busy()) {
@@ -148,6 +171,13 @@ static void ata_read_sector(uint32_t lba, void *buffer)
 
 static void ata_read_sectors(uint32_t lba, uint8_t count, void *buffer)
 {
+    if (g_fat16_blockdev >= 0) {
+        if (!blockdev_raw_read_sectors(g_fat16_blockdev, lba, count, buffer)) {
+            memset(buffer, 0, (uint32_t) count * 512u);
+        }
+        return;
+    }
+
     uint16_t *dst = (uint16_t *) buffer;
 
     if (count == 0) {
@@ -177,6 +207,14 @@ static void ata_read_sectors(uint32_t lba, uint8_t count, void *buffer)
 
 static void ata_write_sector(uint32_t lba, const void *buffer)
 {
+    if (g_fat16_blockdev >= 0) {
+        if (!blockdev_raw_write_sectors(g_fat16_blockdev, lba, 1, buffer) && !g_fat16_write_warned) {
+            g_fat16_write_warned = true;
+            log_write("fs: warning - block device rejected write (volume read-only)");
+        }
+        return;
+    }
+
     const uint16_t *src = (const uint16_t *) buffer;
 
     if (!ata_wait_not_busy()) {
@@ -200,6 +238,14 @@ static void ata_write_sector(uint32_t lba, const void *buffer)
 
 static void ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer)
 {
+    if (g_fat16_blockdev >= 0) {
+        if (!blockdev_raw_write_sectors(g_fat16_blockdev, lba, count, buffer) && !g_fat16_write_warned) {
+            g_fat16_write_warned = true;
+            log_write("fs: warning - block device rejected write (volume read-only)");
+        }
+        return;
+    }
+
     const uint16_t *src = (const uint16_t *) buffer;
 
     if (count == 0 || !ata_wait_not_busy()) {
@@ -356,12 +402,12 @@ static void fat16_free_chain(uint16_t cluster)
     }
 }
 
-static bool fat16_dir_is_root(const fat16_dir_ref_t *dir)
+__attribute__((unused)) static bool fat16_dir_is_root(const fat16_dir_ref_t *dir)
 {
     return dir->is_root;
 }
 
-static uint32_t fat16_dir_sector_count(const fat16_dir_ref_t *dir)
+__attribute__((unused)) static uint32_t fat16_dir_sector_count(const fat16_dir_ref_t *dir)
 {
     if (dir->is_root) {
         return g_root_sectors;
@@ -621,8 +667,12 @@ bool fat16_init(void)
 {
     uint8_t sector[512];
     uint32_t data_sectors;
+    int32_t mount_hint = file_mount_partition_hint();
+    g_fat16_blockdev = file_blockdev_hint();
+    g_fat16_write_warned = false;
 
-    ata_read_sector(0, sector);
+    g_volume_lba = mount_hint >= 0 ? (uint32_t) mount_hint : 0;
+    ata_read_sector(g_volume_lba, sector);
     memcpy(&g_bpb, sector, sizeof(g_bpb));
 
     if (g_bpb.bytes_per_sector != 512 || g_bpb.sectors_per_cluster == 0 || g_bpb.fat_size_16 == 0) {
@@ -630,7 +680,7 @@ bool fat16_init(void)
         return false;
     }
 
-    g_fat_lba = g_bpb.reserved_sector_count;
+    g_fat_lba = g_volume_lba + g_bpb.reserved_sector_count;
     g_root_sectors = ((uint32_t) g_bpb.root_entry_count * 32 + (g_bpb.bytes_per_sector - 1)) / g_bpb.bytes_per_sector;
     g_root_lba = g_fat_lba + (uint32_t) g_bpb.fat_count * g_bpb.fat_size_16;
     g_data_lba = g_root_lba + g_root_sectors;
@@ -1115,4 +1165,33 @@ bool fat16_list_dir(const char *path, char *buffer, uint32_t buffer_size)
 bool fat16_list_root(char *buffer, uint32_t buffer_size)
 {
     return fat16_list_dir("/", buffer, buffer_size);
+}
+
+/* 磁盘空间查询 */
+uint64_t fat16_total_bytes(uint64_t *free_out, uint32_t *cluster_size_out)
+{
+    uint16_t i;
+    uint32_t free_clusters = 0;
+    uint32_t total_clusters = g_cluster_count;
+    uint32_t cluster_sectors = g_bpb.sectors_per_cluster;
+    uint32_t sector_bytes = g_bpb.bytes_per_sector;
+    uint64_t cluster_bytes = (uint64_t)cluster_sectors * sector_bytes;
+
+    if (!g_fat16_ready || total_clusters == 0) {
+        return 0;
+    }
+
+    for (i = 2; i < (uint16_t)(total_clusters + 2); i++) {
+        if (fat16_get_fat_entry(i) == FAT16_CLUSTER_FREE) {
+            free_clusters++;
+        }
+    }
+
+    if (cluster_size_out != NULL) {
+        *cluster_size_out = (uint32_t)cluster_bytes;
+    }
+    if (free_out != NULL) {
+        *free_out = (uint64_t)free_clusters * cluster_bytes;
+    }
+    return (uint64_t)total_clusters * cluster_bytes;
 }

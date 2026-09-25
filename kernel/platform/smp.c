@@ -4,6 +4,7 @@
 #include "kernel.h"
 #include "mmu.h"
 #include "smp.h"
+#include "spinlock.h"
 
 static smp_info_t g_smp_info;
 
@@ -125,6 +126,16 @@ void smp_init(void)
         kernel_log_hex_u32("smp: enabled apic id=", g_smp_info.firmware_enabled_lapic_ids[i]);
     }
     log_write(g_smp_info.status);
+
+    /* Sanity-probe the spinlock primitives before APs are released: a lock
+     * that cannot be acquired/released on the BSP would corrupt every shared
+     * structure (heap, scheduler, sockets, mount table) once APs boot. */
+    {
+        static spinlock_t smp_probe_lock = SPINLOCK_INITIALIZER;
+        uint64_t probe_flags = 0;
+        spin_lock_irqsave(&smp_probe_lock, &probe_flags);
+        spin_unlock_irqrestore(&smp_probe_lock, probe_flags);
+    }
 }
 
 const smp_info_t *smp_info(void)

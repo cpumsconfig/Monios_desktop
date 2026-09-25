@@ -161,3 +161,59 @@ void cmos_log_time(void)
     line[25] = '\0';
     log_write(line);
 }
+
+static uint8_t cmos_dec_to_bcd(uint8_t value)
+{
+    return (uint8_t) (((value / 10u) << 4) | (value % 10u));
+}
+
+static void cmos_write_reg(uint8_t index, uint8_t value)
+{
+    outb(CMOS_INDEX_PORT, index);
+    outb(CMOS_DATA_PORT, value);
+}
+
+/* Write a broken-down time back into the CMOS RTC. Feature 12 (NTP sync). */
+void cmos_write_time(const cmos_time_t *in_time)
+{
+    uint8_t bcd;
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t day;
+    uint8_t month;
+    uint8_t year;
+    uint8_t century;
+
+    if (in_time == NULL) {
+        return;
+    }
+    while (cmos_update_in_progress()) {
+    }
+    bcd = (cmos_read(0x0B) & 0x04u) == 0;
+
+    second = in_time->second;
+    minute = in_time->minute;
+    hour = in_time->hour;
+    day = in_time->day;
+    month = in_time->month;
+    year = (uint8_t) (in_time->year % 100u);
+    century = (uint8_t) (in_time->year / 100u);
+
+    if (bcd) {
+        second = cmos_dec_to_bcd(second);
+        minute = cmos_dec_to_bcd(minute);
+        hour = cmos_dec_to_bcd(hour);
+        day = cmos_dec_to_bcd(day);
+        month = cmos_dec_to_bcd(month);
+        year = cmos_dec_to_bcd(year);
+        century = cmos_dec_to_bcd(century);
+    }
+    cmos_write_reg(0x00, second);
+    cmos_write_reg(0x02, minute);
+    cmos_write_reg(0x04, hour);
+    cmos_write_reg(0x07, day);
+    cmos_write_reg(0x08, month);
+    cmos_write_reg(0x09, year);
+    cmos_write_reg(0x32, century);
+}
